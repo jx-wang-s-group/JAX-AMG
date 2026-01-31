@@ -1,10 +1,12 @@
 """
 Helper functions.
 """
+
 import jax.numpy as jnp
 import jax.experimental.sparse as jsp
 import numpy as np
 import scipy.sparse as sp
+
 
 def from_scipy(A: sp.csr_matrix) -> jsp.CSR:
     """Convert a scipy CSR matrix to JAX CSR format.
@@ -30,5 +32,6 @@ def to_scipy(A: jsp.CSR) -> sp.csr_matrix:
     Returns:
         Scipy CSR matrix
     """
-    return sp.csr_matrix((np.asarray(A.data), np.asarray(A.indices), np.asarray(A.indptr)), shape=A.shape)
-
+    return sp.csr_matrix(
+        (np.asarray(A.data), np.asarray(A.indices), np.asarray(A.indptr)), shape=A.shape
+    )

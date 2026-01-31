@@ -4,6 +4,7 @@ Standard test matrices and RHS vectors.
 This module provides common sparse matrix patterns (1D Laplacian, 2D Poisson)
 and right-hand-side vector generators for testing and demonstration purposes.
 """
+
 import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsp
@@ -21,7 +22,13 @@ def laplacian_1d(n: int, diagonal_value: float = 2.0) -> sp.csr_matrix:
     Returns:
         CSR matrix with [-1, 2, -1] pattern on diagonals
     """
-    return sp.diags([-1, diagonal_value, -1], offsets=[-1, 0, 1], shape=(n, n), format='csr', dtype=np.float32)
+    return sp.diags(
+        [-1, diagonal_value, -1],
+        offsets=[-1, 0, 1],
+        shape=(n, n),
+        format="csr",
+        dtype=np.float32,
+    )
 
 
 def tridiagonal_matrix(n: int, diagonal_value: float = 2.0) -> jsp.CSR:
@@ -51,7 +58,7 @@ def poisson_matrix(n: int) -> jsp.CSR:
         JAX CSR matrix representing the 2D Poisson operator
     """
     L1D = laplacian_1d(n)
-    A = sp.kronsum(L1D, L1D, format='csr').astype(np.float32)
+    A = sp.kronsum(L1D, L1D, format="csr").astype(np.float32)
     return from_scipy(A)
 
 
@@ -79,7 +86,7 @@ def rhs_linear(n: int):
     return jnp.linspace(0, 1, n, dtype=jnp.float32)
 
 
-def rhs_random(n: int, seed: int=0):
+def rhs_random(n: int, seed: int = 0):
     """Create a random RHS vector.
 
     Args:

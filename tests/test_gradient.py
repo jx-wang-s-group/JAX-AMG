@@ -1,4 +1,5 @@
 """Test automatic differentiation with AmgX solver."""
+
 import pytest
 import numpy as np
 import scipy.sparse.linalg as spla
@@ -34,7 +35,7 @@ class TestGradient:
         For loss L(b) = ||x||^2 where x = A^{{-1}}b:
         ∂L/∂b = 2 * A^{{-T}} * x
         """
-        A = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
+        A = tridiagonal_matrix(n, diagonal_value=4.0)  # Better conditioned
         b = rhs_ones(n)
 
         # Define loss function
@@ -64,7 +65,7 @@ class TestGradient:
         ∂L/∂b = A^(-T) v
         """
         n = 32
-        A = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
+        A = tridiagonal_matrix(n, diagonal_value=4.0)  # Better conditioned
         b = rhs_ones(n)
 
         # Random vector for VJP

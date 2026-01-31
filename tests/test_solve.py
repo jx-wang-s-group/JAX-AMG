@@ -1,4 +1,5 @@
 """Test basic solver functionality."""
+
 import pytest
 import numpy as np
 import scipy.sparse.linalg as spla

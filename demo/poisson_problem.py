@@ -4,6 +4,7 @@ Demo: Solving 2D Poisson equation.
 This example demonstrates solving a 2D Poisson equation on a regular grid
 using the 5-point finite difference stencil.
 """
+
 import jax.numpy as jnp
 from jaxamg import amgx_solve
 from jaxamg.matrices import poisson_matrix, rhs_ones

@@ -1,4 +1,5 @@
 """Test JAX JIT compilation with AmgX solver."""
+
 import jax
 import numpy as np
 

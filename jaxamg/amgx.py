@@ -50,17 +50,11 @@ def amgx_solve(A, b):
 
     # Validate dtypes
     if A.data.dtype != jnp.float32:
-        raise ValueError(
-            f"Matrix values must be float32, got {A.data.dtype}. "
-        )
+        raise ValueError(f"Matrix values must be float32, got {A.data.dtype}. ")
     if A.indices.dtype != jnp.int32:
-        raise ValueError(
-            f"Matrix column indices must be int32, got {A.indices.dtype}."
-        )
+        raise ValueError(f"Matrix column indices must be int32, got {A.indices.dtype}.")
     if A.indptr.dtype != jnp.int32:
-        raise ValueError(
-            f"Matrix row pointers must be int32, got {A.indptr.dtype}."
-        )
+        raise ValueError(f"Matrix row pointers must be int32, got {A.indptr.dtype}.")
 
     # Extract CSR components
     row_ptrs = A.indptr

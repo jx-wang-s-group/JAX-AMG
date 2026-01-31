@@ -4,6 +4,7 @@ Demo: Optimization via automatic differentiation.
 This example demonstrates using JAX's automatic differentiation
 and JIT compilation with the AmgX solver for gradient-based optimization.
 """
+
 import jax
 import jax.numpy as jnp
 from jaxamg import amgx_solve
@@ -15,7 +16,7 @@ def main():
     # Setup tridiagonal system
     n = 64
     print(f"Setting up {n}×{n} system...")
-    A = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
+    A = tridiagonal_matrix(n, diagonal_value=4.0)  # Better conditioned
 
     # Initial right-hand side
     b_init = rhs_ones(n)
@@ -71,7 +72,9 @@ def main():
             loss_change = loss_next - loss_current
 
             # Display iteration info
-            print(f"{i:<6} {loss_current:<15.6e} {grad_norm:<15.6e} {loss_change:<15.6e}")
+            print(
+                f"{i:<6} {loss_current:<15.6e} {grad_norm:<15.6e} {loss_change:<15.6e}"
+            )
 
             # Update for next iteration
             b_current = b_next
