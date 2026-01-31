@@ -10,32 +10,39 @@ import scipy.sparse as sp
 from collections import defaultdict
 
 
-def from_scipy(A: sp.csr_matrix) -> jsp.BCSR:
-    """Convert a scipy CSR matrix to JAX BCSR format (block_size=1).
-
-    Args:
-        A: Scipy CSR matrix
-
-    Returns:
-        JAX BCSR matrix with int32 indices and float32 values
-    """
-    # Use BCSR's built-in from_scipy_sparse method
-    # This automatically handles the conversion with block_size=1
-    return jsp.BCSR.from_scipy_sparse(A.astype(np.float32))
-
-
-def to_scipy(A: jsp.BCSR) -> sp.csr_matrix:
-    """Convert a JAX BCSR matrix to scipy CSR format.
+def to_scipy(A: jsp.BCSR, format="csr") -> sp.spmatrix:
+    """Convert a JAX BCSR matrix to Scipy sparse matrix format.
 
     Args:
         A: JAX BCSR matrix
+        format: Scipy sparse matrix format (default "csr")
+                Supported: "csr", "csc", "coo", "lil", "dok", "bsr"
 
     Returns:
-        Scipy CSR matrix
+        Scipy sparse matrix in the specified format
     """
-    return sp.csr_matrix(
+    # First convert to CSR (most efficient from BCSR)
+    A_csr = sp.csr_matrix(
         (np.asarray(A.data), np.asarray(A.indices), np.asarray(A.indptr)), shape=A.shape
     )
+
+    # Convert to requested format
+    if format == "csr":
+        return A_csr
+    elif format == "csc":
+        return A_csr.tocsc()
+    elif format == "coo":
+        return A_csr.tocoo()
+    elif format == "lil":
+        return A_csr.tolil()
+    elif format == "dok":
+        return A_csr.todok()
+    elif format == "bsr":
+        return A_csr.tobsr()
+    else:
+        raise ValueError(
+            f"Unsupported format: {format}. Supported formats: csr, csc, coo, lil, dok, bsr"
+        )
 
 
 def get_sparsity_pattern(A_callable, shape, tol=1e-10):

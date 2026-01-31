@@ -10,7 +10,6 @@ import jax.numpy as jnp
 import jax.experimental.sparse as jsp
 import numpy as np
 import scipy.sparse as sp
-from .utils import from_scipy
 
 
 def tridiagonal_matrix(n: int, diagonal_value: float = 2.0) -> jsp.BCSR:

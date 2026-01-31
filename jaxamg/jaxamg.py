@@ -5,6 +5,8 @@ import jax.experimental.sparse as jsp
 from jax import core
 import functools
 from enum import IntEnum
+import scipy.sparse as sp
+import numpy as np
 
 from . import _amgx_ext, utils
 
@@ -49,10 +51,13 @@ def _normalize_linear_operator(A, *, b=None):
     """
     Normalize input 'A' to a BCSR matrix.
 
+    Supports multiple input formats, including BCSR, BCOO, SciPy sparse (CSR, CSC, COO), dense arrays (NumPy, JAX), and callable operators.
+
     If 'A' is callable:
     1. Outside JIT: Computes sparsity pattern and graph coloring (O(N)), caches it on 'A', and materializes.
     2. Inside JIT: Uses cached coloring to materialize efficiently (O(Colors)).
     """
+    # BCSR: validate and return
     if isinstance(A, jsp.BCSR):
         if A.data.dtype != jnp.float32:
             raise ValueError(f"Matrix values must be float32, got {A.data.dtype}.")
@@ -66,6 +71,63 @@ def _normalize_linear_operator(A, *, b=None):
             )
         return A
 
+    # BCOO: convert to BCSR
+    if isinstance(A, jsp.BCOO):
+        A_bcsr = jsp.BCSR.from_bcoo(A)
+        if A_bcsr.data.dtype != jnp.float32:
+            A_bcsr = jsp.BCSR(
+                (A_bcsr.data.astype(jnp.float32), A_bcsr.indices, A_bcsr.indptr),
+                shape=A_bcsr.shape,
+            )
+        if A_bcsr.indices.dtype != jnp.int32:
+            A_bcsr = jsp.BCSR(
+                (
+                    A_bcsr.data,
+                    A_bcsr.indices.astype(jnp.int32),
+                    A_bcsr.indptr.astype(jnp.int32),
+                ),
+                shape=A_bcsr.shape,
+            )
+        return A_bcsr
+
+    # SciPy sparse: convert to BCSR
+    if sp.issparse(A):
+        A_bcsr = jsp.BCSR.from_scipy_sparse(A.astype(np.float32))
+
+        if A_bcsr.indices.dtype != jnp.int32:
+            A_bcsr = jsp.BCSR(
+                (
+                    A_bcsr.data,
+                    A_bcsr.indices.astype(jnp.int32),
+                    A_bcsr.indptr.astype(jnp.int32),
+                ),
+                shape=A_bcsr.shape,
+            )
+        return A_bcsr
+
+    # Dense arrays: convert to BCSR
+    if isinstance(A, (np.ndarray, jnp.ndarray)):
+        if A.ndim != 2:
+            raise ValueError(f"Dense matrix must be 2D, got shape {A.shape}")
+        if isinstance(A, np.ndarray):
+            A = jnp.array(A, dtype=jnp.float32)
+        elif A.dtype != jnp.float32:
+            A = A.astype(jnp.float32)
+
+        A_bcsr = jsp.BCSR.fromdense(A)
+
+        if A_bcsr.indices.dtype != jnp.int32:
+            A_bcsr = jsp.BCSR(
+                (
+                    A_bcsr.data,
+                    A_bcsr.indices.astype(jnp.int32),
+                    A_bcsr.indptr.astype(jnp.int32),
+                ),
+                shape=A_bcsr.shape,
+            )
+        return A_bcsr
+
+    # Callable: materialize using graph coloring
     if callable(A):
         # Check for cached coloring info attached to the callable
         cached_info = getattr(A, "_amgx_coloring_info", None)
@@ -104,19 +166,19 @@ def _normalize_linear_operator(A, *, b=None):
             )
 
         # Materialize using graph coloring (works efficienty inside JIT)
-        A_csr = utils.materialize_sparse_matrix(
+        A_bcsr = utils.materialize_sparse_matrix(
             A, shape, rows, cols, column_colors, n_colors
         )
 
-        if A_csr.data.dtype != jnp.float32:
+        if A_bcsr.data.dtype != jnp.float32:
             raise ValueError(
-                f"Callable A must return dtype float32. Got {A_csr.data.dtype}."
+                f"Callable A must return dtype float32. Got {A_bcsr.data.dtype}."
             )
 
-        return A_csr
+        return A_bcsr
 
     raise TypeError(
-        f"Matrix A must be either a jax.experimental.sparse.BCSR matrix or a callable. "
+        f"Matrix A must be one of: BCSR, BCOO, SciPy sparse, dense array (NumPy/JAX), or callable. "
         f"Got {type(A).__name__}."
     )
 

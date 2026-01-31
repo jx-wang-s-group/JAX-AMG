@@ -3,6 +3,7 @@
 import pytest
 import numpy as np
 import scipy.sparse.linalg as spla
+import jax
 import jax.numpy as jnp
 
 from jaxamg import amg_solve, AMGXStatus
@@ -47,6 +48,27 @@ class TestSolver:
 
         assert info["status"] == AMGXStatus.NOT_CONVERGED
         assert info["iterations"] == 1
+
+    def test_tridiagonal_solve_jit(self):
+        """Test solving a 1D tridiagonal system with JIT compilation."""
+        n = 32
+        A = tridiagonal_matrix(n)
+        b = rhs_ones(n)
+
+        # Create JIT-compiled version
+        @jax.jit
+        def solve_jit(b):
+            x, _ = amg_solve(A, b)
+            return x
+
+        # Solve with JIT
+        x_jit = solve_jit(b)
+
+        # Solve without JIT
+        x_nojit, _ = amg_solve(A, b)
+
+        # Compare results
+        np.testing.assert_allclose(x_jit, x_nojit)
 
     def test_poisson_manufactured_solution(self):
         """Test 2D Poisson with manufactured solution."""
