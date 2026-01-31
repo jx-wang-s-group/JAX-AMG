@@ -2,16 +2,15 @@ import jax
 import jax.numpy as jnp
 import jax.ffi as ffi
 import jax.experimental.sparse as jsp
+from jax import core
 
-from . import _amgx_ext
+from . import _amgx_ext, utils
 
 
 _AMGX_CALL_NAME = "amgx_solve"
 
-# Get the handler from C++
+# Get the handler from C++ and register for CUDA platform
 _AMGX_HANDLER = _amgx_ext.get_amgx_solve_handler()
-
-# Register FFI target for CUDA platform
 ffi.register_ffi_target(_AMGX_CALL_NAME, _AMGX_HANDLER, platform="CUDA")
 
 
@@ -27,75 +26,140 @@ def _amgx_solve_impl(row_ptrs, col_indices, values, b):
     return call(row_ptrs, col_indices, values, b)
 
 
-@jax.custom_vjp
-def amgx_solve(A, b):
-    """Solve Ax=b using AmgX (differentiable).
-
-    Args:
-        A: CSR matrix (jax.experimental.sparse.CSR)
-        b: Right-hand side vector (float32)
-
-    Returns:
-        x: Solution vector (float32)
-
-    Raises:
-        TypeError: If A is not a jax.experimental.sparse.CSR matrix
-        ValueError: If A has incorrect dtypes (indices must be int32, values must be float32)
+def _normalize_linear_operator(A, *, b=None):
     """
-    # Validate input type
-    if not isinstance(A, jsp.CSR):
-        raise TypeError(
-            f"Matrix A must be a jax.experimental.sparse.CSR object, got {type(A).__name__}. "
+    Normalize input 'A' to a CSR matrix.
+
+    If 'A' is callable:
+    1. Outside JIT: Computes sparsity pattern and graph coloring (O(N)), caches it on 'A', and materializes.
+    2. Inside JIT: Uses cached coloring to materialize efficiently (O(Colors)).
+    """
+    if isinstance(A, jsp.CSR):
+        if A.data.dtype != jnp.float32:
+            raise ValueError(f"Matrix values must be float32, got {A.data.dtype}.")
+        if A.indices.dtype != jnp.int32:
+            raise ValueError(
+                f"Matrix column indices must be int32, got {A.indices.dtype}."
+            )
+        if A.indptr.dtype != jnp.int32:
+            raise ValueError(
+                f"Matrix row pointers must be int32, got {A.indptr.dtype}."
+            )
+        return A
+
+    if callable(A):
+        # Check for cached coloring info attached to the callable
+        cached_info = getattr(A, "_amgx_coloring_info", None)
+
+        if b is None:
+            raise TypeError("Callable A requires RHS b to infer size.")
+        if b.ndim != 1:
+            raise ValueError(f"RHS b must be 1D, got shape {b.shape}.")
+        shape = (int(b.shape[0]), int(b.shape[0]))
+
+        is_jit = isinstance(b, core.Tracer)
+
+        if cached_info is None:
+            if is_jit:
+                # Inside JIT without cache: Impossible to determine sparsity dynamically.
+                raise ValueError(
+                    "Callable operators must be pre-scanned before JIT compilation to determine sparsity.\n"
+                    "Call amgx_solve(A, b) once outside of JIT to compute and cache the sparsity pattern."
+                )
+
+            # Outside JIT: Compute sparsity and coloring (expensive O(N))
+            rows, cols = utils.get_sparsity_pattern(A, shape)
+            column_colors, n_colors = utils.get_column_coloring(rows, cols, shape)
+
+            cached_info = (rows, cols, column_colors, n_colors, shape)
+            try:
+                setattr(A, "_amgx_coloring_info", cached_info)
+            except Exception:
+                pass  # Ignore if caching fails (e.g. on partials or immutable objects)
+
+        rows, cols, column_colors, n_colors, cached_shape = cached_info
+
+        if shape != cached_shape:
+            raise ValueError(
+                f"Operator shape changed from {cached_shape} to {shape}. Create a new callable."
+            )
+
+        # Materialize using graph coloring (works efficienty inside JIT)
+        A_csr = utils.materialize_sparse_matrix(
+            A, shape, rows, cols, column_colors, n_colors
         )
 
-    # Validate dtypes
-    if A.data.dtype != jnp.float32:
-        raise ValueError(f"Matrix values must be float32, got {A.data.dtype}. ")
-    if A.indices.dtype != jnp.int32:
-        raise ValueError(f"Matrix column indices must be int32, got {A.indices.dtype}.")
-    if A.indptr.dtype != jnp.int32:
-        raise ValueError(f"Matrix row pointers must be int32, got {A.indptr.dtype}.")
+        if A_csr.data.dtype != jnp.float32:
+            raise ValueError(
+                f"Callable A must return dtype float32. Got {A_csr.data.dtype}."
+            )
 
-    # Extract CSR components
-    row_ptrs = A.indptr
-    col_indices = A.indices
-    values = A.data
+        return A_csr
 
-    return _amgx_solve_impl(row_ptrs, col_indices, values, b)
+    raise TypeError(
+        f"Matrix A must be either a jax.experimental.sparse.CSR matrix or a callable. "
+        f"Got {type(A).__name__}."
+    )
+
+
+@jax.custom_vjp
+def _amgx_solve_csr(A, b):
+    """
+    Solve Ax=b using AmgX with custom VJP for gradients.
+    Input A must be a jsp.CSR matrix.
+    """
+    return _amgx_solve_impl(A.indptr, A.indices, A.data, b)
 
 
 def _amgx_fwd(A, b):
-    # Extract CSR components
-    row_ptrs = A.indptr
-    col_indices = A.indices
-    values = A.data
-
-    x = _amgx_solve_impl(row_ptrs, col_indices, values, b)
-    # Save the CSR matrix for backward pass
-    return x, A
+    x = _amgx_solve_impl(A.indptr, A.indices, A.data, b)
+    return x, (A, x)
 
 
-def _amgx_bwd(A, g):
-    """Backward pass: solve A^T λ = g for gradient.
-
-    For linear solve x = A^{-1} b, we have:
-        ∂L/∂b = A^{-T} (∂L/∂x)
-
-    Since A is symmetric for our problems, A^T = A, so we solve:
-        A λ = g  where g = ∂L/∂x
+def _amgx_bwd(residuals, g):
     """
-    # Extract CSR components
-    row_ptrs = A.indptr
-    col_indices = A.indices
-    values = A.data
+    Backward pass using Adjoint State Method.
+    Solves A^T λ = g to find adjoint λ, then computes gradients.
+    """
+    A, x = residuals
 
-    # Solve A^T λ = g (for symmetric A, this is A λ = g)
-    adj_b = _amgx_solve_impl(row_ptrs, col_indices, values, g)
+    # 1. Solve for Adjoint λ = A^{-T} g
+    # Since A is assumed symmetric for AmgX usually (or we just use transpose solve),
+    # we solve A^T λ = g.
+    adj_b = _amgx_solve_impl(A.indptr, A.indices, A.data, g)
 
-    # Gradients w.r.t. matrix structure are zero (not differentiating w.r.t. A)
-    zeros_A = jax.tree.map(jnp.zeros_like, A)
+    # 2. Compute gradients w.r.t. matrix values
+    # ∂L/∂A_ij = -λ_i * x_j
+    # Efficiently gather -λ[row[k]] * x[col[k]] for all non-zero entries k.
 
-    return zeros_A, adj_b
+    n = A.shape[0]
+    row_lengths = A.indptr[1:] - A.indptr[:-1]
+    row_indices = jnp.repeat(
+        jnp.arange(n, dtype=jnp.int32), row_lengths, total_repeat_length=len(A.data)
+    )
+
+    grad_values = -adj_b[row_indices] * x[A.indices]
+
+    grad_A = jsp.CSR((grad_values, A.indices, A.indptr), shape=A.shape)
+
+    return grad_A, adj_b
 
 
-amgx_solve.defvjp(_amgx_fwd, _amgx_bwd)
+_amgx_solve_csr.defvjp(_amgx_fwd, _amgx_bwd)
+
+
+def amgx_solve(A, b):
+    """
+    Solve Ax=b using AmgX (differentiable).
+
+    Args:
+        A: either a jax.experimental.sparse.CSR matrix or a callable A(x).
+           Callables are automatically materialized to CSR.
+        b: RHS vector (float32).
+
+    Returns:
+        x: Solution vector (float32).
+
+    """
+    A_csr = _normalize_linear_operator(A, b=b)
+    return _amgx_solve_csr(A_csr, b)

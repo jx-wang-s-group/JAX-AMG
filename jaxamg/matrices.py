@@ -166,6 +166,36 @@ def poisson_matrix(n: int) -> jsp.CSR:
     return jsp.CSR((vals, cols, indptr), shape=(n2, n2))
 
 
+def tridiagonal_operator(diagonal_value: float = 2.0):
+    """Create a tridiagonal operator with [-1, diagonal_value, -1] pattern."""
+    kernel = jnp.array([-1.0, diagonal_value, -1.0])
+    matvec = lambda x: jnp.convolve(x, kernel, mode="same")
+    return matvec
+
+
+def poisson_operator():
+    """Create a 2D Poisson operator (flat input)."""
+    kernel = jnp.array(
+        [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]], dtype=jnp.float32
+    )
+
+    def matvec(u_flat):
+        size = u_flat.shape[0]
+        n = int(size**0.5 + 0.5)
+
+        if n * n != size:
+            raise ValueError(f"Input size {size} is not a perfect square (n^2).")
+
+        u = u_flat.reshape((n, n))
+        # Boundary='fill', fillvalue=0.0 corresponds to Dirichlet BCs
+        Au = jax.scipy.signal.convolve2d(
+            u, kernel, mode="same", boundary="fill", fillvalue=0.0
+        )
+        return Au.ravel()
+
+    return matvec
+
+
 def rhs_ones(n: int):
     """Create a constant RHS vector of ones.
 

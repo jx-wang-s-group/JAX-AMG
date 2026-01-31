@@ -13,7 +13,7 @@ from jaxamg.matrices import poisson_matrix, rhs_ones
 def main():
     # Setup a Poisson problem on a 32x32 grid
     grid_size = 32
-    print(f"\nSetting up Poisson problem on {grid_size}×{grid_size} grid...")
+    print(f"Setting up Poisson problem on {grid_size}×{grid_size} grid...")
     A = poisson_matrix(grid_size)
     n = grid_size**2
     print(f"Matrix size: {n}×{n}")

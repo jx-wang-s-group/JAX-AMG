@@ -15,7 +15,7 @@ def main():
 
     # Setup tridiagonal system
     n = 64
-    print(f"Setting up {n}×{n} system...")
+    print(f"Setting up {n}×{n} tridiagonal system...")
     A = tridiagonal_matrix(n, diagonal_value=4.0)  # Better conditioned
 
     # Initial right-hand side
