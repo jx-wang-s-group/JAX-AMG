@@ -1,5 +1,5 @@
 """
-Helper functions for CSR matrix operations.
+Helper functions for BCSR matrix operations.
 """
 
 import jax
@@ -10,26 +10,25 @@ import scipy.sparse as sp
 from collections import defaultdict
 
 
-def from_scipy(A: sp.csr_matrix) -> jsp.CSR:
-    """Convert a scipy CSR matrix to JAX CSR format.
+def from_scipy(A: sp.csr_matrix) -> jsp.BCSR:
+    """Convert a scipy CSR matrix to JAX BCSR format (block_size=1).
 
     Args:
         A: Scipy CSR matrix
 
     Returns:
-        JAX CSR matrix with int32 indices and float32 values
+        JAX BCSR matrix with int32 indices and float32 values
     """
-    data = jnp.array(A.data, dtype=jnp.float32)
-    indices = jnp.array(A.indices, dtype=jnp.int32)
-    indptr = jnp.array(A.indptr, dtype=jnp.int32)
-    return jsp.CSR((data, indices, indptr), shape=A.shape)
+    # Use BCSR's built-in from_scipy_sparse method
+    # This automatically handles the conversion with block_size=1
+    return jsp.BCSR.from_scipy_sparse(A.astype(np.float32))
 
 
-def to_scipy(A: jsp.CSR) -> sp.csr_matrix:
-    """Convert a JAX CSR matrix to scipy CSR format.
+def to_scipy(A: jsp.BCSR) -> sp.csr_matrix:
+    """Convert a JAX BCSR matrix to scipy CSR format.
 
     Args:
-        A: JAX CSR matrix
+        A: JAX BCSR matrix
 
     Returns:
         Scipy CSR matrix
@@ -144,7 +143,7 @@ def materialize_sparse_matrix(A_callable, shape, rows, cols, column_colors, n_co
         n_colors: Number of colors.
 
     Returns:
-        A_csr: jax.experimental.sparse.CSR matrix containing the values from A_callable.
+        A_bcsr: jax.experimental.sparse.BCSR matrix containing the values from A_callable.
     """
     n, m = shape
 
@@ -168,7 +167,7 @@ def materialize_sparse_matrix(A_callable, shape, rows, cols, column_colors, n_co
     colors_for_cols = column_colors[cols]
     values = w_matrix[colors_for_cols, rows]
 
-    # Reconstruct CSR matrix with sorted indices
+    # Reconstruct BCSR matrix with sorted indices
     sort_idx = jnp.lexsort((cols, rows))
     rows_sorted = rows[sort_idx]
     cols_sorted = cols[sort_idx]
@@ -178,4 +177,4 @@ def materialize_sparse_matrix(A_callable, shape, rows, cols, column_colors, n_co
     row_counts = jnp.bincount(rows_sorted, length=n)
     indptr = indptr.at[1:].set(jnp.cumsum(row_counts))
 
-    return jsp.CSR((values_sorted, cols_sorted, indptr), shape=shape)
+    return jsp.BCSR((values_sorted, cols_sorted, indptr), shape=shape)

@@ -47,13 +47,13 @@ def _amgx_solve_impl(row_ptrs, col_indices, values, b, config_str=""):
 
 def _normalize_linear_operator(A, *, b=None):
     """
-    Normalize input 'A' to a CSR matrix.
+    Normalize input 'A' to a BCSR matrix.
 
     If 'A' is callable:
     1. Outside JIT: Computes sparsity pattern and graph coloring (O(N)), caches it on 'A', and materializes.
     2. Inside JIT: Uses cached coloring to materialize efficiently (O(Colors)).
     """
-    if isinstance(A, jsp.CSR):
+    if isinstance(A, jsp.BCSR):
         if A.data.dtype != jnp.float32:
             raise ValueError(f"Matrix values must be float32, got {A.data.dtype}.")
         if A.indices.dtype != jnp.int32:
@@ -116,7 +116,7 @@ def _normalize_linear_operator(A, *, b=None):
         return A_csr
 
     raise TypeError(
-        f"Matrix A must be either a jax.experimental.sparse.CSR matrix or a callable. "
+        f"Matrix A must be either a jax.experimental.sparse.BCSR matrix or a callable. "
         f"Got {type(A).__name__}."
     )
 
@@ -159,7 +159,7 @@ def _get_solver_primitive(config_str):
             jnp.arange(n, dtype=jnp.int32), row_lengths, total_repeat_length=len(A.data)
         )
         grad_values = -adj_b[row_indices] * x[A.indices]
-        grad_A = jsp.CSR((grad_values, A.indices, A.indptr), shape=A.shape)
+        grad_A = jsp.BCSR((grad_values, A.indices, A.indptr), shape=A.shape)
 
         return grad_A, adj_b
 

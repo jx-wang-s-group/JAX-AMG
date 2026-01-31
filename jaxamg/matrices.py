@@ -13,15 +13,15 @@ import scipy.sparse as sp
 from .utils import from_scipy
 
 
-def tridiagonal_matrix(n: int, diagonal_value: float = 2.0) -> jsp.CSR:
-    """Create a tridiagonal matrix in CSR format with [-1, diagonal_value, -1] pattern.
+def tridiagonal_matrix(n: int, diagonal_value: float = 2.0) -> jsp.BCSR:
+    """Create a tridiagonal matrix in BCSR format with [-1, diagonal_value, -1] pattern.
 
     Args:
         n: Size of the matrix (n x n)
         diagonal_value: Value to place on the main diagonal (default 2.0)
 
     Returns:
-        JAX CSR matrix with [-1, diagonal_value, -1] pattern
+        JAX BCSR matrix with [-1, diagonal_value, -1] pattern
     """
     # Total non-zeros: 2 + 3*(n-2) + 2 = 3*n - 2
     nnz = 3 * n - 2
@@ -90,17 +90,17 @@ def tridiagonal_matrix(n: int, diagonal_value: float = 2.0) -> jsp.CSR:
             [jnp.array([0], dtype=jnp.int32), jnp.cumsum(row_lengths)]
         )
 
-    return jsp.CSR((values, indices, indptr), shape=(n, n))
+    return jsp.BCSR((values, indices, indptr), shape=(n, n))
 
 
-def poisson_matrix(n: int) -> jsp.CSR:
-    """Create a 2D Poisson matrix on an n×n grid in CSR format.
+def poisson_matrix(n: int) -> jsp.BCSR:
+    """Create a 2D Poisson matrix on an n×n grid in BCSR format.
 
     Args:
         n: Grid size in each dimension (results in n² × n² matrix)
 
     Returns:
-        JAX CSR matrix representing the 2D Poisson operator
+        JAX BCSR matrix representing the 2D Poisson operator
     """
     n2 = n * n  # Total size
 
@@ -163,7 +163,7 @@ def poisson_matrix(n: int) -> jsp.CSR:
     row_counts = jnp.bincount(rows, length=n2)
     indptr = indptr.at[1:].set(jnp.cumsum(row_counts))
 
-    return jsp.CSR((vals, cols, indptr), shape=(n2, n2))
+    return jsp.BCSR((vals, cols, indptr), shape=(n2, n2))
 
 
 def tridiagonal_operator(diagonal_value: float = 2.0):
