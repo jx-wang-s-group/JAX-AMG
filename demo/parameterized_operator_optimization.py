@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import jax.experimental.sparse as jsp
 import numpy as np
 
-from jaxamg import amgx_solve
+from jaxamg import amg_solve
 from jaxamg.matrices import tridiagonal_operator, rhs_ones
 
 
@@ -21,13 +21,13 @@ def main():
     true_diag = 4.0
     b = rhs_ones(n)
     A_true = tridiagonal_operator(true_diag)
-    x_target = amgx_solve(A_true, b)
+    x_target = amg_solve(A_true, b)
 
     # Pre-scan: Compute coloring info outside of JIT
     print("Pre-scanning operator structure...")
     diag_init = 4.5  # Use initial guess to pre-scan
     A_dummy = tridiagonal_operator(diag_init)
-    _ = amgx_solve(A_dummy, b)
+    _ = amg_solve(A_dummy, b)
     coloring_cache = A_dummy._amgx_coloring_info
     print(f"Graph coloring computed. Number of colors: {coloring_cache[3]}")
 
@@ -41,7 +41,7 @@ def main():
         object.__setattr__(A, "_amgx_coloring_info", coloring_cache)
 
         # Solve
-        x_pred = amgx_solve(A, b)
+        x_pred = amg_solve(A, b)
 
         # Compute loss
         loss = jnp.mean((x_pred - x_true) ** 2)

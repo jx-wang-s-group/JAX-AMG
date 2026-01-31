@@ -7,7 +7,7 @@ This example demonstrates solving linear systems (tridiagonal and Poisson) using
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxamg import amgx_solve
+from jaxamg import amg_solve
 from jaxamg.matrices import (
     tridiagonal_matrix,
     tridiagonal_operator,
@@ -26,12 +26,12 @@ def main():
     ## Tridigiagonal operator
     print(f"Solving tridiagonal system with operator...")
     A_tri_op = tridiagonal_operator()
-    x_tri_op = amgx_solve(A_tri_op, b)
+    x_tri_op = amg_solve(A_tri_op, b)
 
     # Tridiagonal system as CSR matrix
     print(f"Solving tridiagonal system with CSR matrix...")
     A_tri_csr = tridiagonal_matrix(n)
-    x_tri_csr = amgx_solve(A_tri_csr, b)
+    x_tri_csr = amg_solve(A_tri_csr, b)
 
     # Display results
     print(f"Operator solution (first 5 entries): {x_tri_op[:5]}")
@@ -44,12 +44,12 @@ def main():
     ## Poisson operator
     print(f"Solving Poisson system with operator...")
     A_poi_op = poisson_operator()
-    x_poi_op = amgx_solve(A_poi_op, b)
+    x_poi_op = amg_solve(A_poi_op, b)
 
     # Poisson system as CSR matrix
     print(f"Solving Poisson system with CSR matrix...")
     A_poi_csr = poisson_matrix(n_grid)
-    x_poi_csr = amgx_solve(A_poi_csr, b)
+    x_poi_csr = amg_solve(A_poi_csr, b)
 
     # Display results
     print(f"Operator solution (first 5 entries): {x_poi_op[:5]}")

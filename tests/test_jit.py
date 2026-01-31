@@ -3,7 +3,7 @@
 import jax
 import numpy as np
 
-from jaxamg import amgx_solve
+from jaxamg import amg_solve
 from jaxamg.matrices import tridiagonal_matrix, rhs_ones
 
 
@@ -19,13 +19,13 @@ class TestJIT:
         # Create JIT-compiled version
         @jax.jit
         def solve_jit(b):
-            return amgx_solve(A, b)
+            return amg_solve(A, b)
 
         # Solve with JIT
         x_jit = solve_jit(b)
 
         # Solve without JIT
-        x_nojit = amgx_solve(A, b)
+        x_nojit = amg_solve(A, b)
 
         # Compare results
         np.testing.assert_allclose(x_jit, x_nojit)
@@ -37,7 +37,7 @@ class TestJIT:
 
         @jax.jit
         def solve_jit(b):
-            return amgx_solve(A, b)
+            return amg_solve(A, b)
 
         # Solve with two different RHS
         b1 = rhs_ones(n)

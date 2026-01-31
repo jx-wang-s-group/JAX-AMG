@@ -5,7 +5,7 @@ import numpy as np
 import scipy.sparse.linalg as spla
 import jax.numpy as jnp
 
-from jaxamg import amgx_solve
+from jaxamg import amg_solve
 from jaxamg.matrices import tridiagonal_matrix, poisson_matrix, rhs_ones
 from jaxamg.utils import to_scipy
 
@@ -18,7 +18,7 @@ class TestSolver:
         """Test solving a 1D tridiagonal system against analytical solution."""
         A = tridiagonal_matrix(n)
         b = rhs_ones(n)
-        x = amgx_solve(A, b)
+        x = amg_solve(A, b)
 
         # Verify that Ax = b
         np.testing.assert_allclose(b, A @ x)
@@ -46,7 +46,7 @@ class TestSolver:
         b = jnp.array(A @ x_true)
 
         # Solve
-        x_computed = amgx_solve(A, b)
+        x_computed = amg_solve(A, b)
 
         # Compare with true solution
         np.testing.assert_allclose(x_computed, x_true, atol=1e-6)
@@ -59,7 +59,7 @@ class TestSolver:
         b = rhs_ones(n)
 
         # Solve
-        x = amgx_solve(A, b)
+        x = amg_solve(A, b)
 
         # Solve with Scipy
         A_sp = to_scipy(A)

@@ -5,7 +5,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from jaxamg import amgx_solve
+from jaxamg import amg_solve
 from jaxamg.matrices import (
     tridiagonal_matrix,
     tridiagonal_operator,
@@ -24,8 +24,8 @@ class TestOperator:
         b = rhs_ones(n)
 
         # Solve with operator and CSR matrix
-        x_op = amgx_solve(A_op, b)
-        x_csr = amgx_solve(A_csr, b)
+        x_op = amg_solve(A_op, b)
+        x_csr = amg_solve(A_csr, b)
 
         # Check that the solutions are the same
         np.testing.assert_allclose(x_op, x_csr)
@@ -42,7 +42,7 @@ class TestOperator:
 
         # Solve without JIT
         # Also cache the coloring info for JIT compilation
-        x_nojit = amgx_solve(A, b)
+        x_nojit = amg_solve(A, b)
         coloring_cache = A._amgx_coloring_info
 
         # Solve with JIT
@@ -50,7 +50,7 @@ class TestOperator:
         def solve(diagonal_value, b):
             A = tridiagonal_operator(diagonal_value=diagonal_value)
             object.__setattr__(A, "_amgx_coloring_info", coloring_cache)
-            return amgx_solve(A, b)
+            return amg_solve(A, b)
 
         x_jit = solve(diagonal_value, b)
 
@@ -64,8 +64,8 @@ class TestOperator:
         b = rhs_ones(n * n)
 
         # Solve with operator and CSR matrix
-        x_op = amgx_solve(A_op, b)
-        x_csr = amgx_solve(A_csr, b)
+        x_op = amg_solve(A_op, b)
+        x_csr = amg_solve(A_csr, b)
 
         # Check that the solutions are the same
         np.testing.assert_allclose(x_op, x_csr)

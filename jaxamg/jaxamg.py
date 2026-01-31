@@ -64,7 +64,7 @@ def _normalize_linear_operator(A, *, b=None):
                 # Inside JIT without cache: Impossible to determine sparsity dynamically.
                 raise ValueError(
                     "Callable operators must be pre-scanned before JIT compilation to determine sparsity.\n"
-                    "Call amgx_solve(A, b) once outside of JIT to compute and cache the sparsity pattern."
+                    "Call amg_solve(A, b) once outside of JIT to compute and cache the sparsity pattern."
                 )
 
             # Outside JIT: Compute sparsity and coloring (expensive O(N))
@@ -148,7 +148,7 @@ def _amgx_bwd(residuals, g):
 _amgx_solve_csr.defvjp(_amgx_fwd, _amgx_bwd)
 
 
-def amgx_solve(A, b):
+def amg_solve(A, b):
     """
     Solve Ax=b using AmgX (differentiable).
 
