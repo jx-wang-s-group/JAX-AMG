@@ -13,18 +13,14 @@ def main():
     # Setup: Large 1D Laplacian (tridiagonal matrix)
     n = 1024  # System size
     print(f"Setting up {n}×{n} tridiagonal system...")
-    matrix = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
-    row_ptrs = matrix['row_ptrs']
-    col_indices = matrix['col_indices']
-    values = matrix['values']
-    A = matrix['A']
+    A = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
 
     # Right-hand side: constant vector
     b = rhs_ones(n)
 
     # Solve Ax = b
     print("Solving...")
-    x = amgx_solve(row_ptrs, col_indices, values, b)
+    x = amgx_solve(A, b)
 
     # Compute residual: ||b - Ax|| / ||b||
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)

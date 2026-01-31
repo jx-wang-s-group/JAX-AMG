@@ -15,10 +15,7 @@ def main():
     # Setup tridiagonal system
     n = 64
     print(f"Setting up {n}×{n} system...")
-    matrix = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
-    row_ptrs = matrix['row_ptrs']
-    col_indices = matrix['col_indices']
-    values = matrix['values']
+    A = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
 
     # Initial right-hand side
     b_init = rhs_ones(n)
@@ -26,7 +23,7 @@ def main():
     # Define a loss function: L(b) = ||x||² where x = A⁻¹b
     def loss(b):
         """Loss function: sum of squared solution components."""
-        x = amgx_solve(row_ptrs, col_indices, values, b)
+        x = amgx_solve(A, b)
         return jnp.sum(x * x)
 
     # JIT-compile the loss and gradient functions

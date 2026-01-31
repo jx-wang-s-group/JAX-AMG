@@ -5,19 +5,21 @@ import scipy.sparse.linalg as spla
 import jax
 import jax.numpy as jnp
 from jax.test_util import check_grads
+
 from jaxamg import amgx_solve
 from jaxamg.matrices import tridiagonal_matrix, rhs_ones, rhs_random
+from jaxamg.utils import to_scipy
 
 
-def l2_loss(data, b):
+def l2_loss(A, b):
     """Compute L(b) = ||A^{-1} b||^2."""
-    x = amgx_solve(data['row_ptrs'], data['col_indices'], data['values'], b)
+    x = amgx_solve(A, b)
     return jnp.sum(x * x)
 
 
-def vdot_loss(data, v, b):
+def vdot_loss(A, v, b):
     """Compute L(b) = v^T A^{-1} b."""
-    x = amgx_solve(data['row_ptrs'], data['col_indices'], data['values'], b)
+    x = amgx_solve(A, b)
     return jnp.dot(v, x)
 
 
@@ -32,18 +34,20 @@ class TestGradient:
         For loss L(b) = ||x||^2 where x = A^{{-1}}b:
         ∂L/∂b = 2 * A^{{-T}} * x
         """
-        data = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
+        A = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
         b = rhs_ones(n)
 
         # Define loss function
-        loss = lambda b: l2_loss(data, b)
+        loss = lambda b: l2_loss(A, b)
 
         # Compute gradient with JAX
         grad_jax = jax.grad(loss)(b)
 
         # Compute gradient with SciPy (∂L/∂b = 2 * A^(-T) * x)
-        x = amgx_solve(data['row_ptrs'], data['col_indices'], data['values'], b)
-        grad_sp = 2.0 * spla.spsolve(data['A'].T.tocsr(), np.asarray(x))
+        x = amgx_solve(A, b)
+        # Convert JAX CSR to scipy for comparison
+        A_sp = to_scipy(A)
+        grad_sp = 2.0 * spla.spsolve(A_sp.T.tocsr(), np.asarray(x))
 
         # Comparison with SciPy solution
         np.testing.assert_allclose(grad_jax, grad_sp, rtol=1e-6)
@@ -60,7 +64,7 @@ class TestGradient:
         ∂L/∂b = A^(-T) v
         """
         n = 32
-        data = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
+        A = tridiagonal_matrix(n, diagonal_value=4.0) # Better conditioned
         b = rhs_ones(n)
 
         # Random vector for VJP
@@ -68,13 +72,14 @@ class TestGradient:
         v = jax.random.normal(rng, (len(b),), dtype=jnp.float32)
 
         # Define loss function
-        loss = lambda b: vdot_loss(data, v, b)
+        loss = lambda b: vdot_loss(A, v, b)
 
         # Compute gradient with JAX
         grad_jax = jax.grad(loss)(b)
 
         # Compute gradient with SciPy
-        grad_sp = spla.spsolve(data['A'].T.tocsr(), np.asarray(v))
+        A_sp = to_scipy(A)
+        grad_sp = spla.spsolve(A_sp.T.tocsr(), np.asarray(v))
 
         # Comparison with SciPy solution
         np.testing.assert_allclose(grad_jax, grad_sp, rtol=1e-5)
@@ -85,11 +90,11 @@ class TestGradient:
     def test_gradient_jit(self):
         """Test that gradients work with JIT compilation."""
         n = 32
-        data = tridiagonal_matrix(n)
+        A = tridiagonal_matrix(n)
         b = rhs_random(n)
 
         # Define loss function
-        loss = lambda b: l2_loss(data, b)
+        loss = lambda b: l2_loss(A, b)
 
         # JIT-compiled gradient
         grad_fn_jit = jax.jit(jax.grad(loss))

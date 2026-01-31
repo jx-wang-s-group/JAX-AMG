@@ -13,11 +13,7 @@ def main():
     # Setup a Poisson problem on a 32x32 grid
     grid_size = 32
     print(f"\nSetting up Poisson problem on {grid_size}×{grid_size} grid...")
-    matrix = poisson_matrix(grid_size)
-    row_ptrs = matrix['row_ptrs']
-    col_indices = matrix['col_indices']
-    values = matrix['values']
-    A = matrix['A']
+    A = poisson_matrix(grid_size)
     n = grid_size**2
     print(f"Matrix size: {n}×{n}")
 
@@ -26,7 +22,7 @@ def main():
 
     # Solve Ax = b
     print("Solving...")
-    x = amgx_solve(row_ptrs, col_indices, values, b)
+    x = amgx_solve(A, b)
 
     # Compute residual: ||b - Ax|| / ||b||
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)

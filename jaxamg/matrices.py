@@ -1,12 +1,15 @@
-"""Standard test matrices and RHS vectors for jaxamg.
+"""
+Standard test matrices and RHS vectors.
 
 This module provides common sparse matrix patterns (1D Laplacian, 2D Poisson)
 and right-hand-side vector generators for testing and demonstration purposes.
 """
 import jax
 import jax.numpy as jnp
+import jax.experimental.sparse as jsp
 import numpy as np
 import scipy.sparse as sp
+from .utils import from_scipy
 
 
 def laplacian_1d(n: int, diagonal_value: float = 2.0) -> sp.csr_matrix:
@@ -20,40 +23,21 @@ def laplacian_1d(n: int, diagonal_value: float = 2.0) -> sp.csr_matrix:
     """
     return sp.diags([-1, diagonal_value, -1], offsets=[-1, 0, 1], shape=(n, n), format='csr', dtype=np.float32)
 
-def csr_components(A: sp.csr_matrix):
-    """Extract CSR components from a scipy sparse matrix.
 
-    Args:
-        A: Scipy CSR matrix
-
-    Returns:
-        Dictionary with keys:
-            - 'A': Original CSR matrix
-            - 'row_ptrs': JAX array of row pointers (int32)
-            - 'col_indices': JAX array of column indices (int32)
-            - 'values': JAX array of matrix values (float32)
-    """
-    return {
-        "A": A,
-        "row_ptrs": jnp.array(A.indptr, dtype=jnp.int32),
-        "col_indices": jnp.array(A.indices, dtype=jnp.int32),
-        "values": jnp.array(A.data, dtype=jnp.float32),
-    }
-
-
-def tridiagonal_matrix(n: int, diagonal_value: float = 2.0):
-    """Create a 1D tridiagonal test matrix and CSR components.
+def tridiagonal_matrix(n: int, diagonal_value: float = 2.0) -> jsp.CSR:
+    """Create a 1D tridiagonal test matrix.
 
     Args:
         n: Size of the matrix (n x n)
+        diagonal_value: Value to place on the main diagonal (default 2.0)
 
     Returns:
-        Dictionary with matrix and CSR components (see csr_components)
+        JAX CSR matrix with [-1, diagonal_value, -1] pattern
     """
-    return csr_components(laplacian_1d(n, diagonal_value=diagonal_value))
+    return from_scipy(laplacian_1d(n, diagonal_value=diagonal_value))
 
 
-def poisson_matrix(n: int):
+def poisson_matrix(n: int) -> jsp.CSR:
     """Create a 2D Poisson matrix using Kronecker sum.
 
     Constructs the discrete 2D Laplacian operator for an n×n grid
@@ -64,11 +48,11 @@ def poisson_matrix(n: int):
         n: Grid size in each dimension (results in n² × n² matrix)
 
     Returns:
-        Dictionary with matrix and CSR components (see csr_components)
+        JAX CSR matrix representing the 2D Poisson operator
     """
     L1D = laplacian_1d(n)
     A = sp.kronsum(L1D, L1D, format='csr').astype(np.float32)
-    return csr_components(A)
+    return from_scipy(A)
 
 
 def rhs_ones(n: int):
