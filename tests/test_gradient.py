@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 from jax.test_util import check_grads
 
-from jaxamg import amg_solve
+from jaxamg import amg_solve, cache_coloring, with_coloring
 from jaxamg.matrices import (
     tridiagonal_matrix,
     tridiagonal_operator,
@@ -135,15 +135,14 @@ class TestGradient:
         n = 16
         b = rhs_ones(n)
 
-        # Pre-scan to cache coloring info
-        A_dummy = tridiagonal_operator(diagonal_value=1.0)
-        _ = amg_solve(A_dummy, b)
-        coloring_cache = A_dummy._amgx_coloring_info
+        # Compute coloring cache
+        coloring_cache = cache_coloring(
+            tridiagonal_operator(diagonal_value=1.0), size=n
+        )
 
         @jax.jit
         def loss(diagonal_value):
-            A = tridiagonal_operator(diagonal_value=diagonal_value)
-            object.__setattr__(A, "_amgx_coloring_info", coloring_cache)
+            A = with_coloring(tridiagonal_operator(diagonal_value), coloring_cache)
             return l2_loss(A, b)
 
         diagonal_value = 4.0

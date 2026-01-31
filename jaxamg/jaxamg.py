@@ -163,3 +163,79 @@ def amg_solve(A, b):
     """
     A_csr = _normalize_linear_operator(A, b=b)
     return _amgx_solve_csr(A_csr, b)
+
+
+def cache_coloring(operator, size):
+    """
+    Compute and cache coloring information for an operator.
+
+    This function computes the sparsity pattern and graph coloring for a callable
+    operator, enabling efficient use inside JIT-compiled functions.
+
+    Args:
+        operator: A callable operator A(x) that returns A @ x.
+        size: Size of the operator (n for an n×n matrix).
+
+    Returns:
+        Cached coloring information that can be reattached with `with_coloring()`.
+
+    Example:
+        >>> A = tridiagonal_operator(diagonal_value=2.0)
+        >>> cache = cache_coloring(A, size=100)
+        >>>
+        >>> @jax.jit
+        >>> def solve(diag, b):
+        >>>     A = with_coloring(tridiagonal_operator(diag), cache)
+        >>>     return amg_solve(A, b)
+    """
+    # Check if already cached
+    existing_cache = getattr(operator, "_amgx_coloring_info", None)
+    if existing_cache is not None:
+        # Verify size matches
+        cached_shape = existing_cache[4]
+        if cached_shape == (size, size):
+            return existing_cache
+        else:
+            raise ValueError(
+                f"Operator already has cached coloring for size {cached_shape[0]}, "
+                f"but requested size {size}. Create a new operator instance."
+            )
+
+    # Compute sparsity pattern and coloring
+    shape = (size, size)
+    rows, cols = utils.get_sparsity_pattern(operator, shape)
+    column_colors, n_colors = utils.get_column_coloring(rows, cols, shape)
+
+    cache = (rows, cols, column_colors, n_colors, shape)
+
+    # Try to attach to operator for convenience
+    try:
+        setattr(operator, "_amgx_coloring_info", cache)
+    except Exception:
+        pass  # Ignore if caching fails
+
+    return cache
+
+
+def with_coloring(operator, cache):
+    """
+    Attach cached coloring information to an operator.
+
+    This allows using parameterized operators inside JIT-compiled functions
+    without recomputing the sparsity pattern and coloring.
+
+    Args:
+        operator: A callable operator.
+        cache: Cached coloring information from `cache_coloring()`.
+
+    Returns:
+        The same operator with coloring cache attached.
+    """
+    try:
+        object.__setattr__(operator, "_amgx_coloring_info", cache)
+    except Exception as e:
+        raise TypeError(
+            f"Cannot attach coloring cache to operator of type {type(operator).__name__}. "
+            f"Error: {e}"
+        )
+    return operator
