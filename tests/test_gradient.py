@@ -106,3 +106,21 @@ class TestGradient:
 
         # Comparison
         np.testing.assert_allclose(g_jit, g_nojit)
+
+    def test_gradient_wrt_diagonal_value(self):
+        """Test gradient of loss function with respect to diagonal value."""
+        n = 32
+        b = rhs_ones(n)
+
+        @jax.jit
+        def loss(diagonal_value):
+            A = tridiagonal_matrix(n, diagonal_value=diagonal_value)
+            return l2_loss(A, b)
+
+        diagonal_value = 4.0
+
+        # Compute gradient with JAX
+        grad = jax.grad(loss)(diagonal_value)
+
+        # Compute gradient with finite differences
+        check_grads(loss, (diagonal_value,), order=1, modes=["rev"])
