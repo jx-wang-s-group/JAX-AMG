@@ -73,8 +73,8 @@ namespace
     AMGX_vector_handle b_vec;
     AMGX_solver_handle solver;
 
-    // Use host mode (hFFI) to avoid CUDA context issues
-    const AMGX_Mode mode = AMGX_mode_hFFI;
+    // Use device mode (dFFI) for direct GPU pointer access (no host transfer)
+    const AMGX_Mode mode = AMGX_mode_dFFI;
     const char *cfg_str =
         "config_version=2, solver=CG, preconditioner=AMG, max_iters=100, "
         "tolerance=1e-6, norm=L2, print_solve_stats=1, monitor_residual=1, "
@@ -83,39 +83,25 @@ namespace
     AMGX_SAFE_CALL(AMGX_config_create(&cfg, cfg_str));
     AMGX_SAFE_CALL(AMGX_resources_create_simple(&rsrc, cfg));
 
-    // Download device data to host for hFFI mode
-    int *row_ptrs_host = new int[n + 1];
-    int *col_indices_host = new int[nnz];
-    float *values_host = new float[nnz];
-    float *b_host = new float[n];
-    float *x_host = new float[n];
-
-    cudaMemcpyAsync(row_ptrs_host, row_ptrs_data, (n + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(col_indices_host, col_indices_data, nnz * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(values_host, values_data, nnz * sizeof(float), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(b_host, b_data, n * sizeof(float), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-
+    // Create AmgX objects in device mode
     AMGX_SAFE_CALL(AMGX_matrix_create(&A, rsrc, mode));
     AMGX_SAFE_CALL(AMGX_vector_create(&x_vec, rsrc, mode));
     AMGX_SAFE_CALL(AMGX_vector_create(&b_vec, rsrc, mode));
     AMGX_SAFE_CALL(AMGX_solver_create(&solver, rsrc, mode, cfg));
 
-    // Upload matrix and vectors
+    // Upload matrix and vectors directly from device pointers
     AMGX_SAFE_CALL(AMGX_matrix_upload_all(A, n, nnz, 1, 1,
-                                          row_ptrs_host, col_indices_host,
-                                          values_host, nullptr));
-    AMGX_SAFE_CALL(AMGX_vector_upload(b_vec, n, 1, b_host));
+                                          row_ptrs_data, col_indices_data,
+                                          values_data, nullptr));
+    AMGX_SAFE_CALL(AMGX_vector_upload(b_vec, n, 1, b_data));
     AMGX_SAFE_CALL(AMGX_vector_set_zero(x_vec, n, 1));
 
+    // Solve the system
     AMGX_SAFE_CALL(AMGX_solver_setup(solver, A));
     AMGX_SAFE_CALL(AMGX_solver_solve(solver, b_vec, x_vec));
 
-    // Download result and upload to device
-    AMGX_SAFE_CALL(AMGX_vector_download(x_vec, x_host));
-    cudaMemcpyAsync(x_data, x_host, static_cast<size_t>(n) * sizeof(float),
-                    cudaMemcpyHostToDevice, stream);
-    cudaStreamSynchronize(stream);
+    // Download result directly to device memory (no host intermediate!)
+    AMGX_SAFE_CALL(AMGX_vector_download(x_vec, x_data));
 
     // Cleanup
     AMGX_SAFE_CALL(AMGX_solver_destroy(solver));
@@ -124,12 +110,6 @@ namespace
     AMGX_SAFE_CALL(AMGX_matrix_destroy(A));
     AMGX_SAFE_CALL(AMGX_resources_destroy(rsrc));
     AMGX_SAFE_CALL(AMGX_config_destroy(cfg));
-
-    delete[] row_ptrs_host;
-    delete[] col_indices_host;
-    delete[] values_host;
-    delete[] b_host;
-    delete[] x_host;
 
     return ffi::Error::Success();
   }
