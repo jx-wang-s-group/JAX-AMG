@@ -19,13 +19,14 @@ class TestJIT:
         # Create JIT-compiled version
         @jax.jit
         def solve_jit(b):
-            return amg_solve(A, b)
+            x, _ = amg_solve(A, b)
+            return x
 
         # Solve with JIT
         x_jit = solve_jit(b)
 
         # Solve without JIT
-        x_nojit = amg_solve(A, b)
+        x_nojit, _ = amg_solve(A, b)
 
         # Compare results
         np.testing.assert_allclose(x_jit, x_nojit)
@@ -37,7 +38,8 @@ class TestJIT:
 
         @jax.jit
         def solve_jit(b):
-            return amg_solve(A, b)
+            x, _ = amg_solve(A, b)
+            return x
 
         # Solve with two different RHS
         b1 = rhs_ones(n)

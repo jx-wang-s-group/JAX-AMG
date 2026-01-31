@@ -24,8 +24,8 @@ class TestOperator:
         b = rhs_ones(n)
 
         # Solve with operator and CSR matrix
-        x_op = amg_solve(A_op, b)
-        x_csr = amg_solve(A_csr, b)
+        x_op, _ = amg_solve(A_op, b)
+        x_csr, _ = amg_solve(A_csr, b)
 
         # Check that the solutions are the same
         np.testing.assert_allclose(x_op, x_csr)
@@ -47,12 +47,13 @@ class TestOperator:
         @jax.jit
         def solve(diagonal_value, b):
             A = with_coloring(tridiagonal_operator(diagonal_value), coloring_cache)
-            return amg_solve(A, b)
+            x, _ = amg_solve(A, b)
+            return x
 
         x_jit = solve(diagonal_value, b)
 
         # Solve without JIT for comparison
-        x_nojit = amg_solve(A, b)
+        x_nojit, _ = amg_solve(A, b)
 
         np.testing.assert_allclose(x_jit, x_nojit)
 
@@ -64,8 +65,8 @@ class TestOperator:
         b = rhs_ones(n * n)
 
         # Solve with operator and CSR matrix
-        x_op = amg_solve(A_op, b)
-        x_csr = amg_solve(A_csr, b)
+        x_op, _ = amg_solve(A_op, b)
+        x_csr, _ = amg_solve(A_csr, b)
 
         # Check that the solutions are the same
         np.testing.assert_allclose(x_op, x_csr)

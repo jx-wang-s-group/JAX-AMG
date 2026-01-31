@@ -1,9 +1,17 @@
+/*
+ *
+ * This file implements the XLA Custom Call handler for NVIDIA AmgX.
+ * It uses the JAX Typed FFI (foreign function interface) to expose
+ * AmgX functionality to JAX programs running on GPU.
+ */
+
 #include <pybind11/pybind11.h>
 #include <cuda_runtime.h>
 #include <amgx_c.h>
 #include <xla/ffi/api/ffi.h>
 #include <cstdint>
 #include <mutex>
+#include <string>
 
 namespace py = pybind11;
 namespace ffi = xla::ffi;
@@ -18,54 +26,73 @@ namespace
     AMGX_SAFE_CALL(AMGX_finalize());
   }
 
-  void EnsureAmgxInitialized()
+  // Custom callback to suppress AmgX library output (banners, version info)
+  void PrintCallback(const char *msg, int length)
   {
-    std::call_once(g_amgx_init_flag, []()
-                   {
-    AMGX_SAFE_CALL(AMGX_initialize());
-    AMGX_SAFE_CALL(AMGX_install_signal_handler());
-    std::atexit(AmgxFinalize); });
+      // No-op: Output is fully suppressed to keep stdout clean for the user.
+      return;
   }
 
-  // Typed FFI handler using XLA FFI API
+  void EnsureAmgxInitialized()
+  {
+    std::call_once(g_amgx_init_flag, []() {
+        // Register print callback before initialization
+        AMGX_register_print_callback(PrintCallback);
+
+        AMGX_SAFE_CALL(AMGX_initialize());
+        AMGX_SAFE_CALL(AMGX_install_signal_handler());
+        std::atexit(AmgxFinalize);
+    });
+  }
+
+  /*
+   * AmgxSolveImpl: Core implementation of the XLA FFI handler.
+   *
+   * Arguments:
+   *   stream: CUDA stream provided by XLA/JAX.
+   *   row_ptrs, col_indices, values: CSR matrix components (on device).
+   *   b: RHS vector (on device).
+   *   x: Output solution buffer (on device).
+   *   stats: Output statistics buffer [iterations, residual, status].
+   *   config: AmgX configuration string.
+   */
   ffi::Error AmgxSolveImpl(cudaStream_t stream,
                            ffi::Buffer<ffi::S32> row_ptrs,
                            ffi::Buffer<ffi::S32> col_indices,
                            ffi::Buffer<ffi::F32> values,
                            ffi::Buffer<ffi::F32> b,
-                           ffi::ResultBuffer<ffi::F32> x)
+                           ffi::ResultBuffer<ffi::F32> x,
+                           ffi::ResultBuffer<ffi::F32> stats,
+                           std::string_view config)
   {
     EnsureAmgxInitialized();
 
-    // Set the device for this stream
+    // 1. Setup execution context
     int device;
-    cudaError_t err = cudaGetDevice(&device);
-    if (err != cudaSuccess)
-    {
+    if (cudaGetDevice(&device) != cudaSuccess) {
       return ffi::Error::Internal("cudaGetDevice failed");
     }
-    // Extract dimensions using dimensions() method
-    const int n = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
-    const int nnz = static_cast<int>(values.dimensions().size() > 0 ? values.dimensions()[0] : 0);
-    const int n_rows_plus_1 = static_cast<int>(row_ptrs.dimensions().size() > 0 ? row_ptrs.dimensions()[0] : 0);
 
-    // Get pointers to buffer data
+    if (cudaSetDevice(device) != cudaSuccess) {
+      return ffi::Error::Internal("cudaSetDevice failed");
+    }
+
+    // Synchronize stream to ensure inputs are ready
+    cudaStreamSynchronize(stream);
+
+    // 2. Prepare data pointers (Device Mode / dFFI)
+    // We cast to raw pointers to pass directly to AmgX, avoiding host transfers.
     int *row_ptrs_data = const_cast<int *>(row_ptrs.typed_data());
     int *col_indices_data = const_cast<int *>(col_indices.typed_data());
     float *values_data = const_cast<float *>(values.typed_data());
     float *b_data = const_cast<float *>(b.typed_data());
     float *x_data = x->typed_data();
+    float *stats_data = stats->typed_data();
 
-    // Synchronize stream before calling AmgX
-    cudaStreamSynchronize(stream);
+    // Dimensions
+    const int n_rows = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
 
-    err = cudaSetDevice(device);
-    if (err != cudaSuccess)
-    {
-      return ffi::Error::Internal("cudaSetDevice failed");
-    }
-
-    // Initialize AmgX objects
+    // 3. Initialize AmgX Resources
     AMGX_config_handle cfg;
     AMGX_resources_handle rsrc;
     AMGX_matrix_handle A;
@@ -73,40 +100,80 @@ namespace
     AMGX_vector_handle b_vec;
     AMGX_solver_handle solver;
 
-    // Use device mode (dFFI) for direct GPU pointer access (no host transfer)
+    // Use AMGX_mode_dFFI to indicate data is already on the device
     const AMGX_Mode mode = AMGX_mode_dFFI;
-    const char *cfg_str =
-        "config_version=2, solver=CG, preconditioner=AMG, max_iters=100, "
-        "tolerance=1e-6, norm=L2, print_solve_stats=1, monitor_residual=1, "
-        "cycle=V, smoother=JACOBI_L1";
 
-    AMGX_SAFE_CALL(AMGX_config_create(&cfg, cfg_str));
+    // Prepare configuration
+    std::string config_str(config);
+    if (config_str.empty()) {
+        config_str = "config_version=2, solver=CG, preconditioner=AMG, max_iters=100, tolerance=1e-6, norm=L2";
+    }
+
+    AMGX_SAFE_CALL(AMGX_config_create(&cfg, config_str.c_str()));
+
+    // Enforce history storage to enable residual retrieval
+    AMGX_SAFE_CALL(AMGX_config_add_parameters(&cfg, "store_res_history=1"));
     AMGX_SAFE_CALL(AMGX_resources_create_simple(&rsrc, cfg));
 
-    // Create AmgX objects in device mode
+    // Create Matrix and Vectors
     AMGX_SAFE_CALL(AMGX_matrix_create(&A, rsrc, mode));
     AMGX_SAFE_CALL(AMGX_vector_create(&x_vec, rsrc, mode));
     AMGX_SAFE_CALL(AMGX_vector_create(&b_vec, rsrc, mode));
     AMGX_SAFE_CALL(AMGX_solver_create(&solver, rsrc, mode, cfg));
 
-    // Upload matrix and vectors directly from device pointers
-    AMGX_SAFE_CALL(AMGX_matrix_upload_all(A, n, nnz, 1, 1,
-                                          row_ptrs_data, col_indices_data,
-                                          values_data, nullptr));
-    AMGX_SAFE_CALL(AMGX_vector_upload(b_vec, n, 1, b_data));
-    AMGX_SAFE_CALL(AMGX_vector_set_zero(x_vec, n, 1));
+    // 4. Bind Data (No Copies)
+    // Upload matrix data (binds device pointers)
+    AMGX_SAFE_CALL(AMGX_matrix_upload_all(A, n_rows, (int)values.element_count(), 1, 1,
+                                          row_ptrs_data, col_indices_data, values_data, nullptr));
 
-    // Solve the system
+    // Bind RHS vector
+    AMGX_SAFE_CALL(AMGX_vector_upload(b_vec, n_rows, 1, b_data));
+
+    // Initialize solution vector to zero
+    AMGX_SAFE_CALL(AMGX_vector_set_zero(x_vec, n_rows, 1));
+
+    // 5. Solve System
     AMGX_SAFE_CALL(AMGX_solver_setup(solver, A));
     AMGX_SAFE_CALL(AMGX_solver_solve(solver, b_vec, x_vec));
 
-    // Download result directly to device memory (no host intermediate!)
+    // 6. Retrieve Results & Statistics
+    AMGX_SOLVE_STATUS status;
+    AMGX_SAFE_CALL(AMGX_solver_get_status(solver, &status));
+
+    if (status == AMGX_SOLVE_FAILED) {
+      // Clean up before returning error
+      AMGX_solver_destroy(solver);
+      AMGX_vector_destroy(b_vec);
+      AMGX_vector_destroy(x_vec);
+      AMGX_matrix_destroy(A);
+      AMGX_resources_destroy(rsrc);
+      AMGX_config_destroy(cfg);
+      return ffi::Error::Internal("AmgX solve failed");
+    }
+
+    int iters = 0;
+    double residual = 0.0;
+
+    AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(solver, &iters));
+
+    // Retrieve residual at the final iteration
+    AMGX_SAFE_CALL(AMGX_solver_get_iteration_residual(solver, iters, 0, &residual));
+
+    // Transfer stats to output buffer [iters, residual, status]
+    float stats_host[3] = {
+        static_cast<float>(iters),
+        static_cast<float>(residual),
+        static_cast<float>(status)
+    };
+    cudaMemcpyAsync(stats_data, stats_host, 3 * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+    // Download solution (copies from AmgX internal buffer to JAX output buffer)
     AMGX_SAFE_CALL(AMGX_vector_download(x_vec, x_data));
 
-    // Cleanup
+    // 7. Cleanup
     AMGX_SAFE_CALL(AMGX_solver_destroy(solver));
-    AMGX_SAFE_CALL(AMGX_vector_destroy(x_vec));
     AMGX_SAFE_CALL(AMGX_vector_destroy(b_vec));
+    AMGX_SAFE_CALL(AMGX_vector_destroy(x_vec));
     AMGX_SAFE_CALL(AMGX_matrix_destroy(A));
     AMGX_SAFE_CALL(AMGX_resources_destroy(rsrc));
     AMGX_SAFE_CALL(AMGX_config_destroy(cfg));
@@ -114,9 +181,10 @@ namespace
     return ffi::Error::Success();
   }
 
-  // Define handler symbol with typed FFI binding
-  XLA_FFI_DEFINE_HANDLER_SYMBOL(
-      AmgxSolve, AmgxSolveImpl,
+  // Register XLA FFI Handler
+  XLA_FFI_DEFINE_HANDLER(
+      AmgxSolve,
+      AmgxSolveImpl,
       ffi::Ffi::Bind()
           .Ctx<ffi::PlatformStream<cudaStream_t>>() // CUDA stream context
           .Arg<ffi::Buffer<ffi::S32>>()             // row_ptrs
@@ -124,6 +192,8 @@ namespace
           .Arg<ffi::Buffer<ffi::F32>>()             // values
           .Arg<ffi::Buffer<ffi::F32>>()             // b
           .Ret<ffi::Buffer<ffi::F32>>()             // x
+          .Ret<ffi::Buffer<ffi::F32>>()             // stats
+          .Attr<std::string_view>("config")         // config string
   );
 
 } // namespace

@@ -3,6 +3,8 @@ import jax.numpy as jnp
 import jax.ffi as ffi
 import jax.experimental.sparse as jsp
 from jax import core
+import functools
+from enum import IntEnum
 
 from . import _amgx_ext, utils
 
@@ -14,16 +16,33 @@ _AMGX_HANDLER = _amgx_ext.get_amgx_solve_handler()
 ffi.register_ffi_target(_AMGX_CALL_NAME, _AMGX_HANDLER, platform="CUDA")
 
 
-def _amgx_solve_impl(row_ptrs, col_indices, values, b):
+class AMGXStatus(IntEnum):
+    SUCCESS = 0
+    FAILED = 1
+    DIVERGED = 2
+    NOT_CONVERGED = 3
+
+    def __repr__(self):
+        return f"<{self.__class__.__name__}.{self.name}: {self.value}>"
+
+    def __str__(self):
+        return f"{self.__class__.__name__}.{self.name}"
+
+
+def _amgx_solve_impl(row_ptrs, col_indices, values, b, config_str=""):
     """Low-level FFI call to AmgX solver (non-differentiable)."""
-    out_spec = jax.ShapeDtypeStruct(b.shape, b.dtype)
+
+    out_spec = (
+        jax.ShapeDtypeStruct(b.shape, b.dtype),
+        jax.ShapeDtypeStruct((3,), jnp.float32),
+    )
     call = ffi.ffi_call(
         _AMGX_CALL_NAME,
         out_spec,
         input_layouts=[None, None, None, None],
         output_layouts=None,
     )
-    return call(row_ptrs, col_indices, values, b)
+    return call(row_ptrs, col_indices, values, b, config=config_str)
 
 
 def _normalize_linear_operator(A, *, b=None):
@@ -102,53 +121,64 @@ def _normalize_linear_operator(A, *, b=None):
     )
 
 
-@jax.custom_vjp
-def _amgx_solve_csr(A, b):
+@functools.lru_cache(maxsize=32)
+def _get_solver_primitive(config_str):
     """
-    Solve Ax=b using AmgX with custom VJP for gradients.
-    Input A must be a jsp.CSR matrix.
+    Returns a JAX custom_vjp primitive for AmgX solve with a specific configuration.
+    Cached to avoid recompilation for identical configurations.
     """
-    return _amgx_solve_impl(A.indptr, A.indices, A.data, b)
+
+    @jax.custom_vjp
+    def solve(A, b):
+        return _amgx_solve_impl(A.indptr, A.indices, A.data, b, config_str=config_str)
+
+    def fwd(A, b):
+        # returns ((x, stats), residuals)
+        x_and_stats = solve(A, b)
+        # We only need A and x for backward pass, stats are metadata
+        x, stats = x_and_stats
+        return x_and_stats, (A, x)
+
+    def bwd(residuals, g):
+        # g is tuple (g_x, g_stats). We ignore g_stats.
+        g_x = g[0]
+        # g_stats = g[1] # Should be zeros/None ideally
+
+        A, x = residuals
+
+        # Solve A^T λ = g_x
+        solver = _get_solver_primitive(config_str)
+        # Solver returns (adj_b, adj_stats). We only care about adj_b.
+        adj_b, _ = solver(A, g_x)
+
+        n = A.shape[0]
+        row_lengths = A.indptr[1:] - A.indptr[:-1]
+
+        # Safe gradient computation
+        row_indices = jnp.repeat(
+            jnp.arange(n, dtype=jnp.int32), row_lengths, total_repeat_length=len(A.data)
+        )
+        grad_values = -adj_b[row_indices] * x[A.indices]
+        grad_A = jsp.CSR((grad_values, A.indices, A.indptr), shape=A.shape)
+
+        return grad_A, adj_b
+
+    solve.defvjp(fwd, bwd)
+    return solve
 
 
-def _amgx_fwd(A, b):
-    x = _amgx_solve_impl(A.indptr, A.indices, A.data, b)
-    return x, (A, x)
+def _format_config(config):
+    if config is None:
+        return ""
+    if isinstance(config, str):
+        return config
+    if isinstance(config, dict):
+        # Convert dict to "key=val, key2=val2"
+        return ", ".join(f"{k}={v}" for k, v in config.items())
+    raise TypeError("Config must be a string or dictionary.")
 
 
-def _amgx_bwd(residuals, g):
-    """
-    Backward pass using Adjoint State Method.
-    Solves A^T λ = g to find adjoint λ, then computes gradients.
-    """
-    A, x = residuals
-
-    # 1. Solve for Adjoint λ = A^{-T} g
-    # Since A is assumed symmetric for AmgX usually (or we just use transpose solve),
-    # we solve A^T λ = g.
-    adj_b = _amgx_solve_impl(A.indptr, A.indices, A.data, g)
-
-    # 2. Compute gradients w.r.t. matrix values
-    # ∂L/∂A_ij = -λ_i * x_j
-    # Efficiently gather -λ[row[k]] * x[col[k]] for all non-zero entries k.
-
-    n = A.shape[0]
-    row_lengths = A.indptr[1:] - A.indptr[:-1]
-    row_indices = jnp.repeat(
-        jnp.arange(n, dtype=jnp.int32), row_lengths, total_repeat_length=len(A.data)
-    )
-
-    grad_values = -adj_b[row_indices] * x[A.indices]
-
-    grad_A = jsp.CSR((grad_values, A.indices, A.indptr), shape=A.shape)
-
-    return grad_A, adj_b
-
-
-_amgx_solve_csr.defvjp(_amgx_fwd, _amgx_bwd)
-
-
-def amg_solve(A, b):
+def amg_solve(A, b, config=None, **kwargs):
     """
     Solve Ax=b using AmgX (differentiable).
 
@@ -156,13 +186,69 @@ def amg_solve(A, b):
         A: either a jax.experimental.sparse.CSR matrix or a callable A(x).
            Callables are automatically materialized to CSR.
         b: RHS vector (float32).
+        config: Dict or string of AmgX configuration parameters.
+        **kwargs: Additional configuration parameters passed as keyword arguments.
+                  These override config if present.
 
     Returns:
         x: Solution vector (float32).
-
+        info: Dictionary containing 'iterations', 'residual', and 'status'.
     """
+    # Merge configurations
+    _config = {}
+
+    # Default configuration
+    defaults = {
+        "config_version": 2,
+        "solver": "CG",
+        "preconditioner": "AMG",
+        "max_iters": 100,
+        "tolerance": 1e-6,
+        "norm": "L2",
+        "print_solve_stats": 1,
+        "monitor_residual": 1,
+        "cycle": "V",
+        "smoother": "JACOBI_L1",
+    }
+    _config.update(defaults)
+
+    # Update with user config
+    if config:
+        if isinstance(config, str):
+            pass
+        elif isinstance(config, dict):
+            _config.update(config)
+
+    # Update with kwargs
+    _config.update(kwargs)
+
+    # Generate string
+    if config and isinstance(config, str) and not kwargs:
+        config_str = config
+    else:
+        config_str = _format_config(_config)
+
     A_csr = _normalize_linear_operator(A, b=b)
-    return _amgx_solve_csr(A_csr, b)
+
+    # Get cached primitive for this configuration
+    solver = _get_solver_primitive(config_str)
+
+    # Returns (x, stats_array)
+    x, stats = solver(A_csr, b)
+
+    # Convert JAX array stats to python dict
+    try:
+        iter_val = int(stats[0])
+        res_val = float(stats[1])
+        status_val = AMGXStatus(int(stats[2]))
+    except Exception:
+        # Inside JIT or symbolic execution: return raw arrays/tracers
+        iter_val = stats[0]
+        res_val = stats[1]
+        status_val = stats[2]
+
+    info = {"iterations": iter_val, "residual": res_val, "status": status_val}
+    return x, info
 
 
 def cache_coloring(operator, size):

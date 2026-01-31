@@ -21,7 +21,7 @@ def main():
 
     # Solve Ax = b
     print("Solving...")
-    x = amg_solve(A, b)
+    x, _ = amg_solve(A, b)
 
     # Compute residual: ||b - Ax|| / ||b||
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)

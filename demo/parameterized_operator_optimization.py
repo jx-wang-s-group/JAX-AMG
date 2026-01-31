@@ -21,7 +21,7 @@ def main():
     true_diag = 4.0
     b = rhs_ones(n)
     A_true = tridiagonal_operator(true_diag)
-    x_target = amg_solve(A_true, b)
+    x_target, _ = amg_solve(A_true, b)
 
     # Compute coloring cache
     print("Computing operator coloring...")
@@ -36,7 +36,7 @@ def main():
         A = with_coloring(tridiagonal_operator(diag), coloring_cache)
 
         # Solve
-        x_pred = amg_solve(A, b)
+        x_pred, _ = amg_solve(A, b)
 
         # Compute loss
         loss = jnp.mean((x_pred - x_true) ** 2)
