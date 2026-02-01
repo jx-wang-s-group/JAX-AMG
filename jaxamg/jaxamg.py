@@ -7,8 +7,9 @@ import functools
 from enum import IntEnum
 import scipy.sparse as sp
 import numpy as np
+import os
 
-from . import _amgx_ext, utils
+from . import _amgx_ext, utils, config as amgx_config
 
 
 _AMGX_CALL_NAME = "amgx_solve"
@@ -229,17 +230,6 @@ def _get_solver_primitive(config_str):
     return solve
 
 
-def _format_config(config):
-    if config is None:
-        return ""
-    if isinstance(config, str):
-        return config
-    if isinstance(config, dict):
-        # Convert dict to "key=val, key2=val2"
-        return ", ".join(f"{k}={v}" for k, v in config.items())
-    raise TypeError("Config must be a string or dictionary.")
-
-
 def amg_solve(A, b, config=None, **kwargs):
     """
     Solve Ax=b using AmgX (differentiable).
@@ -256,39 +246,8 @@ def amg_solve(A, b, config=None, **kwargs):
         x: Solution vector (float32).
         info: Dictionary containing 'iterations', 'residual', and 'status'.
     """
-    # Merge configurations
-    _config = {}
-
-    # Default configuration
-    defaults = {
-        "config_version": 2,
-        "solver": "CG",
-        "preconditioner": "AMG",
-        "max_iters": 100,
-        "tolerance": 1e-6,
-        "norm": "L2",
-        "print_solve_stats": 1,
-        "monitor_residual": 1,
-        "cycle": "V",
-        "smoother": "JACOBI_L1",
-    }
-    _config.update(defaults)
-
-    # Update with user config
-    if config:
-        if isinstance(config, str):
-            pass
-        elif isinstance(config, dict):
-            _config.update(config)
-
-    # Update with kwargs
-    _config.update(kwargs)
-
-    # Generate string
-    if config and isinstance(config, str) and not kwargs:
-        config_str = config
-    else:
-        config_str = _format_config(_config)
+    # Prepare configuration string/file
+    config_str = amgx_config.prepare_config(config, **kwargs)
 
     A_csr = _normalize_linear_operator(A, b=b)
 
