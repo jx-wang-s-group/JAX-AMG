@@ -4,93 +4,88 @@ import os
 from typing import Dict, Any, Union, Optional
 
 
-def _has_nested_dict(d: Dict) -> bool:
-    """Check if dictionary contains nested dictionaries."""
-    if not isinstance(d, dict):
-        return False
-    for v in d.values():
-        if isinstance(v, dict):
-            return True
-    return False
-
-
-def _format_config(config: Union[Dict, str, None]) -> str:
+def _format_config(config: Dict) -> str:
     """
     Format configuration for AmgX.
 
-    - Strings are passed through as-is
-    - Flat dicts are converted to "key=val, key2=val2" format
-    - Nested dicts are written to a temporary JSON file and the path is returned
+    Serializes the config dictionary to a temporary JSON file and returns its path.
     """
     if config is None:
         return ""
-    if isinstance(config, str):
-        return config
-    if isinstance(config, dict):
-        # Check if dict has nested structures
-        if _has_nested_dict(config):
-            # Write to temporary JSON file (following pyamgx approach)
-            # Note: We can't use NamedTemporaryFile with delete=True because
-            # the file needs to persist until AmgX reads it in the C++ layer
-            fd, path = tempfile.mkstemp(suffix=".json", text=True)
-            try:
-                with os.fdopen(fd, "w") as f:
-                    json.dump(config, f, indent=2)
-                return path
-            except:
-                os.close(fd)
-                os.unlink(path)
-                raise
-        else:
-            # Flat dict: convert to "key=val, key2=val2"
-            return ", ".join(f"{k}={v}" for k, v in config.items())
-    raise TypeError("Config must be a string or dictionary.")
+
+    if not isinstance(config, dict):
+        raise TypeError(
+            "Config must be a dictionary. String configuration is no longer supported."
+        )
+
+    # Serialize to temp JSON file
+    fd, path = tempfile.mkstemp(suffix=".json", text=True)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f, indent=2)
+        return path
+    except:
+        os.close(fd)
+        os.unlink(path)
+        raise
 
 
-def prepare_config(user_config: Optional[Union[Dict, str]] = None, **kwargs) -> str:
+def prepare_config(user_config: Optional[Dict] = None, **kwargs) -> str:
     """
     Prepare the final configuration string for AmgX.
 
-    Merges default settings, user-provided config, and any keyword arguments.
-    Handles serialization of nested dictionaries if present.
-
-    Args:
-        user_config: Base configuration (dict or string).
-        **kwargs: Overrides for configuration parameters.
-
-    Returns:
-        A string that AmgX can interpret (key=val string or path to JSON file).
+    Merges the user config into defaults (PBICGSTAB+AMG), applies overrides (kwargs),
+    and injects residual tracking settings.
     """
-    # If config is a simple string and no kwargs are provided, return it directly
-    if user_config and isinstance(user_config, str) and not kwargs:
-        return user_config
+    if user_config is not None and not isinstance(user_config, dict):
+        raise TypeError(
+            f"Config must be a dictionary, got {type(user_config).__name__}. String configuration is no longer supported."
+        )
 
-    # Default configuration
-    merged_config = {
-        "config_version": 2,
-        "solver": "CG",
-        "preconditioner": "AMG",
-        "max_iters": 100,
+    # Default config: PBICGSTAB + AMG with block Jacobi smoother
+    defaults = {
+        "solver": "PBICGSTAB",
+        "preconditioner": {
+            "solver": "AMG",
+            "smoother": {"solver": "BLOCK_JACOBI", "relaxation_factor": 0.8},
+            "presweeps": 1,
+            "postsweeps": 1,
+            "coarse_solver": "NOSOLVER",
+            "max_levels": 50,
+            "cycle": "V",
+        },
         "tolerance": 1e-6,
-        "norm": "L2",
+        "max_iters": 1000,
         "print_solve_stats": 1,
-        "monitor_residual": 1,
-        "cycle": "V",
-        "smoother": "JACOBI_L1",
+        "norm": "L2",
     }
 
-    # Update with user configuration
+    # Determine base: use defaults for flat configs, but respect nested/versioned configs
+    # by starting empty to avoid polluting user intent.
+    is_nested = False
     if user_config:
-        if isinstance(user_config, dict):
-            merged_config.update(user_config)
-        elif isinstance(user_config, str):
-            # If user provides a string config AND kwargs, we can't easily merge.
-            # Strategy: strings bypass defaults if no kwargs are present (handled above).
-            # If kwargs ARE present, we ignore the string (as it's unstructured)
-            # and use defaults + kwargs. This preserves behavior from the original implementation.
-            pass
+        if "config_version" in user_config:
+            is_nested = True
+        elif isinstance(user_config.get("solver"), dict):
+            is_nested = True
 
-    # Apply overrides (kwargs)
+    if is_nested:
+        merged_config = user_config.copy()
+    else:
+        merged_config = defaults.copy()
+        if user_config:
+            merged_config.update(user_config)
+
+    # Apply kwargs (highest priority overrides)
     merged_config.update(kwargs)
+
+    # Inject residual tracking into the correct solver scope
+    target_dict = merged_config
+    if "solver" in merged_config and isinstance(merged_config["solver"], dict):
+        # We are likely in a nested config where 'solver' contains the solver params
+        target_dict = merged_config["solver"]
+
+    target_dict["store_res_history"] = 1
+    target_dict["monitor_residual"] = 1
 
     return _format_config(merged_config)

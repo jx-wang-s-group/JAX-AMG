@@ -41,13 +41,15 @@ def main():
 
     start = time.time()
     # High precision solve for target
-    x_target, info_target = amg_solve(A, b_true, max_iters=2000, tolerance=1e-8)
+    x_target, info_target = amg_solve(
+        A, b_true, solver="CG", max_iters=2000, tolerance=1e-8
+    )
     print(f"Status: {info_target['status']}")
 
     # Define loss function and optimization step
     def solve_model(theta):
         b = b0 * theta
-        x, _ = amg_solve(A, b, max_iters=500, tolerance=1e-6)
+        x, _ = amg_solve(A, b, solver="CG")
         return x
 
     def loss_fn(theta):

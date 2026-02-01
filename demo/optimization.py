@@ -24,7 +24,7 @@ def main():
     # Define a loss function: L(b) = ||x||² where x = A⁻¹b
     def loss(b):
         """Loss function: sum of squared solution components."""
-        x, _ = amg_solve(A, b)
+        x, _ = amg_solve(A, b, solver="CG")
         return jnp.sum(x * x)
 
     # JIT-compile the loss and gradient functions

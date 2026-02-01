@@ -35,9 +35,7 @@ def main():
     # Solve
     print("\nSolving...")
     start = time.time()
-    x, info = amg_solve(A, b, max_iters=2000, tolerance=1e-6)
-    print(jnp.linalg.norm(x))
-    print(x[:100])
+    x, info = amg_solve(A, b, solver="CG", max_iters=2000, tolerance=1e-6)
     solve_time = time.time() - start
 
     print(f"Solve time: {solve_time:.2f}s")

@@ -19,13 +19,13 @@ from jaxamg.utils import to_scipy
 
 def l2_loss(A, b):
     """Compute L(b) = ||A^{-1} b||^2."""
-    x, _ = amg_solve(A, b)
+    x, _ = amg_solve(A, b, solver="CG")
     return jnp.sum(x * x)
 
 
 def vdot_loss(A, v, b):
     """Compute L(b) = v^T A^{-1} b."""
-    x, _ = amg_solve(A, b)
+    x, _ = amg_solve(A, b, solver="CG")
     return jnp.dot(v, x)
 
 
@@ -50,7 +50,7 @@ class TestGradient:
         grad_jax = jax.grad(loss)(b)
 
         # Compute gradient with SciPy (∂L/∂b = 2 * A^(-T) * x)
-        x, _ = amg_solve(A, b)
+        x, _ = amg_solve(A, b, solver="CG")
         # Convert JAX CSR to scipy for comparison
         A_sp = to_scipy(A)
         grad_sp = 2.0 * spla.spsolve(A_sp.T.tocsr(), np.asarray(x))

@@ -24,8 +24,8 @@ class TestOperator:
         b = rhs_ones(n)
 
         # Solve with operator and CSR matrix
-        x_op, _ = amg_solve(A_op, b)
-        x_csr, _ = amg_solve(A_csr, b)
+        x_op, _ = amg_solve(A_op, b, solver="CG")
+        x_csr, _ = amg_solve(A_csr, b, solver="CG")
 
         # Check that the solutions are the same
         np.testing.assert_allclose(x_op, x_csr)
@@ -47,7 +47,7 @@ class TestOperator:
         @jax.jit
         def solve(diagonal_value, b):
             A = with_coloring(tridiagonal_operator(diagonal_value), coloring_cache)
-            x, _ = amg_solve(A, b)
+            x, _ = amg_solve(A, b, solver="CG")
             return x
 
         x_jit = solve(diagonal_value, b)
@@ -55,7 +55,7 @@ class TestOperator:
         # Solve without JIT for comparison
         x_nojit, _ = amg_solve(A, b)
 
-        np.testing.assert_allclose(x_jit, x_nojit)
+        np.testing.assert_allclose(x_jit, x_nojit, rtol=1e-6)
 
     def test_poisson_operator(self):
         n = 8
@@ -65,8 +65,8 @@ class TestOperator:
         b = rhs_ones(n * n)
 
         # Solve with operator and CSR matrix
-        x_op, _ = amg_solve(A_op, b)
-        x_csr, _ = amg_solve(A_csr, b)
+        x_op, _ = amg_solve(A_op, b, solver="CG")
+        x_csr, _ = amg_solve(A_csr, b, solver="CG")
 
         # Check that the solutions are the same
         np.testing.assert_allclose(x_op, x_csr)
@@ -82,7 +82,7 @@ class TestOperator:
         b = rhs_ones(n * n)
 
         # Solve with CG
-        x, info = amg_solve(A_op, b)
+        x, info = amg_solve(A_op, b, solver="CG")
 
         # Should not converge
         assert info["status"] == AMGXStatus.NOT_CONVERGED

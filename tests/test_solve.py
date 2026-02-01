@@ -24,14 +24,14 @@ class TestSolver:
         """Test solving a 1D tridiagonal system against analytical solution."""
         A = tridiagonal_matrix(n)
         b = rhs_ones(n)
-        x, info = amg_solve(A, b)
+        x, info = amg_solve(A, b, solver="CG", max_iters=100)
 
         # Verify solver status
         if n == 256:
-            # Solver is ill-conditioned for this size
+            # CG solver fails to converge for this size within 100 iterations
             assert info["status"] == AMGXStatus.NOT_CONVERGED
         else:
-            # Solver should converge for smaller size
+            # CG solver should converge for smaller sizes
             assert info["status"] == AMGXStatus.SUCCESS
 
         if info["status"] == AMGXStatus.SUCCESS:
@@ -49,7 +49,7 @@ class TestSolver:
         n = 32
         A = tridiagonal_matrix(n)
         b = rhs_ones(n)
-        x, info = amg_solve(A, b, max_iters=1)
+        x, info = amg_solve(A, b, solver="CG", max_iters=1)
 
         assert info["status"] == AMGXStatus.NOT_CONVERGED
         assert info["iterations"] == 1
@@ -63,7 +63,7 @@ class TestSolver:
         # Create JIT-compiled version
         @jax.jit
         def solve_jit(b):
-            x, _ = amg_solve(A, b)
+            x, _ = amg_solve(A, b, solver="CG")
             return x
 
         # Solve with JIT
@@ -176,12 +176,7 @@ class TestSolver:
         )
 
         # Solve (BICGSTAB ignores the preconditioner)
-        config = {
-            "solver": solver,
-            "preconditioner": {"solver": "AMG"},
-            "tolerance": 1e-6,
-        }
-        u, info = amg_solve(A, b, config=config)
+        u, info = amg_solve(A, b, solver=solver)
 
         # Verify solver status
         if solver == "BICGSTAB":

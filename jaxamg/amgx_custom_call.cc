@@ -20,11 +20,43 @@ namespace ffi = xla::ffi;
 namespace
 {
 
+// Undefine existing macro from amgx_c.h to allow custom error handling
+#ifdef AMGX_SAFE_CALL
+  #undef AMGX_SAFE_CALL
+#endif
+
+// Macro for functions returning ffi::Error (propagates to Python)
+#define AMGX_SAFE_CALL(call)                                                \
+  do                                                                        \
+  {                                                                         \
+    AMGX_RC err = (call);                                                   \
+    if (err != AMGX_RC_OK)                                                  \
+    {                                                                       \
+      char msg[4096];                                                       \
+      AMGX_get_error_string(err, msg, 4096);                                \
+      std::string error_msg = "AMGX Error: " + std::string(msg);            \
+      return ffi::Error::Internal(error_msg);                               \
+    }                                                                       \
+  } while (0)
+
+// Macro for functions returning void (just log error)
+#define AMGX_SAFE_CALL_VOID(call)                                           \
+  do                                                                        \
+  {                                                                         \
+    AMGX_RC err = (call);                                                   \
+    if (err != AMGX_RC_OK)                                                  \
+    {                                                                       \
+      char msg[4096];                                                       \
+      AMGX_get_error_string(err, msg, 4096);                                \
+      fprintf(stderr, "AMGX Error in void function: %s\n", msg);            \
+    }                                                                       \
+  } while (0)
+
   std::once_flag g_amgx_init_flag;
 
   void AmgxFinalize()
   {
-    AMGX_SAFE_CALL(AMGX_finalize());
+    AMGX_SAFE_CALL_VOID(AMGX_finalize());
   }
 
   // Custom callback to suppress AmgX library output (banners, version info)
@@ -40,8 +72,8 @@ namespace
         // Register print callback before initialization
         AMGX_register_print_callback(PrintCallback);
 
-        AMGX_SAFE_CALL(AMGX_initialize());
-        AMGX_SAFE_CALL(AMGX_install_signal_handler());
+        AMGX_SAFE_CALL_VOID(AMGX_initialize());
+        AMGX_SAFE_CALL_VOID(AMGX_install_signal_handler());
         std::atexit(AmgxFinalize);
     });
   }
@@ -105,10 +137,8 @@ namespace
     const AMGX_Mode mode = AMGX_mode_dFFI;
 
     // Prepare configuration
+    // Prepare configuration
     std::string config_str(config);
-    if (config_str.empty()) {
-        config_str = "config_version=2, solver=CG, preconditioner=AMG, max_iters=100, tolerance=1e-6, norm=L2";
-    }
 
     // Attempt to open as file to determine if it's a file path
     std::ifstream file_check(config_str);
@@ -121,8 +151,6 @@ namespace
         AMGX_SAFE_CALL(AMGX_config_create(&cfg, config_str.c_str()));
     }
 
-    // Enforce history storage to enable residual retrieval
-    AMGX_SAFE_CALL(AMGX_config_add_parameters(&cfg, "store_res_history=1"));
     AMGX_SAFE_CALL(AMGX_resources_create_simple(&rsrc, cfg));
 
     // Create Matrix and Vectors

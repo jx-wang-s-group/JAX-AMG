@@ -21,7 +21,7 @@ def main():
 
     # Solve Ax = b
     print("Solving...")
-    x, _ = amg_solve(A, b)
+    x, _ = amg_solve(A, b, solver="CG")
 
     # Compute residual: ||b - Ax|| / ||b||
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)
@@ -29,7 +29,7 @@ def main():
     # Display results
     print("Solution should be symmetric:")
     print(f"First 5 entries: {x[:5]}")
-    print(f"Last 5 entries: {x[-5:]}")
+    print(f"Last 5 entries (reversed): {x[-5:][::-1]}")
     print(f"Relative residual: {residual:.2e}")
 
 
