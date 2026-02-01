@@ -246,6 +246,14 @@ def amg_solve(A, b, config=None, **kwargs):
         x: Solution vector (float32).
         info: Dictionary containing 'iterations', 'residual', and 'status'.
     """
+
+    # Check for GPU backend
+    if jax.default_backend() != "gpu":
+        raise RuntimeError(
+            f"AMGX requires a GPU backend, but JAX is using '{jax.default_backend()}'. "
+            "Please ensure you have a CUDA-enabled GPU and JAX is installed with CUDA support."
+        )
+
     # Prepare configuration string/file
     config_str = amgx_config.prepare_config(config, **kwargs)
 
