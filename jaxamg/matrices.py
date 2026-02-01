@@ -317,6 +317,116 @@ def poisson_operator(skew: float = 0.0):
     return matvec
 
 
+def convection_diffusion_matrix_2d(
+    n: int, epsilon: float = 1.0, theta: float = 0.0, velocity: float = 100.0
+) -> jsp.BCSR:
+    """Create a 2D convection-diffusion matrix on an n×n grid.
+
+    Equation: -ε Δu + v⋅∇u = f
+
+    The velocity field v is constant magnitude `velocity` rotated by angle `theta`.
+    v = (vx, vy) = (velocity * cos(theta), velocity * sin(theta))
+
+    Discretization:
+    - Diffusion: Standard 5-point central difference.
+    - Convection: First-order Upwind differencing for stability at high Peclet numbers.
+    - Grid spacing h = 1/(n-1).
+
+    Args:
+        n: Grid size (n x n nodes)
+        epsilon: Diffusion coefficient
+        theta: Flow angle in radians
+        velocity: Flow velocity magnitude
+
+    Returns:
+        JAX BCSR matrix
+    """
+    n2 = n * n
+    h = 1.0 / (n - 1)  # Grid spacing
+
+    vx = velocity * jnp.cos(theta)
+    vy = velocity * jnp.sin(theta)
+
+    # Grid construction
+    i_grid, j_grid = jnp.meshgrid(jnp.arange(n), jnp.arange(n), indexing="ij")
+    i_flat = i_grid.ravel()
+    j_flat = j_grid.ravel()
+    row_indices = i_flat * n + j_flat
+
+    # Initialize coefficients
+    diag_vals = jnp.zeros(n2, dtype=jnp.float32)
+    left_vals = jnp.zeros(n2, dtype=jnp.float32)
+    right_vals = jnp.zeros(n2, dtype=jnp.float32)
+    top_vals = jnp.zeros(n2, dtype=jnp.float32)
+    bottom_vals = jnp.zeros(n2, dtype=jnp.float32)
+
+    # Diffusion (Standard 5-point central difference)
+    # Coefficients scaled by h^2 to keep matrix well-scaled
+    inv_h2 = 1.0 / (h * h)
+
+    diag_vals += 4.0 * epsilon * inv_h2
+    left_vals -= epsilon * inv_h2
+    right_vals -= epsilon * inv_h2
+    top_vals -= epsilon * inv_h2
+    bottom_vals -= epsilon * inv_h2
+
+    # Convection (First-order Upwind)
+    inv_h = 1.0 / h
+
+    # X-direction
+    if vx > 0:
+        diag_vals += vx * inv_h
+        left_vals -= vx * inv_h
+    else:
+        diag_vals -= vx * inv_h
+        right_vals += vx * inv_h
+
+    # Y-direction
+    if vy > 0:
+        diag_vals += vy * inv_h
+        top_vals -= vy * inv_h
+    else:
+        diag_vals -= vy * inv_h
+        bottom_vals += vy * inv_h
+
+    # Assemble Matrix
+    # ----------------
+    masks = [
+        j_flat > 0,  # Left
+        j_flat < n - 1,  # Right
+        i_flat > 0,  # Top (i-1)
+        i_flat < n - 1,  # Bottom (i+1)
+    ]
+    offsets = [-1, 1, -n, n]
+    coeffs = [left_vals, right_vals, top_vals, bottom_vals]
+
+    all_rows = [row_indices]
+    all_cols = [row_indices]
+    all_vals = [diag_vals]
+
+    for mask, offset, val_arr in zip(masks, offsets, coeffs):
+        all_rows.append(row_indices[mask])
+        all_cols.append(row_indices[mask] + offset)
+        all_vals.append(val_arr[mask])
+
+    rows = jnp.concatenate(all_rows)
+    cols = jnp.concatenate(all_cols)
+    vals = jnp.concatenate(all_vals)
+
+    # Sort
+    sort_idx = jnp.lexsort((cols, rows))
+    rows = rows[sort_idx]
+    cols = cols[sort_idx]
+    vals = vals[sort_idx]
+
+    # Indptr
+    indptr = jnp.zeros(n2 + 1, dtype=jnp.int32)
+    row_counts = jnp.bincount(rows, length=n2)
+    indptr = indptr.at[1:].set(jnp.cumsum(row_counts))
+
+    return jsp.BCSR((vals, cols, indptr), shape=(n2, n2))
+
+
 def rhs_ones(n: int):
     """Create a constant RHS vector of ones.
 

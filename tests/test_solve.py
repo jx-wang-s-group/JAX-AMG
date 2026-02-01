@@ -7,7 +7,12 @@ import jax
 import jax.numpy as jnp
 
 from jaxamg import amg_solve, AMGXStatus
-from jaxamg.matrices import tridiagonal_matrix, poisson_matrix, rhs_ones
+from jaxamg.matrices import (
+    tridiagonal_matrix,
+    poisson_matrix,
+    convection_diffusion_matrix_2d,
+    rhs_ones,
+)
 from jaxamg.utils import to_scipy
 
 
@@ -132,3 +137,60 @@ class TestSolver:
 
             # Check solution
             np.testing.assert_allclose(b, A @ x, rtol=1e-5)
+
+    @pytest.mark.parametrize("solver", ["BICGSTAB", "PBICGSTAB"])
+    def test_convection_diffusion_solve(self, solver):
+        """Test solving 2D convection-diffusion equation with analytic solution."""
+
+        n = 64  # Grid size
+        h = 1.0 / (n - 1)  # Grid spacing
+
+        # Parameters
+        epsilon = 1e-3
+        velocity = 1.0
+        theta = np.pi / 4.0
+
+        # Velocity components
+        vx = velocity * np.cos(theta)
+        vy = velocity * np.sin(theta)
+
+        # Grid
+        x = jnp.linspace(0, 1, n)
+        y = jnp.linspace(0, 1, n)
+        X, Y = jnp.meshgrid(x, y, indexing="ij")
+
+        # Analytic solution: u = sin(pi*x) * sin(pi*y)
+        u_exact = jnp.sin(np.pi * X) * jnp.sin(np.pi * Y)
+        laplacian_u = -2 * np.pi**2 * u_exact
+        grad_u_x = np.pi * jnp.cos(np.pi * X) * jnp.sin(np.pi * Y)
+        grad_u_y = np.pi * jnp.sin(np.pi * X) * jnp.cos(np.pi * Y)
+
+        # Source term f = -epsilon*Delta u + v.Grad u
+        f = -epsilon * laplacian_u + vx * grad_u_x + vy * grad_u_y
+        b = f.ravel()
+        u_exact_flat = u_exact.ravel()
+
+        # Matrix
+        A = convection_diffusion_matrix_2d(
+            n, epsilon=epsilon, theta=theta, velocity=velocity
+        )
+
+        # Solve (BICGSTAB ignores the preconditioner)
+        config = {
+            "solver": solver,
+            "preconditioner": {"solver": "AMG"},
+            "tolerance": 1e-6,
+        }
+        u, info = amg_solve(A, b, config=config)
+
+        # Verify solver status
+        if solver == "BICGSTAB":
+            # BICGSTAB should not converge
+            assert info["status"] == AMGXStatus.NOT_CONVERGED
+        else:
+            # PBICGSTAB with AMG preconditioner should converge
+            assert info["status"] == AMGXStatus.SUCCESS
+
+            # Verify solution
+            np.testing.assert_allclose(A @ u, b, atol=1e-4)
+            np.testing.assert_allclose(u, u_exact_flat, atol=0.1)
