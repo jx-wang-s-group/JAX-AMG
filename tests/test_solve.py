@@ -5,6 +5,7 @@ import numpy as np
 import scipy.sparse.linalg as spla
 import jax
 import jax.numpy as jnp
+import jax.experimental.sparse as jsp
 
 from jaxamg import amg_solve, AMGXStatus
 from jaxamg.matrices import (
@@ -74,6 +75,50 @@ class TestSolver:
 
         # Compare results
         np.testing.assert_allclose(x_jit, x_nojit)
+
+    def test_tridiagonal_solve_float64(self):
+        """Test solving a 1D tridiagonal system with double precision."""
+
+        # Override the default float32 precision
+        jax.config.update("jax_enable_x64", True)
+
+        n = 8
+        A = tridiagonal_matrix(n)
+        b = rhs_ones(n).astype(jnp.float64)
+        x, info = amg_solve(A, b, solver="CG")
+
+        assert info["status"] == AMGXStatus.SUCCESS
+        np.testing.assert_allclose(b, A @ x)
+
+        # Check that the solution is float64
+        assert x.dtype == jnp.float64
+
+        # Reset to default
+        jax.config.update("jax_enable_x64", False)
+
+    def test_tridiagonal_solve_float64_upcasting(self):
+        """Test solving a 1D tridiagonal system with float64 matrix and float32 rhs."""
+
+        # Override the default float32 precision
+        jax.config.update("jax_enable_x64", True)
+
+        n = 8
+
+        # Explicitly cast matrix to float64
+        A = tridiagonal_matrix(n)
+        A = jsp.BCSR((A.data.astype(jnp.float64), A.indices, A.indptr), shape=A.shape)
+
+        b = rhs_ones(n).astype(jnp.float32)
+        x, info = amg_solve(A, b, solver="CG")
+
+        assert info["status"] == AMGXStatus.SUCCESS
+        np.testing.assert_allclose(b, A @ x)
+
+        # Check that the solution is float64
+        assert x.dtype == jnp.float64
+
+        # Reset to default
+        jax.config.update("jax_enable_x64", False)
 
     def test_poisson_manufactured_solution(self):
         """Test 2D Poisson with manufactured solution."""
@@ -181,6 +226,7 @@ class TestSolver:
         # Verify solver status
         if solver == "BICGSTAB":
             # BICGSTAB should not converge
+            # (Note: will converge if float64 is used)
             assert info["status"] == AMGXStatus.NOT_CONVERGED
         else:
             # PBICGSTAB with AMG preconditioner should converge

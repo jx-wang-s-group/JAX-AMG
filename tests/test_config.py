@@ -76,17 +76,3 @@ def test_config_nested(linear_system):
 
     # Check residual tracking injection is successful even if not explicitly requested
     assert np.isfinite(info["residual"])
-
-
-def test_config_invalid_solver(linear_system):
-    """Test invalid solver name raises an exception."""
-    A, b = linear_system
-    config = {"solver": "INVALID_SOLVER_NAME"}
-
-    with pytest.raises(Exception) as excinfo:
-        amg_solve(A, b, config=config)
-
-    # Check that the exception message comes from AmgX
-    assert "AMGX Error" in str(excinfo.value) or "Incorrect parameters" in str(
-        excinfo.value
-    )

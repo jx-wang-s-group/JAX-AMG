@@ -79,24 +79,20 @@ namespace
   }
 
   /*
-   * AmgxSolveImpl: Core implementation of the XLA FFI handler.
-   *
-   * Arguments:
-   *   stream: CUDA stream provided by XLA/JAX.
-   *   row_ptrs, col_indices, values: CSR matrix components (on device).
-   *   b: RHS vector (on device).
-   *   x: Output solution buffer (on device).
-   *   stats: Output statistics buffer [iterations, residual, status].
-   *   config: AmgX configuration string.
+   * AmgxSolveInternal: Templated core implementation of the XLA FFI handler.
+  /*
+   * AmgxSolveInternal: Templated core implementation of the XLA FFI handler.
+   * Supports both float (AMGX_mode_dFFI) and double (AMGX_mode_dDDI).
    */
-  ffi::Error AmgxSolveImpl(cudaStream_t stream,
-                           ffi::Buffer<ffi::S32> row_ptrs,
-                           ffi::Buffer<ffi::S32> col_indices,
-                           ffi::Buffer<ffi::F32> values,
-                           ffi::Buffer<ffi::F32> b,
-                           ffi::ResultBuffer<ffi::F32> x,
-                           ffi::ResultBuffer<ffi::F32> stats,
-                           std::string_view config)
+  template <typename T, ffi::DataType DType, AMGX_Mode Mode>
+  ffi::Error AmgxSolveInternal(cudaStream_t stream,
+                               ffi::Buffer<ffi::DataType::S32> row_ptrs,
+                               ffi::Buffer<ffi::DataType::S32> col_indices,
+                               ffi::Buffer<DType> values,
+                               ffi::Buffer<DType> b,
+                               ffi::ResultBuffer<DType> x,
+                               ffi::ResultBuffer<DType> stats,
+                               std::string_view config)
   {
     EnsureAmgxInitialized();
 
@@ -113,14 +109,14 @@ namespace
     // Synchronize stream to ensure inputs are ready
     cudaStreamSynchronize(stream);
 
-    // 2. Prepare data pointers (Device Mode / dFFI)
+    // 2. Prepare data pointers (Device Mode / dFFI or dDDI)
     // We cast to raw pointers to pass directly to AmgX, avoiding host transfers.
     int *row_ptrs_data = const_cast<int *>(row_ptrs.typed_data());
     int *col_indices_data = const_cast<int *>(col_indices.typed_data());
-    float *values_data = const_cast<float *>(values.typed_data());
-    float *b_data = const_cast<float *>(b.typed_data());
-    float *x_data = x->typed_data();
-    float *stats_data = stats->typed_data();
+    T *values_data = const_cast<T *>(values.typed_data());
+    T *b_data = const_cast<T *>(b.typed_data());
+    T *x_data = x->typed_data();
+    T *stats_data = stats->typed_data();
 
     // Dimensions
     const int n_rows = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
@@ -133,10 +129,9 @@ namespace
     AMGX_vector_handle b_vec;
     AMGX_solver_handle solver;
 
-    // Use AMGX_mode_dFFI to indicate data is already on the device
-    const AMGX_Mode mode = AMGX_mode_dFFI;
+    // Use teplated mode
+    const AMGX_Mode mode = Mode;
 
-    // Prepare configuration
     // Prepare configuration
     std::string config_str(config);
 
@@ -198,12 +193,12 @@ namespace
     AMGX_SAFE_CALL(AMGX_solver_get_iteration_residual(solver, iters, 0, &residual));
 
     // Transfer stats to output buffer [iters, residual, status]
-    float stats_host[3] = {
-        static_cast<float>(iters),
-        static_cast<float>(residual),
-        static_cast<float>(status)
+    T stats_host[3] = {
+        static_cast<T>(iters),
+        static_cast<T>(residual),
+        static_cast<T>(status)
     };
-    cudaMemcpyAsync(stats_data, stats_host, 3 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(stats_data, stats_host, 3 * sizeof(T), cudaMemcpyHostToDevice, stream);
 
     // Download solution (copies from AmgX internal buffer to JAX output buffer)
     AMGX_SAFE_CALL(AMGX_vector_download(x_vec, x_data));
@@ -217,6 +212,32 @@ namespace
     AMGX_SAFE_CALL(AMGX_config_destroy(cfg));
 
     return ffi::Error::Success();
+  }
+
+  // Float implementation
+  ffi::Error AmgxSolveImpl(cudaStream_t stream,
+                           ffi::Buffer<ffi::DataType::S32> row_ptrs,
+                           ffi::Buffer<ffi::DataType::S32> col_indices,
+                           ffi::Buffer<ffi::DataType::F32> values,
+                           ffi::Buffer<ffi::DataType::F32> b,
+                           ffi::ResultBuffer<ffi::DataType::F32> x,
+                           ffi::ResultBuffer<ffi::DataType::F32> stats,
+                           std::string_view config)
+  {
+      return AmgxSolveInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(stream, row_ptrs, col_indices, values, b, x, stats, config);
+  }
+
+  // Double implementation
+  ffi::Error AmgxSolveImplDouble(cudaStream_t stream,
+                                 ffi::Buffer<ffi::DataType::S32> row_ptrs,
+                                 ffi::Buffer<ffi::DataType::S32> col_indices,
+                                 ffi::Buffer<ffi::DataType::F64> values,
+                                 ffi::Buffer<ffi::DataType::F64> b,
+                                 ffi::ResultBuffer<ffi::DataType::F64> x,
+                                 ffi::ResultBuffer<ffi::DataType::F64> stats,
+                                 std::string_view config)
+  {
+      return AmgxSolveInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(stream, row_ptrs, col_indices, values, b, x, stats, config);
   }
 
   // Register XLA FFI Handler
@@ -234,10 +255,26 @@ namespace
           .Attr<std::string_view>("config")         // config string
   );
 
+  XLA_FFI_DEFINE_HANDLER(
+      AmgxSolveDouble,
+      AmgxSolveImplDouble,
+      ffi::Ffi::Bind()
+          .Ctx<ffi::PlatformStream<cudaStream_t>>() // CUDA stream context
+          .Arg<ffi::Buffer<ffi::S32>>()             // row_ptrs
+          .Arg<ffi::Buffer<ffi::S32>>()             // col_indices
+          .Arg<ffi::Buffer<ffi::F64>>()             // values
+          .Arg<ffi::Buffer<ffi::F64>>()             // b
+          .Ret<ffi::Buffer<ffi::F64>>()             // x
+          .Ret<ffi::Buffer<ffi::F64>>()             // stats
+          .Attr<std::string_view>("config")         // config string
+  );
+
 } // namespace
 
 PYBIND11_MODULE(_amgx_ext, m)
 {
   m.def("get_amgx_solve_handler", []()
         { return py::capsule(reinterpret_cast<void *>(AmgxSolve)); });
+  m.def("get_amgx_solve_double_handler", []()
+        { return py::capsule(reinterpret_cast<void *>(AmgxSolveDouble)); });
 }
