@@ -112,3 +112,23 @@ class TestSolver:
         # Check residual
         residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)
         np.testing.assert_allclose(residual, 0.0, atol=1e-5)
+
+    @pytest.mark.parametrize("solver", ["CG", "BICGSTAB", "GMRES"])
+    def test_nonsymmetric_solve(self, solver):
+        """Test solving 2D non-symmetric problem."""
+        grid_size = 5
+        A = poisson_matrix(grid_size, skew=1.0)
+        n = grid_size**2
+        b = rhs_ones(n)
+
+        # Solve (with Jacobi preconditioner)
+        x, info = amg_solve(A, b, solver=solver, preconditioner="JACOBI_L1")
+
+        # CG should not converge, BICGSTAB and GMRES should converge
+        if solver == "CG":
+            assert info["status"] == AMGXStatus.NOT_CONVERGED
+        else:
+            assert info["status"] == AMGXStatus.SUCCESS
+
+            # Check solution
+            np.testing.assert_allclose(b, A @ x, rtol=1e-5)

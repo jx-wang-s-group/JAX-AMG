@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import jax.experimental.sparse as jsp
 
 from jaxamg import amg_solve
-from jaxamg.matrices import tridiagonal_matrix
+from jaxamg.matrices import tridiagonal_matrix, rhs_ones
 from jaxamg.utils import to_scipy
 
 
@@ -18,7 +18,7 @@ class TestMatrixFormats:
     def setup_matrices(self):
         """Create test matrices in various formats."""
         n = 5
-        b = jnp.ones(n)
+        b = rhs_ones(n)
 
         # Create base BCSR matrix
         A_bcsr = tridiagonal_matrix(n, diagonal_value=4.0)

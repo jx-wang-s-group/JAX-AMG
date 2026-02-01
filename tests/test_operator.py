@@ -5,7 +5,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from jaxamg import amg_solve, cache_coloring, with_coloring
+from jaxamg import amg_solve, cache_coloring, with_coloring, AMGXStatus
 from jaxamg.matrices import (
     tridiagonal_matrix,
     tridiagonal_operator,
@@ -73,3 +73,25 @@ class TestOperator:
 
         # Check that the solution is correct
         np.testing.assert_allclose(A_op(x_op), b, rtol=1e-5)
+
+    def test_poisson_operator_nonsymmetric(self):
+        """Test non-symmetric poisson_operator with skew parameter."""
+        n = 5
+
+        A_op = poisson_operator(skew=1.0)
+        b = rhs_ones(n * n)
+
+        # Solve with CG
+        x, info = amg_solve(A_op, b)
+
+        # Should not converge
+        assert info["status"] == AMGXStatus.NOT_CONVERGED
+
+        # Solve with BiCGSTAB
+        x, info = amg_solve(A_op, b, solver="BICGSTAB")
+
+        # Should converge
+        assert info["status"] == AMGXStatus.SUCCESS
+
+        # Check that the solution satisfies Ax = b
+        np.testing.assert_allclose(A_op(x), b, rtol=1e-5)

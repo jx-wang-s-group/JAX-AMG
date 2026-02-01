@@ -4,12 +4,12 @@ Demo: Print solver information
 
 import jax.numpy as jnp
 from jaxamg.jaxamg import amg_solve, AMGXStatus
-from jaxamg.matrices import tridiagonal_matrix
+from jaxamg.matrices import tridiagonal_matrix, rhs_ones
 
 
 def main():
     n = 500
-    b = jnp.ones(n)
+    b = rhs_ones(n)
 
     # Ill-conditioned matrix
     print(f"Sovling a ill-conditioned matrix of size {n}x{n}")

@@ -92,14 +92,20 @@ def tridiagonal_matrix(n: int, diagonal_value: float = 2.0) -> jsp.BCSR:
     return jsp.BCSR((values, indices, indptr), shape=(n, n))
 
 
-def poisson_matrix(n: int) -> jsp.BCSR:
+def poisson_matrix(n: int, skew: float = 0.0) -> jsp.BCSR:
     """Create a 2D Poisson matrix on an n×n grid in BCSR format.
+
+    The matrix represents the discretization of -Δu + skew * (∂u/∂x + ∂u/∂y)
+    on a regular grid with standard 5-point stencil.
 
     Args:
         n: Grid size in each dimension (results in n² × n² matrix)
+        skew: Skew-symmetric coefficient (default 0.0 for symmetric Poisson)
+              Non-zero values add convection-like terms, making the matrix non-symmetric.
+              Positive values create upwind-biased discretization.
 
     Returns:
-        JAX BCSR matrix representing the 2D Poisson operator
+        JAX BCSR matrix representing the 2D Poisson operator with optional skew
     """
     n2 = n * n  # Total size
 
@@ -112,10 +118,10 @@ def poisson_matrix(n: int) -> jsp.BCSR:
     # Build all entries using vectorized operations
     # For each grid point (i,j), we have up to 5 non-zeros:
     # - Diagonal: 4.0
-    # - Left (j-1): -1.0 if j > 0
-    # - Right (j+1): -1.0 if j < n-1
-    # - Top (i-1): -1.0 if i > 0
-    # - Bottom (i+1): -1.0 if i < n-1
+    # - Left (j-1): -1.0 - skew/2 if j > 0
+    # - Right (j+1): -1.0 + skew/2 if j < n-1
+    # - Top (i-1): -1.0 - skew/2 if i > 0
+    # - Bottom (i+1): -1.0 + skew/2 if i < n-1
 
     # Diagonal entries (always present)
     diag_rows = row_indices
@@ -126,25 +132,25 @@ def poisson_matrix(n: int) -> jsp.BCSR:
     left_mask = j_flat > 0
     left_rows = row_indices[left_mask]
     left_cols = row_indices[left_mask] - 1
-    left_vals = jnp.full(jnp.sum(left_mask), -1.0, dtype=jnp.float32)
+    left_vals = jnp.full(jnp.sum(left_mask), -1.0 - skew / 2.0, dtype=jnp.float32)
 
     # Right neighbors (j < n-1)
     right_mask = j_flat < n - 1
     right_rows = row_indices[right_mask]
     right_cols = row_indices[right_mask] + 1
-    right_vals = jnp.full(jnp.sum(right_mask), -1.0, dtype=jnp.float32)
+    right_vals = jnp.full(jnp.sum(right_mask), -1.0 + skew / 2.0, dtype=jnp.float32)
 
     # Top neighbors (i > 0)
     top_mask = i_flat > 0
     top_rows = row_indices[top_mask]
     top_cols = row_indices[top_mask] - n
-    top_vals = jnp.full(jnp.sum(top_mask), -1.0, dtype=jnp.float32)
+    top_vals = jnp.full(jnp.sum(top_mask), -1.0 - skew / 2.0, dtype=jnp.float32)
 
     # Bottom neighbors (i < n-1)
     bottom_mask = i_flat < n - 1
     bottom_rows = row_indices[bottom_mask]
     bottom_cols = row_indices[bottom_mask] + n
-    bottom_vals = jnp.full(jnp.sum(bottom_mask), -1.0, dtype=jnp.float32)
+    bottom_vals = jnp.full(jnp.sum(bottom_mask), -1.0 + skew / 2.0, dtype=jnp.float32)
 
     # Concatenate all entries
     rows = jnp.concatenate([diag_rows, left_rows, right_rows, top_rows, bottom_rows])
@@ -172,10 +178,29 @@ def tridiagonal_operator(diagonal_value: float = 2.0):
     return matvec
 
 
-def poisson_operator():
-    """Create a 2D Poisson operator (flat input)."""
+def poisson_operator(skew: float = 0.0):
+    """Create a 2D Poisson operator (flat input).
+
+    The operator represents the discretization of -Δu + skew * (∂u/∂x + ∂u/∂y)
+    on a regular grid with standard 5-point stencil.
+
+    Args:
+        skew: Skew-symmetric coefficient (default 0.0 for symmetric Poisson)
+              Non-zero values add convection-like terms, making the operator non-symmetric.
+
+    Returns:
+        Callable operator that applies the Poisson stencil to a flattened 2D array
+    """
+    # Create kernel with skew parameter
+    # Standard symmetric: [[0, -1, 0], [-1, 4, -1], [0, -1, 0]]
+    # With skew: left/top get -1-skew/2, right/bottom get -1+skew/2
     kernel = jnp.array(
-        [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]], dtype=jnp.float32
+        [
+            [0.0, -1.0 - skew / 2.0, 0.0],
+            [-1.0 - skew / 2.0, 4.0, -1.0 + skew / 2.0],
+            [0.0, -1.0 + skew / 2.0, 0.0],
+        ],
+        dtype=jnp.float32,
     )
 
     def matvec(u_flat):
