@@ -171,6 +171,103 @@ def poisson_matrix(n: int, skew: float = 0.0) -> jsp.BCSR:
     return jsp.BCSR((vals, cols, indptr), shape=(n2, n2))
 
 
+def poisson3d_matrix(n: int, skew: float = 0.0) -> jsp.BCSR:
+    """Create a 3D Poisson matrix on an n×n×n grid in BCSR format.
+
+    The matrix represents the discretization of -Δu + skew * (∂u/∂x + ∂u/∂y + ∂u/∂z)
+    on a regular 3D grid with standard 7-point stencil.
+
+    Args:
+        n: Grid size in each dimension (results in n³ × n³ matrix)
+        skew: Skew-symmetric coefficient (default 0.0 for symmetric Poisson)
+              Non-zero values add convection-like terms, making the matrix non-symmetric.
+
+    Returns:
+        JAX BCSR matrix representing the 3D Poisson operator with optional skew
+    """
+    n3 = n * n * n  # Total size
+
+    # Create grid indices
+    # indexing='ij': i varies slowest, k varies fastest
+    # Shape of grids: (n, n, n)
+    i_grid, j_grid, k_grid = jnp.meshgrid(
+        jnp.arange(n), jnp.arange(n), jnp.arange(n), indexing="ij"
+    )
+    # i corresponds to index i in (i, j, k) -> stride n*n
+    # j corresponds to index j in (i, j, k) -> stride n
+    # k corresponds to index k in (i, j, k) -> stride 1
+
+    i_flat = i_grid.ravel()
+    j_flat = j_grid.ravel()
+    k_flat = k_grid.ravel()
+    row_indices = (i_flat * n * n + j_flat * n + k_flat).astype(jnp.int32)
+
+    # Diagonal entries (always present)
+    diag_rows = row_indices
+    diag_cols = row_indices
+    diag_vals = jnp.full(n3, 6.0, dtype=jnp.float32)
+
+    # Left neighbors (j > 0), stride n
+    left_mask = j_flat > 0
+    left_rows = row_indices[left_mask]
+    left_cols = row_indices[left_mask] - n
+    left_vals = jnp.full(jnp.sum(left_mask), -1.0 - skew / 2.0, dtype=jnp.float32)
+
+    # Right neighbors (j < n-1), stride n
+    right_mask = j_flat < n - 1
+    right_rows = row_indices[right_mask]
+    right_cols = row_indices[right_mask] + n
+    right_vals = jnp.full(jnp.sum(right_mask), -1.0 + skew / 2.0, dtype=jnp.float32)
+
+    # Front neighbors (i > 0), stride n*n
+    front_mask = i_flat > 0
+    front_rows = row_indices[front_mask]
+    front_cols = row_indices[front_mask] - n * n
+    front_vals = jnp.full(jnp.sum(front_mask), -1.0 - skew / 2.0, dtype=jnp.float32)
+
+    # Back neighbors (i < n-1), stride n*n
+    back_mask = i_flat < n - 1
+    back_rows = row_indices[back_mask]
+    back_cols = row_indices[back_mask] + n * n
+    back_vals = jnp.full(jnp.sum(back_mask), -1.0 + skew / 2.0, dtype=jnp.float32)
+
+    # Bottom neighbors (k > 0), stride 1
+    bottom_mask = k_flat > 0
+    bottom_rows = row_indices[bottom_mask]
+    bottom_cols = row_indices[bottom_mask] - 1
+    bottom_vals = jnp.full(jnp.sum(bottom_mask), -1.0 - skew / 2.0, dtype=jnp.float32)
+
+    # Top neighbors (k < n-1), stride 1
+    top_mask = k_flat < n - 1
+    top_rows = row_indices[top_mask]
+    top_cols = row_indices[top_mask] + 1
+    top_vals = jnp.full(jnp.sum(top_mask), -1.0 + skew / 2.0, dtype=jnp.float32)
+
+    # Concatenate all entries
+    rows = jnp.concatenate(
+        [diag_rows, left_rows, right_rows, front_rows, back_rows, bottom_rows, top_rows]
+    )
+    cols = jnp.concatenate(
+        [diag_cols, left_cols, right_cols, front_cols, back_cols, bottom_cols, top_cols]
+    )
+    vals = jnp.concatenate(
+        [diag_vals, left_vals, right_vals, front_vals, back_vals, bottom_vals, top_vals]
+    )
+
+    # Sort by (row, col)
+    sort_idx = jnp.lexsort((cols, rows))
+    rows = rows[sort_idx]
+    cols = cols[sort_idx]
+    vals = vals[sort_idx]
+
+    # Build indptr
+    indptr = jnp.zeros(n3 + 1, dtype=jnp.int32)
+    row_counts = jnp.bincount(rows, length=n3)
+    indptr = indptr.at[1:].set(jnp.cumsum(row_counts))
+
+    return jsp.BCSR((vals, cols, indptr), shape=(n3, n3))
+
+
 def tridiagonal_operator(diagonal_value: float = 2.0):
     """Create a tridiagonal operator with [-1, diagonal_value, -1] pattern."""
     kernel = jnp.array([-1.0, diagonal_value, -1.0])
