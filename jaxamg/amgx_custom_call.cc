@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <fstream>
 
 namespace py = pybind11;
 namespace ffi = xla::ffi;
@@ -109,7 +110,16 @@ namespace
         config_str = "config_version=2, solver=CG, preconditioner=AMG, max_iters=100, tolerance=1e-6, norm=L2";
     }
 
-    AMGX_SAFE_CALL(AMGX_config_create(&cfg, config_str.c_str()));
+    // Attempt to open as file to determine if it's a file path
+    std::ifstream file_check(config_str);
+    bool is_file = file_check.good();
+    file_check.close();  // Close the stream before AmgX tries to read
+
+    if (is_file) {
+        AMGX_SAFE_CALL(AMGX_config_create_from_file(&cfg, config_str.c_str()));
+    } else {
+        AMGX_SAFE_CALL(AMGX_config_create(&cfg, config_str.c_str()));
+    }
 
     // Enforce history storage to enable residual retrieval
     AMGX_SAFE_CALL(AMGX_config_add_parameters(&cfg, "store_res_history=1"));
