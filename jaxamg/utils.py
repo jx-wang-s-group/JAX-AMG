@@ -9,6 +9,7 @@ import jax.experimental.sparse as jsp
 import numpy as np
 import scipy.sparse as sp
 from collections import defaultdict
+import atexit
 
 
 def to_scipy(A: jsp.BCSR, format="csr") -> sp.spmatrix:
@@ -214,8 +215,15 @@ def get_preferred_dtype(A, b):
     return target_dtype
 
 
-def _ensure_bcsr_properties(A, target_dtype):
-    """Ensure BCSR matrix has correct data type and int32 indices."""
+def _ensure_bcsr_properties(A, target_dtype, use_int64_indices=False):
+    """Ensure BCSR matrix has correct data type and index types.
+
+    Args:
+        A: BCSR matrix to normalize
+        target_dtype: Target dtype for matrix values (float32 or float64)
+        use_int64_indices: If True, use int64 for column indices (required for MPI).
+                          If False (default), use int32 (for single-GPU mode).
+    """
     # check data type
     if A.data.dtype != target_dtype:
         A = jsp.BCSR(
@@ -224,18 +232,41 @@ def _ensure_bcsr_properties(A, target_dtype):
         )
 
     # check indices type
-    if A.indices.dtype != jnp.int32:
-        try:
-            A = jsp.BCSR(
-                (A.data, A.indices.astype(jnp.int32), A.indptr),
-                shape=A.shape,
-            )
-        except Exception:
-            raise ValueError(
-                f"Matrix column indices must be int32, got {A.indices.dtype}."
-            )
+    if use_int64_indices:
+        # For MPI: need int64 indices
+        # Temporarily enable X64 mode to allow int64 arrays
+        if A.indices.dtype != np.int64:
+            try:
+                import jax
 
-    # check indptr type
+                original_x64 = jax.config.jax_enable_x64
+                jax.config.update("jax_enable_x64", True)
+                try:
+                    indices_int64 = jnp.array(A.indices, dtype=jnp.int64)
+                    A = jsp.BCSR(
+                        (A.data, indices_int64, A.indptr),
+                        shape=A.shape,
+                    )
+                finally:
+                    jax.config.update("jax_enable_x64", original_x64)
+            except Exception as e:
+                raise ValueError(
+                    f"Matrix column indices must be int64 for MPI, got {A.indices.dtype}. Error: {e}"
+                )
+    else:
+        # For single-GPU: use int32
+        if A.indices.dtype != jnp.int32:
+            try:
+                A = jsp.BCSR(
+                    (A.data, A.indices.astype(jnp.int32), A.indptr),
+                    shape=A.shape,
+                )
+            except Exception:
+                raise ValueError(
+                    f"Matrix column indices must be int32, got {A.indices.dtype}."
+                )
+
+    # check indptr type (always int32)
     if A.indptr.dtype != jnp.int32:
         try:
             A = jsp.BCSR(
@@ -255,11 +286,17 @@ def _ensure_bcsr_properties(A, target_dtype):
     return A
 
 
-def to_bcsr_matrix(A, *, b=None):
+def to_bcsr_matrix(A, *, b=None, use_int64_indices=False):
     """
     Normalize input 'A' to a BCSR matrix.
 
     Supports multiple input formats, including BCSR, BCOO, SciPy sparse (CSR, CSC, COO), dense arrays (NumPy, JAX), and callable operators.
+
+    Args:
+        A: Input matrix or callable operator
+        b: RHS vector (required for callable operators)
+        use_int64_indices: If True, use int64 for column indices (required for MPI).
+                          If False (default), use int32 (for single-GPU mode).
     """
     # 1. Handle Callables (materialize via graph coloring)
     if callable(A):
@@ -327,4 +364,34 @@ def to_bcsr_matrix(A, *, b=None):
         )
 
     # 3. Standardize properties
-    return _ensure_bcsr_properties(A, target_dtype)
+    return _ensure_bcsr_properties(A, target_dtype, use_int64_indices=use_int64_indices)
+
+
+# AMGX finalization: runs during Python exit (before MPI_FINALIZE)
+# Note: C++ does not register atexit - Python controls cleanup order
+_amgx_finalized = False
+
+
+def _finalize_amgx():
+    """Finalize AMGX library before program exit (runs before MPI_FINALIZE)."""
+    global _amgx_finalized
+    if not _amgx_finalized:
+        try:
+            # MPI barrier if in MPI context (ensures coordinated cleanup)
+            try:
+                from mpi4py import MPI
+
+                if MPI.Is_initialized() and not MPI.Is_finalized():
+                    MPI.COMM_WORLD.Barrier()
+            except (ImportError, Exception):
+                pass
+
+            from jaxamg import _amgx_ext
+
+            _amgx_ext.finalize()
+            _amgx_finalized = True
+        except Exception:
+            pass  # Ignore cleanup errors
+
+
+atexit.register(_finalize_amgx)

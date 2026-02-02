@@ -4,9 +4,6 @@ Demo: Solve linear system with linear operator.
 This example demonstrates solving linear systems (tridiagonal and Poisson) using linear operators.
 """
 
-import jax
-import jax.numpy as jnp
-import numpy as np
 from jaxamg import amg_solve
 from jaxamg.matrices import (
     tridiagonal_matrix,

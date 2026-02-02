@@ -3,20 +3,28 @@ import jax.numpy as jnp
 import jax.ffi as ffi
 import jax.experimental.sparse as jsp
 import functools
+import numpy as np
 from enum import IntEnum
 
 from . import _amgx_ext, utils, config as amgx_config
 
-
 _AMGX_CALL_NAME = "amgx_solve"
 _AMGX_CALL_NAME_DOUBLE = "amgx_solve_double"
+_AMGX_CALL_NAME_MPI = "amgx_solve_mpi"
+_AMGX_CALL_NAME_MPI_DOUBLE = "amgx_solve_mpi_double"
 
 # Get the handler from C++ and register for CUDA platform
 _AMGX_HANDLER = _amgx_ext.get_amgx_solve_handler()
 _AMGX_HANDLER_DOUBLE = _amgx_ext.get_amgx_solve_double_handler()
+_AMGX_HANDLER_MPI = _amgx_ext.get_amgx_solve_mpi_handler()
+_AMGX_HANDLER_MPI_DOUBLE = _amgx_ext.get_amgx_solve_mpi_double_handler()
 
 ffi.register_ffi_target(_AMGX_CALL_NAME, _AMGX_HANDLER, platform="CUDA")
 ffi.register_ffi_target(_AMGX_CALL_NAME_DOUBLE, _AMGX_HANDLER_DOUBLE, platform="CUDA")
+ffi.register_ffi_target(_AMGX_CALL_NAME_MPI, _AMGX_HANDLER_MPI, platform="CUDA")
+ffi.register_ffi_target(
+    _AMGX_CALL_NAME_MPI_DOUBLE, _AMGX_HANDLER_MPI_DOUBLE, platform="CUDA"
+)
 
 
 class AMGXStatus(IntEnum):
@@ -51,6 +59,31 @@ def _amgx_solve_impl(row_ptrs, col_indices, values, b, config_str=""):
         output_layouts=None,
     )
     return call(row_ptrs, col_indices, values, b, config=config_str)
+
+
+def _amgx_solve_mpi_impl(
+    row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, config_str=""
+):
+    """Low-level FFI call to AmgX MPI solver (non-differentiable)."""
+
+    out_spec = (
+        jax.ShapeDtypeStruct(b.shape, b.dtype),
+        jax.ShapeDtypeStruct((3,), b.dtype),
+    )
+
+    call_name = _AMGX_CALL_NAME_MPI
+    if b.dtype == jnp.float64:
+        call_name = _AMGX_CALL_NAME_MPI_DOUBLE
+
+    call = ffi.ffi_call(
+        call_name,
+        out_spec,
+        input_layouts=[None, None, None, None, None, None, None],
+        output_layouts=None,
+    )
+    return call(
+        row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, config=config_str
+    )
 
 
 @functools.lru_cache(maxsize=32)
@@ -99,11 +132,68 @@ def _get_solver_primitive(config_str):
     return solve
 
 
-def amg_solve(A, b, config=None, **kwargs):
+@functools.lru_cache(maxsize=32)
+def _get_solver_primitive_mpi(config_str, nglobal, comm_ptr, lrank):
+    """
+    Returns a JAX custom_vjp primitive for MPI AmgX solve with a specific configuration.
+    Cached to avoid recompilation for identical configurations.
+
+    Note: Gradient support for MPI mode is not yet implemented.
+    """
+
+    @jax.custom_vjp
+    def solve(A, b):
+        # Convert parameters to JAX arrays on device
+        nglobal_arr = jnp.array([nglobal], dtype=jnp.int32)
+
+        # Handle comm_ptr: split into two int32 values
+        # Use numpy to handle unsigned properly, then convert to signed int32 for JAX
+        comm_ptr_low_unsigned = comm_ptr & 0xFFFFFFFF
+        comm_ptr_high_unsigned = (comm_ptr >> 32) & 0xFFFFFFFF
+
+        # Convert unsigned to signed int32 (reinterpret bits)
+        comm_ptr_low_signed = np.int32(np.uint32(comm_ptr_low_unsigned))
+        comm_ptr_high_signed = np.int32(np.uint32(comm_ptr_high_unsigned))
+
+        comm_ptr_arr = jnp.array(
+            [comm_ptr_low_signed, comm_ptr_high_signed], dtype=jnp.int32
+        )
+        lrank_arr = jnp.array([lrank], dtype=jnp.int32)
+
+        return _amgx_solve_mpi_impl(
+            A.indptr,
+            A.indices,
+            A.data,
+            b,
+            nglobal_arr,
+            comm_ptr_arr,
+            lrank_arr,
+            config_str=config_str,
+        )
+
+    def fwd(A, b):
+        x_and_stats = solve(A, b)
+        x, stats = x_and_stats
+        return x_and_stats, (A, x)
+
+    def bwd(residuals, g):
+        # Gradient computation for MPI mode not yet implemented
+        raise NotImplementedError(
+            "Automatic differentiation is not yet supported for MPI mode. "
+            "Please use forward mode only or implement custom gradients."
+        )
+
+    solve.defvjp(fwd, bwd)
+    return solve
+
+
+def amg_solve(
+    A, b, config=None, comm=None, nglobal=None, partition_info=None, **kwargs
+):
     """
     Solve Ax=b using AmgX (differentiable).
 
-    Args:
+    Single-GPU mode (default):
         A: either a jax.experimental.sparse.CSR matrix or a callable A(x).
            Callables are automatically materialized to CSR.
         b: RHS vector (float32 or float64).
@@ -111,8 +201,17 @@ def amg_solve(A, b, config=None, **kwargs):
         **kwargs: Additional configuration parameters passed as keyword arguments.
                   These override config if present.
 
+    MPI mode (when comm is provided):
+        A: Local portion of matrix with GLOBAL column indices (CSR).
+        b: Local portion of RHS vector.
+        comm: MPI communicator (from mpi4py.MPI.COMM_WORLD).
+        nglobal: Global size of the matrix (total number of rows across all ranks).
+        partition_info: Tuple (row_start, row_end) indicating which rows this rank owns.
+        config: Dict or string of AmgX configuration parameters.
+        **kwargs: Additional configuration parameters.
+
     Returns:
-        x: Solution vector (float32 or float64).
+        x: Solution vector (float32 or float64). In MPI mode, returns local portion.
         info: Dictionary containing 'iterations', 'residual', and 'status'.
     """
 
@@ -131,15 +230,54 @@ def amg_solve(A, b, config=None, **kwargs):
     if target_dtype == jnp.float64 and b.dtype != jnp.float64:
         b = b.astype(jnp.float64)
 
-    A_csr = utils.to_bcsr_matrix(A, b=b)
+    # Branch: MPI mode or single-GPU mode
+    if comm is not None:
+        # MPI MODE
+        if nglobal is None:
+            raise ValueError("nglobal must be provided when using MPI mode")
+        if partition_info is None:
+            raise ValueError(
+                "partition_info (row_start, row_end) must be provided when using MPI mode"
+            )
 
-    # Get cached primitive for this configuration
-    solver = _get_solver_primitive(config_str)
+        # Import mpi4py for communicator handling
+        try:
+            from mpi4py import MPI
+        except ImportError:
+            raise ImportError(
+                "mpi4py is required for MPI mode. Install it with: pip install mpi4py"
+            )
 
-    # Returns (x, stats_array)
-    x, stats = solver(A_csr, b)
+        # Get MPI rank and compute local GPU assignment
+        rank = comm.Get_rank()
+        gpu_count = jax.device_count()
+        lrank = rank % gpu_count
 
-    # Convert JAX array stats to python dict
+        # Get MPI communicator pointer
+        comm_ptr = MPI._addressof(comm)
+
+        # A must already be CSR format with global column indices in MPI mode
+        # Use int64 indices for MPI (AMGX global API requires int64)
+        A_csr = utils.to_bcsr_matrix(A, b=b, use_int64_indices=True)
+
+        # Get cached MPI primitive for this configuration
+        solver = _get_solver_primitive_mpi(config_str, nglobal, comm_ptr, lrank)
+
+        # Solve
+        x, stats = solver(A_csr, b)
+
+    else:
+        # SINGLE-GPU MODE (original behavior)
+        # Use int32 indices for single-GPU (default behavior)
+        A_csr = utils.to_bcsr_matrix(A, b=b)
+
+        # Get cached primitive for this configuration
+        solver = _get_solver_primitive(config_str)
+
+        # Returns (x, stats_array)
+        x, stats = solver(A_csr, b)
+
+    # Convert JAX array stats to python dict (same for both modes)
     try:
         iter_val = int(stats[0])
         res_val = float(stats[1])

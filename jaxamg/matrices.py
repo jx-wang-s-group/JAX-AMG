@@ -268,6 +268,86 @@ def poisson3d_matrix(n: int, skew: float = 0.0) -> jsp.BCSR:
     return jsp.BCSR((vals, cols, indptr), shape=(n3, n3))
 
 
+def poisson_matrix_distributed(nx, ny, rank, nranks, dtype=jnp.float32):
+    """Create distributed 2D Poisson matrix with 5-point stencil for MPI.
+
+    Args:
+        nx: Grid size in x-direction
+        ny: Grid size in y-direction
+        rank: MPI rank (0-indexed)
+        nranks: Total number of MPI ranks
+        dtype: Data type for matrix values (default: jnp.float32)
+
+    Returns:
+        A_local: Local BCSR matrix partition (JAX)
+        row_start: Starting row index (global)
+        row_end: Ending row index (global, exclusive)
+    """
+    n = nx * ny
+
+    # Row-based partitioning
+    rows_per_rank = n // nranks
+    row_start = rank * rows_per_rank
+    row_end = (rank + 1) * rows_per_rank if rank < nranks - 1 else n
+    n_local = row_end - row_start
+
+    rows, cols, vals = [], [], []
+
+    for local_i in range(n_local):
+        global_i = row_start + local_i
+        ix = global_i % nx
+        iy = global_i // nx
+
+        # Diagonal entry
+        rows.append(local_i)
+        cols.append(global_i)
+        vals.append(4.0)
+
+        # Left neighbor
+        if ix > 0:
+            rows.append(local_i)
+            cols.append(global_i - 1)
+            vals.append(-1.0)
+
+        # Right neighbor
+        if ix < nx - 1:
+            rows.append(local_i)
+            cols.append(global_i + 1)
+            vals.append(-1.0)
+
+        # Bottom neighbor
+        if iy > 0:
+            rows.append(local_i)
+            cols.append(global_i - nx)
+            vals.append(-1.0)
+
+        # Top neighbor
+        if iy < ny - 1:
+            rows.append(local_i)
+            cols.append(global_i + nx)
+            vals.append(-1.0)
+
+    # Convert JAX dtype to NumPy dtype
+    np_dtype = np.float32 if dtype == jnp.float32 else np.float64
+
+    A_local_scipy = sp.csr_matrix(
+        (vals, (rows, cols)),
+        shape=(n_local, n),
+        dtype=np_dtype,
+    )
+
+    A_local = jsp.BCSR(
+        (
+            jnp.array(A_local_scipy.data),
+            jnp.array(A_local_scipy.indices, dtype=jnp.int32),
+            jnp.array(A_local_scipy.indptr, dtype=jnp.int32),
+        ),
+        shape=(n_local, n),
+    )
+
+    return A_local, row_start, row_end
+
+
 def tridiagonal_operator(diagonal_value: float = 2.0):
     """Create a tridiagonal operator with [-1, diagonal_value, -1] pattern."""
     kernel = jnp.array([-1.0, diagonal_value, -1.0])

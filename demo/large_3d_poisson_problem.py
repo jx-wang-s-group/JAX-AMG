@@ -1,12 +1,12 @@
-"""Demo: Solving a large 3D Poisson system.
+"""
+Demo: Solving a large 3D Poisson system.
 
 This demonstrates solver's ability to efficiently solve very large sparse linear systems.
 """
 
 import time
-import jax.numpy as jnp
 from jaxamg import amg_solve
-from jaxamg.matrices import rhs_ones, rhs_linear, poisson3d_matrix
+from jaxamg.matrices import rhs_ones, poisson3d_matrix
 
 
 def main():

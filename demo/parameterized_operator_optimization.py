@@ -6,8 +6,6 @@ Use JIT with parameterized operator for end-to-end optimization of a parameter (
 
 import jax
 import jax.numpy as jnp
-import jax.experimental.sparse as jsp
-import numpy as np
 
 from jaxamg import amg_solve, cache_coloring, with_coloring
 from jaxamg.matrices import tridiagonal_operator, rhs_ones

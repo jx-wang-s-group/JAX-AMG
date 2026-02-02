@@ -5,8 +5,6 @@ Use CG and BiCGSTAB solvers on symmetric and non-symmetric systems,
 and demonstrate that CG fails for non-symmetric systems.
 """
 
-import numpy as np
-import jax.numpy as jnp
 from jaxamg import amg_solve
 from jaxamg.matrices import poisson_matrix, poisson_operator, rhs_ones
 
