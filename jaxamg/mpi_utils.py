@@ -7,19 +7,6 @@ from typing import Tuple
 from dataclasses import dataclass
 
 
-@dataclass
-class DistributedCSR:
-    """Distributed CSR matrix with global column indexing."""
-
-    data: jnp.ndarray
-    indices: jnp.ndarray
-    indptr: jnp.ndarray
-    shape: Tuple[int, int]
-    row_start: int
-    row_end: int
-    nglobal: int
-
-
 def partition_csr_matrix(A_global, rank, nranks):
     """Partition global CSR matrix across MPI ranks (row-based).
 
@@ -118,22 +105,6 @@ def partition_vector(b_global, rank, nranks):
     row_start = rank * rows_per_rank
     row_end = (rank + 1) * rows_per_rank if rank < nranks - 1 else n
     return b_global[row_start:row_end], row_start, row_end
-
-
-def compute_halo_size(A_local, row_start, row_end):
-    """Compute number of unique halo elements (off-rank column indices).
-
-    Args:
-        A_local: Local matrix partition
-        row_start: Starting row index (global)
-        row_end: Ending row index (global, exclusive)
-
-    Returns:
-        Number of unique column indices outside [row_start, row_end)
-    """
-    col_indices = np.array(A_local.indices)
-    halo_cols = col_indices[(col_indices < row_start) | (col_indices >= row_end)]
-    return len(np.unique(halo_cols))
 
 
 def gather_solution(x_local, comm, root=0):

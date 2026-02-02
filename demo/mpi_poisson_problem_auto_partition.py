@@ -68,8 +68,8 @@ def main():
 
     validate_partition(A_local, n, row_start, row_end)
 
-    b_global_np = rhs_linear(n)
-    b_local, _, _ = partition_vector(b_global_np, rank, nranks)
+    b_global = rhs_linear(n)
+    b_local, _, _ = partition_vector(b_global, rank, nranks)
 
     comm.Barrier()
     if rank == 0:

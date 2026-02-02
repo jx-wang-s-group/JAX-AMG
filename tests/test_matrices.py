@@ -3,7 +3,8 @@
 import pytest
 import numpy as np
 import jax.numpy as jnp
-from jaxamg.matrices import poisson_matrix, poisson3d_matrix
+from jaxamg.matrices import poisson_matrix, poisson3d_matrix, poisson_matrix_distributed
+from jaxamg.mpi_utils import partition_csr_matrix
 from jaxamg.utils import to_scipy
 
 
@@ -116,3 +117,55 @@ class TestMatrixConstruction:
 
         np.testing.assert_allclose(row_13[neg_neighbors], [expected_neg] * 3)
         np.testing.assert_allclose(row_13[pos_neighbors], [expected_pos] * 3)
+
+    def test_poisson_matrix_distributed(self):
+        """Verify that distributed pieces assemble back to the global matrix."""
+        grid_size = 4
+        nranks = 4
+        n_global = grid_size**2
+
+        # Global Poisson matrix
+        A_global = poisson_matrix(grid_size).todense()
+
+        # Reconstruct from distributed pieces
+        rows_list = []
+
+        for rank in range(nranks):
+            A_local, row_start, row_end = poisson_matrix_distributed(
+                grid_size, grid_size, rank, nranks
+            )
+
+            # Verify row range matches
+            assert A_local.shape == (row_end - row_start, n_global)
+
+            rows_list.append(A_local.todense())
+
+        # Stack all local chunks vertically
+        A_reconstructed = jnp.vstack(rows_list)
+
+        np.testing.assert_array_equal(A_reconstructed, A_global)
+
+    def test_poisson_matrix_auto_partition(self):
+        """Verify that partition_csr_matrix correctly splits a global CSR matrix."""
+        grid_size = 4
+        nranks = 4
+        n_global = grid_size**2
+
+        # Global Poisson matrix
+        A_global = poisson_matrix(grid_size)
+
+        rows_list = []
+
+        # Partition the global matrix and collect local chunks
+        for rank in range(nranks):
+            A_local, row_start, row_end = partition_csr_matrix(A_global, rank, nranks)
+
+            n_local = row_end - row_start
+            assert A_local.shape == (n_local, n_global)
+
+            rows_list.append(A_local.todense())
+
+        # Stack all local chunks vertically
+        A_reconstructed = jnp.vstack(rows_list)
+
+        np.testing.assert_array_equal(A_reconstructed, A_global.todense())
