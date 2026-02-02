@@ -237,8 +237,6 @@ def _ensure_bcsr_properties(A, target_dtype, use_int64_indices=False):
         # Temporarily enable X64 mode to allow int64 arrays
         if A.indices.dtype != np.int64:
             try:
-                import jax
-
                 original_x64 = jax.config.jax_enable_x64
                 jax.config.update("jax_enable_x64", True)
                 try:
@@ -307,7 +305,18 @@ def to_bcsr_matrix(A, *, b=None, use_int64_indices=False):
             raise TypeError("Callable A requires RHS b to infer size.")
         if b.ndim != 1:
             raise ValueError(f"RHS b must be 1D, got shape {b.shape}.")
-        shape = (int(b.shape[0]), int(b.shape[0]))
+
+        n_rows = int(b.shape[0])
+
+        # Determine shape
+        if cached_info is not None:
+            shape = cached_info[4]
+            if shape[0] != n_rows:
+                raise ValueError(
+                    f"Cached operator has {shape[0]} rows, but RHS b has {n_rows} elements."
+                )
+        else:
+            shape = (n_rows, n_rows)
 
         is_jit = isinstance(b, core.Tracer)
 

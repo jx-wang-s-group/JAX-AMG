@@ -1,0 +1,148 @@
+"""
+Demo: MPI-distributed optimization of a Poisson operator skew parameter.
+
+Demonstrates end-to-end JIT compilation and differentiation of a custom JAX operator
+in an MPI setting.
+
+Usage:
+    mpirun -n 4 python demo/mpi_poisson_operator_optimization.py
+"""
+
+import os
+from mpi4py import MPI
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from jaxamg import (
+    amg_solve,
+    cache_mpi_metadata,
+    with_mpi_cache,
+    cache_coloring,
+    with_coloring,
+)
+from jaxamg.matrices import (
+    rhs_ones,
+    poisson_operator,
+    poisson_matrix,
+    poisson_operator_distributed,
+)
+from jaxamg.mpi_utils import get_partition_info
+
+jax.config.update("jax_enable_x64", True)
+
+
+def main():
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    nranks = comm.Get_size()
+
+    gpu_ids = [0, 1, 2, 3]
+    gpu_id = gpu_ids[rank]
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    # Problem size
+    grid_size = 16
+    n_global = grid_size * grid_size
+
+    if rank == 0:
+        print(f"Setting up MPI Poisson Optimization on {grid_size}x{grid_size} grid...")
+        print(f"MPI ranks: {nranks}")
+        print()
+
+    # Ground truth
+    true_skew = 5.0
+
+    # Generate ground truth solution using single-GPU on rank 0
+    if rank == 0:
+        b_global = rhs_ones(n_global, dtype=jnp.float64)
+        A_true = poisson_operator(true_skew)
+
+        x_target_global, info = amg_solve(
+            A_true,
+            b_global,
+            solver="PBICGSTAB",
+            preconditioner={"solver": "MULTICOLOR_DILU"},
+            tolerance=1e-8,
+        )
+    else:
+        x_target_global = None
+
+    # Broadcast ground truth
+    x_target_global = comm.bcast(x_target_global, root=0)
+
+    # Partition
+    row_start, row_end, n_local = get_partition_info(n_global, rank, nranks)
+    x_target_local = jnp.array(x_target_global[row_start:row_end])
+    b_local = rhs_ones(n_local, dtype=jnp.float64)
+
+    comm.Barrier()
+    print(f"  Rank {rank}: {n_local} rows [{row_start}:{row_end})")
+    comm.Barrier()
+
+    # Configuration for solver
+    config = {
+        "solver": "PBICGSTAB",
+        "preconditioner": {"solver": "AMG"},
+        "max_iters": 50,
+        "tolerance": 1e-6,
+    }
+
+    # Cache MPI metadata
+    mpi_cache = cache_mpi_metadata(config, comm, n_global, (row_start, row_end))
+
+    # Cache coloring
+    dummy_op = poisson_operator_distributed(grid_size, row_start, row_end, skew=0.0)
+    coloring_cache = cache_coloring(dummy_op, shape=(n_local, n_global))
+
+    if rank == 0:
+        print("\nStarting optimization...")
+
+    # Define loss function
+    def loss_local(skew, b_loc, x_true_loc):
+        op = poisson_operator_distributed(grid_size, row_start, row_end, skew=skew)
+        A = with_mpi_cache(with_coloring(op, coloring_cache), mpi_cache)
+
+        x_pred_loc, info = amg_solve(A, b_loc)
+
+        loss = jnp.sum((x_pred_loc - x_true_loc) ** 2) / n_global
+        return loss
+
+    # JIT gradients
+    grad_fn = jax.jit(jax.grad(loss_local))
+
+    # Optimization Loop
+    skew_init = 0.0
+    lr = 0.1
+
+    if rank == 0:
+        print(f"{'Epoch':<6} {'Skew':<12} {'Global Loss':<15} {'Gradient':<12}")
+        print("-" * 50)
+
+    for epoch in range(200):
+        # Compute local loss and gradient
+        l_loc = loss_local(skew_init, b_local, x_target_local)
+        g_loc = grad_fn(skew_init, b_local, x_target_local)
+
+        # Sync
+        l_global = comm.allreduce(float(l_loc), op=MPI.SUM)
+        g_global = comm.allreduce(float(g_loc), op=MPI.SUM)
+
+        if rank == 0:
+            print(f"{epoch:<6} {skew_init:<12.4f} {l_global:<15.6f} {g_global:<12.6f}")
+
+        # Update
+        skew_init -= lr * g_global
+
+        if l_global < 1e-6:
+            if rank == 0:
+                print("\nConverged!")
+            break
+
+    if rank == 0:
+        print(f"\nFinal skew: {skew_init:.4f}, True skew: {true_skew:.4f}")
+
+
+if __name__ == "__main__":
+    main()

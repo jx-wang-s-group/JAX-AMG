@@ -491,6 +491,108 @@ namespace
           .Attr<std::string_view>("config")         // config string
   );
 
+  // -------------------------------------------------------------------------
+  // MPI AllGather Custom Call
+  // -------------------------------------------------------------------------
+
+  template <typename T, ffi::DataType DType>
+  ffi::Error AmgxAllGatherInternal(cudaStream_t stream,
+                                   ffi::Buffer<DType> sendbuf,
+                                   ffi::Buffer<ffi::DataType::S32> recvcounts,
+                                   ffi::Buffer<ffi::DataType::S32> displs,
+                                   ffi::Buffer<ffi::DataType::S32> comm_ptr_buf,
+                                   ffi::ResultBuffer<DType> recvbuf)
+  {
+    // Synchronize stream to ensure inputs are ready
+    cudaStreamSynchronize(stream);
+
+    // Get MPI Communicator
+    int comm_ptr_parts[2];
+    cudaMemcpy(comm_ptr_parts, comm_ptr_buf.typed_data(), 2 * sizeof(int), cudaMemcpyDeviceToHost);
+    uint64_t comm_ptr_val = (static_cast<uint64_t>(static_cast<uint32_t>(comm_ptr_parts[1])) << 32) |
+                            static_cast<uint64_t>(static_cast<uint32_t>(comm_ptr_parts[0]));
+    MPI_Comm *mpi_comm = reinterpret_cast<MPI_Comm *>(comm_ptr_val);
+
+    // Get Counts and Displacements (must be on host for MPI call)
+    size_t nranks = recvcounts.element_count();
+    std::vector<int> counts_h(nranks);
+    std::vector<int> displs_h(nranks);
+
+    cudaMemcpy(counts_h.data(), recvcounts.typed_data(), nranks * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(displs_h.data(), displs.typed_data(), nranks * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Staging buffers on Host for MPI communication (Safer than assuming CUDA-aware MPI)
+    int send_count = static_cast<int>(sendbuf.element_count());
+    int total_recv_count = displs_h.back() + counts_h.back(); // Last displacement + last count = total size
+
+    std::vector<T> send_host(send_count);
+    std::vector<T> recv_host(total_recv_count);
+
+    // Copy D2H
+    // Note: sendbuf.typed_data() returns const T*, cast if needed or use directly if memcpy accepts const
+    cudaMemcpy(send_host.data(), sendbuf.typed_data(), send_count * sizeof(T), cudaMemcpyDeviceToHost);
+
+    // MPI Call
+    MPI_Datatype mpi_type = (sizeof(T) == 8) ? MPI_DOUBLE : MPI_FLOAT;
+    int err = MPI_Allgatherv(send_host.data(), send_count, mpi_type,
+                             recv_host.data(), counts_h.data(), displs_h.data(), mpi_type,
+                             *mpi_comm);
+
+    if (err != MPI_SUCCESS)
+    {
+      return ffi::Error::Internal("MPI_Allgatherv failed");
+    }
+
+    // Copy H2D
+    cudaMemcpy(recvbuf->typed_data(), recv_host.data(), total_recv_count * sizeof(T), cudaMemcpyHostToDevice);
+
+    return ffi::Error::Success();
+  }
+
+  ffi::Error AmgxAllGatherImpl(cudaStream_t stream,
+                               ffi::Buffer<ffi::DataType::F32> sendbuf,
+                               ffi::Buffer<ffi::DataType::S32> recvcounts,
+                               ffi::Buffer<ffi::DataType::S32> displs,
+                               ffi::Buffer<ffi::DataType::S32> comm_ptr,
+                               ffi::ResultBuffer<ffi::DataType::F32> recvbuf)
+  {
+    return AmgxAllGatherInternal<float, ffi::DataType::F32>(stream, sendbuf, recvcounts, displs, comm_ptr, recvbuf);
+  }
+
+  ffi::Error AmgxAllGatherImplDouble(cudaStream_t stream,
+                                     ffi::Buffer<ffi::DataType::F64> sendbuf,
+                                     ffi::Buffer<ffi::DataType::S32> recvcounts,
+                                     ffi::Buffer<ffi::DataType::S32> displs,
+                                     ffi::Buffer<ffi::DataType::S32> comm_ptr,
+                                     ffi::ResultBuffer<ffi::DataType::F64> recvbuf)
+  {
+    return AmgxAllGatherInternal<double, ffi::DataType::F64>(stream, sendbuf, recvcounts, displs, comm_ptr, recvbuf);
+  }
+
+  XLA_FFI_DEFINE_HANDLER(
+      AmgxAllGather,
+      AmgxAllGatherImpl,
+      ffi::Ffi::Bind()
+          .Ctx<ffi::PlatformStream<cudaStream_t>>()
+          .Arg<ffi::Buffer<ffi::F32>>() // sendbuf
+          .Arg<ffi::Buffer<ffi::S32>>() // recvcounts
+          .Arg<ffi::Buffer<ffi::S32>>() // displs
+          .Arg<ffi::Buffer<ffi::S32>>() // comm_ptr
+          .Ret<ffi::Buffer<ffi::F32>>() // recvbuf
+  );
+
+  XLA_FFI_DEFINE_HANDLER(
+      AmgxAllGatherDouble,
+      AmgxAllGatherImplDouble,
+      ffi::Ffi::Bind()
+          .Ctx<ffi::PlatformStream<cudaStream_t>>()
+          .Arg<ffi::Buffer<ffi::F64>>() // sendbuf
+          .Arg<ffi::Buffer<ffi::S32>>() // recvcounts
+          .Arg<ffi::Buffer<ffi::S32>>() // displs
+          .Arg<ffi::Buffer<ffi::S32>>() // comm_ptr
+          .Ret<ffi::Buffer<ffi::F64>>() // recvbuf
+  );
+
 } // namespace
 
 PYBIND11_MODULE(_amgx_ext, m)
@@ -503,5 +605,9 @@ PYBIND11_MODULE(_amgx_ext, m)
         { return py::capsule(reinterpret_cast<void *>(AmgxSolveMPI)); });
   m.def("get_amgx_solve_mpi_double_handler", []()
         { return py::capsule(reinterpret_cast<void *>(AmgxSolveMPIDouble)); });
+  m.def("get_amgx_allgather_handler", []()
+        { return py::capsule(reinterpret_cast<void *>(AmgxAllGather)); });
+  m.def("get_amgx_allgather_double_handler", []()
+        { return py::capsule(reinterpret_cast<void *>(AmgxAllGatherDouble)); });
   m.def("finalize", &AmgxFinalize, "Finalize AMGX (call before MPI_FINALIZE in MPI mode)");
 }

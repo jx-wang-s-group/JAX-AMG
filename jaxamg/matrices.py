@@ -12,12 +12,15 @@ import numpy as np
 import scipy.sparse as sp
 
 
-def tridiagonal_matrix(n: int, diagonal_value: float = 2.0) -> jsp.BCSR:
+def tridiagonal_matrix(
+    n: int, diagonal_value: float = 2.0, dtype=jnp.float32
+) -> jsp.BCSR:
     """Create a tridiagonal matrix in BCSR format with [-1, diagonal_value, -1] pattern.
 
     Args:
         n: Size of the matrix (n x n)
         diagonal_value: Value to place on the main diagonal (default 2.0)
+        dtype: Data type for matrix values (default jnp.float32)
 
     Returns:
         JAX BCSR matrix with [-1, diagonal_value, -1] pattern
@@ -30,28 +33,26 @@ def tridiagonal_matrix(n: int, diagonal_value: float = 2.0) -> jsp.BCSR:
 
     if n == 1:
         # Special case: 1x1 matrix
-        values = jnp.array([diagonal_value], dtype=jnp.float32)
+        values = jnp.array([diagonal_value], dtype=dtype)
         indices = jnp.array([0], dtype=jnp.int32)
         indptr = jnp.array([0, 1], dtype=jnp.int32)
     elif n == 2:
         # Special case: 2x2 matrix
-        values = jnp.array(
-            [diagonal_value, -1.0, -1.0, diagonal_value], dtype=jnp.float32
-        )
+        values = jnp.array([diagonal_value, -1.0, -1.0, diagonal_value], dtype=dtype)
         indices = jnp.array([0, 1, 0, 1], dtype=jnp.int32)
         indptr = jnp.array([0, 2, 4], dtype=jnp.int32)
     else:
         # General case: n >= 3
         # Build middle rows pattern: [-1, diag, -1] repeated (n-2) times
-        middle_pattern = jnp.array([-1.0, diagonal_value, -1.0], dtype=jnp.float32)
+        middle_pattern = jnp.array([-1.0, diagonal_value, -1.0], dtype=dtype)
         middle_values = jnp.tile(middle_pattern, n - 2)
 
         # Concatenate: first row + middle rows + last row
         values = jnp.concatenate(
             [
-                jnp.array([diagonal_value, -1.0], dtype=jnp.float32),  # First row
+                jnp.array([diagonal_value, -1.0], dtype=dtype),  # First row
                 middle_values,  # Middle rows
-                jnp.array([-1.0, diagonal_value], dtype=jnp.float32),  # Last row
+                jnp.array([-1.0, diagonal_value], dtype=dtype),  # Last row
             ]
         )
 
@@ -268,6 +269,62 @@ def poisson3d_matrix(n: int, skew: float = 0.0) -> jsp.BCSR:
     return jsp.BCSR((vals, cols, indptr), shape=(n3, n3))
 
 
+def tridiagonal_matrix_distributed(
+    n_global, rank, nranks, diagonal_value=2.0, dtype=jnp.float32
+):
+    """Create distributed tridiagonal matrix [-1, diagonal_value, -1] for MPI.
+
+    Args:
+        n_global: Global matrix size
+        rank: MPI rank (0-indexed)
+        nranks: Total number of MPI ranks
+        diagonal_value: Value on main diagonal (default: 2.0)
+        dtype: Data type for matrix values (default: jnp.float32)
+
+    Returns:
+        A_local: Local BCSR matrix partition (JAX)
+        row_start: Starting row index (global)
+        row_end: Ending row index (global, exclusive)
+    """
+    # Row-based partitioning
+    rows_per_rank = n_global // nranks
+    row_start = rank * rows_per_rank
+    row_end = (rank + 1) * rows_per_rank if rank < nranks - 1 else n_global
+    n_local = row_end - row_start
+
+    data, indices, indptr = [], [], [0]
+
+    for local_i in range(n_local):
+        global_i = row_start + local_i
+
+        # Lower diagonal
+        if global_i > 0:
+            data.append(-1.0)
+            indices.append(global_i - 1)
+
+        # Main diagonal
+        data.append(diagonal_value)
+        indices.append(global_i)
+
+        # Upper diagonal
+        if global_i < n_global - 1:
+            data.append(-1.0)
+            indices.append(global_i + 1)
+
+        indptr.append(len(data))
+
+    A_local = jsp.BCSR(
+        (
+            jnp.array(data, dtype=dtype),
+            jnp.array(indices, dtype=jnp.int32),
+            jnp.array(indptr, dtype=jnp.int32),
+        ),
+        shape=(n_local, n_global),
+    )
+
+    return A_local, row_start, row_end
+
+
 def poisson_matrix_distributed(nx, ny, rank, nranks, dtype=jnp.float32):
     """Create distributed 2D Poisson matrix with 5-point stencil for MPI.
 
@@ -397,6 +454,48 @@ def poisson_operator(skew: float = 0.0):
     return matvec
 
 
+def poisson_operator_distributed(n_side, row_start, row_end, skew=0.0):
+    """
+    Create a distributed Poisson operator.
+
+    The operator takes a global vector u, applies the Poisson stencil,
+    and returns the local portion of the result (rows [row_start, row_end)).
+
+    Args:
+        n_side: Grid size (results in n_side^2 global size)
+        row_start: Starting global row index for this rank
+        row_end: Ending global row index for this rank (exclusive)
+        skew: Skew-symmetric coefficient (default 0.0)
+
+    Returns:
+        Callable operator u_global_flat -> local_segment_flat
+    """
+    # Create kernel with skew parameter
+    # Standard symmetric: [[0, -1, 0], [-1, 4, -1], [0, -1, 0]]
+    kernel = jnp.array(
+        [
+            [0.0, -1.0 - skew / 2.0, 0.0],
+            [-1.0 - skew / 2.0, 4.0, -1.0 + skew / 2.0],
+            [0.0, -1.0 + skew / 2.0, 0.0],
+        ],
+        dtype=jnp.float64,
+    )
+
+    def matvec(u_flat):
+        # Reshape flat global vector to 2D grid
+        u = u_flat.reshape((n_side, n_side))
+
+        # Apply convolution with zero padding (Dirichlet BCs)
+        Au = jax.scipy.signal.convolve2d(
+            u, kernel, mode="same", boundary="fill", fillvalue=0.0
+        )
+
+        # Flatten and extract local rows
+        return Au.ravel()[row_start:row_end]
+
+    return matvec
+
+
 def convection_diffusion_matrix_2d(
     n: int, epsilon: float = 1.0, theta: float = 0.0, velocity: float = 100.0
 ) -> jsp.BCSR:
@@ -507,39 +606,42 @@ def convection_diffusion_matrix_2d(
     return jsp.BCSR((vals, cols, indptr), shape=(n2, n2))
 
 
-def rhs_ones(n: int):
+def rhs_ones(n: int, dtype=jnp.float32):
     """Create a constant RHS vector of ones.
 
     Args:
         n: Vector length
+        dtype: Data type of the vector
 
     Returns:
-        JAX array of ones (float32)
+        JAX array of ones
     """
-    return jnp.ones(n, dtype=jnp.float32)
+    return jnp.ones(n, dtype=dtype)
 
 
-def rhs_linear(n: int):
+def rhs_linear(n: int, dtype=jnp.float32):
     """Create a linearly increasing RHS vector.
 
     Args:
         n: Vector length
+        dtype: Data type of the vector
 
     Returns:
-        JAX array with values linearly spaced from 0 to 1 (float32)
+        JAX array with values linearly spaced from 0 to 1
     """
-    return jnp.linspace(0, 1, n, dtype=jnp.float32)
+    return jnp.linspace(0, 1, n, dtype=dtype)
 
 
-def rhs_random(n: int, seed: int = 0):
+def rhs_random(n: int, seed: int = 0, dtype=jnp.float32):
     """Create a random RHS vector.
 
     Args:
         n: Vector length
         seed: Random seed for reproducibility
+        dtype: Data type of the vector
 
     Returns:
-        JAX array with random normal values (float32)
+        JAX array with random normal values
     """
     key = jax.random.PRNGKey(seed)
-    return jax.random.normal(key, (n,), dtype=jnp.float32)
+    return jax.random.normal(key, (n,), dtype=dtype)

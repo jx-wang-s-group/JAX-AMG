@@ -24,7 +24,7 @@ def main():
     # Compute coloring cache
     print("Computing operator coloring...")
     diag_init = 4.5  # Use initial guess
-    coloring_cache = cache_coloring(tridiagonal_operator(diag_init), size=n)
+    coloring_cache = cache_coloring(tridiagonal_operator(diag_init), shape=n)
     print(f"Graph coloring computed. Number of colors: {coloring_cache[3]}")
 
     # Define loss function

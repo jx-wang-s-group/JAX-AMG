@@ -23,11 +23,10 @@ def main():
     # Compute coloring cache
     print("Computing operator coloring...")
     skew_init = 1.0  # Use initial guess
-    coloring_cache = cache_coloring(poisson_operator(skew_init), size=n)
+    coloring_cache = cache_coloring(poisson_operator(skew_init), shape=n)
     print(f"Graph coloring computed. Number of colors: {coloring_cache[3]}")
 
     # Define loss function
-    @jax.jit
     def loss_fn(skew, b, x_true):
         # Create operator with cached coloring
         A = with_coloring(poisson_operator(skew), coloring_cache)
@@ -42,7 +41,7 @@ def main():
     # Gradient Descent
     print("Starting optimization...")
     lr = 5.0  # Learning rate
-    grad_fn = jax.grad(loss_fn)
+    grad_fn = jax.jit(jax.grad(loss_fn))
 
     for epoch in range(200):
         l = loss_fn(skew_init, b, x_target)

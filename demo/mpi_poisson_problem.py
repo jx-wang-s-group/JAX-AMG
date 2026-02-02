@@ -28,7 +28,8 @@ def main():
     rank = comm.Get_rank()
     nranks = comm.Get_size()
 
-    gpu_id = rank
+    gpu_ids = [0, 1, 2, 3]
+    gpu_id = gpu_ids[rank]
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     grid_size = 32

@@ -137,7 +137,7 @@ class TestGradient:
 
         # Compute coloring cache
         coloring_cache = cache_coloring(
-            tridiagonal_operator(diagonal_value=1.0), size=n
+            tridiagonal_operator(diagonal_value=1.0), shape=n
         )
 
         @jax.jit

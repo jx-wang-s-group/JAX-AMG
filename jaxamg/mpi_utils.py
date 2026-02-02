@@ -137,3 +137,20 @@ def gather_solution(x_local, comm, root=0):
     else:
         comm.Gatherv(x_local_np, None, root=root)
         return None
+
+
+def get_partition_info(n_global, rank, nranks):
+    """Compute partition information for distributed problem."""
+    local_size = n_global // nranks
+    remainder = n_global % nranks
+
+    if rank < remainder:
+        n_local = local_size + 1
+        row_start = rank * n_local
+    else:
+        n_local = local_size
+        row_start = rank * local_size + remainder
+
+    row_end = row_start + n_local
+
+    return row_start, row_end, n_local

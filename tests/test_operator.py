@@ -41,7 +41,7 @@ class TestOperator:
         b = rhs_ones(n)
 
         # Compute coloring cache
-        coloring_cache = cache_coloring(A, size=n)
+        coloring_cache = cache_coloring(A, shape=n)
 
         # Solve with JIT using cached coloring
         @jax.jit

@@ -4,11 +4,9 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import pytest
 import jax.numpy as jnp
 import numpy as np
-import time
 
 from jaxamg import amg_solve, AMGXStatus
 from jaxamg.mpi_utils import (
-    validate_partition,
     gather_solution,
     partition_vector,
 )
