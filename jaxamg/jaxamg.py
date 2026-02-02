@@ -113,8 +113,8 @@ def _get_solver_primitive(config_str):
 
         # Solve A^T λ = g_x
         solver = _get_solver_primitive(config_str)
-        # Solver returns (adj_b, adj_stats). We only care about adj_b.
-        adj_b, _ = solver(A, g_x)
+        A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
+        adj_b, _ = solver(A_T, g_x)
 
         n = A.shape[0]
         row_lengths = A.indptr[1:] - A.indptr[:-1]

@@ -47,7 +47,7 @@ def prepare_config(user_config: Optional[Dict] = None, **kwargs) -> str:
         "solver": "PBICGSTAB",
         "preconditioner": {
             "solver": "AMG",
-            "smoother": {"solver": "BLOCK_JACOBI", "relaxation_factor": 0.8},
+            "smoother": {"solver": "JACOBI_L1", "relaxation_factor": 0.8},
             "presweeps": 1,
             "postsweeps": 1,
             "coarse_solver": "NOSOLVER",

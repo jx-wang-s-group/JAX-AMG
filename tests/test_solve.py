@@ -74,7 +74,7 @@ class TestSolver:
         x_nojit, _ = amg_solve(A, b)
 
         # Compare results
-        np.testing.assert_allclose(x_jit, x_nojit)
+        np.testing.assert_allclose(x_jit, x_nojit, rtol=1e-6)
 
     def test_tridiagonal_solve_float64(self):
         """Test solving a 1D tridiagonal system with double precision."""

@@ -1,7 +1,7 @@
 """
-Demo: Optimize a parameter of a linear operator.
+Demo: Optimize a parameter of a tridiagonal operator.
 
-Use JIT with parameterized operator for end-to-end optimization of a parameter (diagonal value).
+Use JIT with parameterized tridiagonal operator for end-to-end optimization of the diagonal value.
 """
 
 import jax
