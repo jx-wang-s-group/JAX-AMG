@@ -6,7 +6,13 @@ import functools
 import numpy as np
 from enum import IntEnum
 
-from . import _amgx_ext, utils, config as amgx_config
+from . import _amgx, utils, config as amgx_config
+
+from typing import cast, Callable, Any, TYPE_CHECKING
+from jax.typing import ArrayLike
+
+if TYPE_CHECKING:
+    from mpi4py.MPI import Comm
 
 _AMGX_CALL_NAME = "amgx_solve"
 _AMGX_CALL_NAME_DOUBLE = "amgx_solve_double"
@@ -16,12 +22,12 @@ _AMGX_CALL_NAME_ALLGATHER = "amgx_allgather"
 _AMGX_CALL_NAME_ALLGATHER_DOUBLE = "amgx_allgather_double"
 
 # Get the handler from C++ and register for CUDA platform
-_AMGX_HANDLER = _amgx_ext.get_amgx_solve_handler()
-_AMGX_HANDLER_DOUBLE = _amgx_ext.get_amgx_solve_double_handler()
-_AMGX_HANDLER_MPI = _amgx_ext.get_amgx_solve_mpi_handler()
-_AMGX_HANDLER_MPI_DOUBLE = _amgx_ext.get_amgx_solve_mpi_double_handler()
-_AMGX_HANDLER_ALLGATHER = _amgx_ext.get_amgx_allgather_handler()
-_AMGX_HANDLER_ALLGATHER_DOUBLE = _amgx_ext.get_amgx_allgather_double_handler()
+_AMGX_HANDLER = _amgx.get_amgx_solve_handler()
+_AMGX_HANDLER_DOUBLE = _amgx.get_amgx_solve_double_handler()
+_AMGX_HANDLER_MPI = _amgx.get_amgx_solve_mpi_handler()
+_AMGX_HANDLER_MPI_DOUBLE = _amgx.get_amgx_solve_mpi_double_handler()
+_AMGX_HANDLER_ALLGATHER = _amgx.get_amgx_allgather_handler()
+_AMGX_HANDLER_ALLGATHER_DOUBLE = _amgx.get_amgx_allgather_double_handler()
 
 ffi.register_ffi_target(_AMGX_CALL_NAME, _AMGX_HANDLER, platform="CUDA")
 ffi.register_ffi_target(_AMGX_CALL_NAME_DOUBLE, _AMGX_HANDLER_DOUBLE, platform="CUDA")
@@ -53,8 +59,17 @@ class AMGXStatus(IntEnum):
         return f"{self.__class__.__name__}.{self.name}"
 
 
-def _amgx_allgather_impl(sendbuf, recvcounts, displs, comm_ptr, nglobal=None):
+def _amgx_allgather_impl(
+    sendbuf: ArrayLike,
+    recvcounts: ArrayLike,
+    displs: ArrayLike,
+    comm_ptr: ArrayLike,
+    nglobal: ArrayLike | None = None,
+) -> jax.Array:
     """MPI AllGatherv implementation via FFI."""
+
+    sendbuf = jnp.asarray(sendbuf)
+
     if nglobal is None:
         nglobal = jnp.sum(recvcounts)
 
@@ -75,8 +90,16 @@ def _amgx_allgather_impl(sendbuf, recvcounts, displs, comm_ptr, nglobal=None):
     return call(sendbuf, recvcounts, displs, comm_ptr)
 
 
-def _amgx_solve_impl(row_ptrs, col_indices, values, b, config_str=""):
+def _amgx_solve_impl(
+    row_ptrs: ArrayLike,
+    col_indices: ArrayLike,
+    values: ArrayLike,
+    b: ArrayLike,
+    config_str: str = "",
+) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX solver (non-differentiable)."""
+
+    b = jnp.asarray(b)
 
     out_spec = (
         jax.ShapeDtypeStruct(b.shape, b.dtype),
@@ -93,13 +116,24 @@ def _amgx_solve_impl(row_ptrs, col_indices, values, b, config_str=""):
         input_layouts=[None, None, None, None],
         output_layouts=None,
     )
-    return call(row_ptrs, col_indices, values, b, config=config_str)
+    results = call(row_ptrs, col_indices, values, b, config=config_str)
+
+    return cast(tuple, results)
 
 
 def _amgx_solve_mpi_impl(
-    row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, config_str=""
-):
+    row_ptrs: ArrayLike,
+    col_indices: ArrayLike,
+    values: ArrayLike,
+    b: ArrayLike,
+    nglobal: ArrayLike,
+    comm_ptr: ArrayLike,
+    lrank: ArrayLike,
+    config_str: str = "",
+) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX MPI solver (non-differentiable)."""
+
+    b = jnp.asarray(b)
 
     out_spec = (
         jax.ShapeDtypeStruct(b.shape, b.dtype),
@@ -116,34 +150,38 @@ def _amgx_solve_mpi_impl(
         input_layouts=[None, None, None, None, None, None, None],
         output_layouts=None,
     )
-    return call(
+    results = call(
         row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, config=config_str
     )
 
+    return cast(tuple, results)
+
 
 @functools.lru_cache(maxsize=32)
-def _get_solver_primitive(config_str, is_symmetric=False):
+def _get_solver_primitive(config_str: str, is_symmetric: bool = False) -> Callable:
     """
     Returns a JAX custom_vjp primitive for AmgX solve with a specific configuration.
     Cached to avoid recompilation for identical configurations.
     """
 
     @jax.custom_vjp
-    def solve(A, b):
-        return _amgx_solve_impl(A.indptr, A.indices, A.data, b, config_str=config_str)
+    def solve(A: jsp.BCSR, b: jax.Array) -> tuple[jax.Array, jax.Array]:
+        x, info = _amgx_solve_impl(
+            A.indptr, A.indices, A.data, b, config_str=config_str
+        )
+        return x, info
 
-    def fwd(A, b):
-        # returns ((x, stats), residuals)
-        x_and_stats = solve(A, b)
-        # We only need A and x for backward pass, stats are metadata
-        x, stats = x_and_stats
-        return x_and_stats, (A, x)
+    def fwd(
+        A: jsp.BCSR, b: jax.Array
+    ) -> tuple[tuple[jax.Array, jax.Array], tuple[jsp.BCSR, jax.Array]]:
+        x, info = solve(A, b)
+        # Returns ((x, info), residuals)
+        return (x, info), (A, x)
 
-    def bwd(residuals, g):
-        # g is tuple (g_x, g_stats). We ignore g_stats.
+    def bwd(
+        residuals: tuple[jsp.BCSR, jax.Array], g: tuple[jax.Array, jax.Array]
+    ) -> tuple[jsp.BCSR, jax.Array]:
         g_x = g[0]
-        # g_stats = g[1] # Should be zeros/None ideally
-
         A, x = residuals
 
         # Solve A^T λ = g_x
@@ -173,19 +211,32 @@ def _get_solver_primitive(config_str, is_symmetric=False):
 
 
 @functools.lru_cache(maxsize=32)
-def _get_solver_primitive_mpi(config_str, nglobal, comm_ptr, lrank, is_symmetric=False):
+def _get_solver_primitive_mpi(
+    config_str: str,
+    nglobal: int,
+    comm_ptr: int,
+    lrank: int,
+    is_symmetric: bool = False,
+) -> Callable:
     """
     Create cached JAX custom_vjp primitive for MPI AmgX solve.
     Supports automatic differentiation in distributed setting.
     """
 
-    def allgather(sendbuf, recvcounts, displs, comm_ptr_arr):
+    def allgather(
+        sendbuf: ArrayLike,
+        recvcounts: ArrayLike,
+        displs: ArrayLike,
+        comm_ptr_arr: ArrayLike,
+    ) -> jax.Array:
         return _amgx_allgather_impl(
             sendbuf, recvcounts, displs, comm_ptr_arr, nglobal=nglobal
         )
 
     @jax.custom_vjp
-    def solve(A, b, recvcounts, displs):
+    def solve(
+        A: jsp.BCSR, b: jax.Array, recvcounts: jax.Array, displs: jax.Array
+    ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
         nglobal_arr = jnp.array([nglobal], dtype=jnp.int32)
 
         # Split 64-bit comm_ptr into two int32 values for FFI
@@ -199,7 +250,7 @@ def _get_solver_primitive_mpi(config_str, nglobal, comm_ptr, lrank, is_symmetric
         )
         lrank_arr = jnp.array([lrank], dtype=jnp.int32)
 
-        x, stats = _amgx_solve_mpi_impl(
+        x, info = _amgx_solve_mpi_impl(
             A.indptr,
             A.indices,
             A.data,
@@ -210,14 +261,28 @@ def _get_solver_primitive_mpi(config_str, nglobal, comm_ptr, lrank, is_symmetric
             config_str=config_str,
         )
 
-        return (x, stats), comm_ptr_arr
+        return (x, info), comm_ptr_arr
 
-    def fwd(A, b, recvcounts, displs):
+    def fwd(
+        A: jsp.BCSR, b: jax.Array, recvcounts: jax.Array, displs: jax.Array
+    ) -> tuple[
+        tuple[tuple[jax.Array, jax.Array], jax.Array],
+        tuple[jsp.BCSR, jax.Array, jax.Array, jax.Array, jax.Array],
+    ]:
         out = solve(A, b, recvcounts, displs)
-        (x, stats), comm_ptr_arr = out
-        return out, (A, x, recvcounts, displs, comm_ptr_arr)
+        (x, info), comm_ptr_arr = out
+        return out, (
+            A,
+            x,
+            recvcounts,
+            displs,
+            comm_ptr_arr,
+        )
 
-    def bwd(residuals, g):
+    def bwd(
+        residuals: tuple[jsp.BCSR, jax.Array, jax.Array, jax.Array, jax.Array],
+        g: tuple[tuple[jax.Array, jax.Array], jax.Array],
+    ) -> tuple[jsp.BCSR, jax.Array, None, None]:
         (g_x, _), _ = g
         A, x, recvcounts, displs, comm_ptr_arr = residuals
 
@@ -420,22 +485,22 @@ def _get_solver_primitive_mpi(config_str, nglobal, comm_ptr, lrank, is_symmetric
 
 
 def amg_solve(
-    A,
-    b,
-    config=None,
-    comm=None,
-    nglobal=None,
-    partition_info=None,
-    **kwargs,
-):
+    A: ArrayLike | Callable,
+    b: ArrayLike,
+    config: dict | None = None,
+    comm: "Comm | None" = None,
+    nglobal: int | None = None,
+    partition_info: tuple[int, int] | None = None,
+    **kwargs: Any,
+) -> tuple[jax.Array, dict]:
     """
     Solve Ax=b using AmgX (differentiable).
 
     Single-GPU mode (default):
-        A: either a jax.experimental.sparse.CSR matrix or a callable A(x).
+        A: Matrix or callable operator A(x).
            Callables are automatically materialized to CSR.
         b: RHS vector (float32 or float64).
-        config: Dict or string of AmgX configuration parameters.
+        config: Dict of AmgX configuration parameters.
         **kwargs: Additional configuration parameters passed as keyword arguments.
                   These override config if present.
 
@@ -454,6 +519,8 @@ def amg_solve(
         x: Solution vector (float32 or float64). In MPI mode, returns local portion.
         info: Dictionary containing 'iterations', 'residual', and 'status'.
     """
+
+    b = jnp.asarray(b)
 
     # Check for GPU backend
     if jax.default_backend() != "gpu":
@@ -506,8 +573,8 @@ def amg_solve(
             recvcounts = jnp.array(mpi_cache["recvcounts_tuple"], dtype=jnp.int32)
             displs = jnp.array(mpi_cache["displs_tuple"], dtype=jnp.int32)
 
-            (x, stats), _ = solver(A_csr, b, recvcounts, displs)
-        else:
+            (x, info), _ = solver(A_csr, b, recvcounts, displs)
+        elif comm is not None:
             # Compute metadata dynamically
             try:
                 from mpi4py import MPI
@@ -538,28 +605,27 @@ def amg_solve(
             solver = _get_solver_primitive_mpi(
                 config_str, nglobal, comm_ptr, lrank, is_symmetric=is_symmetric
             )
-            (x, stats), _ = solver(A_csr, b, recvcounts, displs)
+            (x, info), _ = solver(A_csr, b, recvcounts, displs)
 
     else:
         # Single-GPU mode: use int32 indices
-        A_csr = utils.to_bcsr_matrix(A, b=b)
+        A_csr = utils.to_bcsr_matrix(A, b)
 
         # Get cached primitive for this configuration
         solver = _get_solver_primitive(config_str, is_symmetric=is_symmetric)
 
-        # Returns (x, stats_array)
-        x, stats = solver(A_csr, b)
+        x, info = solver(A_csr, b)
 
     # Convert JAX array stats to python dict (same for both modes)
     try:
-        iter_val = int(stats[0])
-        res_val = float(stats[1])
-        status_val = AMGXStatus(int(stats[2]))
+        iter_val = int(info[0])
+        res_val = float(info[1])
+        status_val = AMGXStatus(int(info[2]))
     except Exception:
         # Inside JIT or symbolic execution: return raw arrays/tracers
-        iter_val = stats[0]
-        res_val = stats[1]
-        status_val = stats[2]
+        iter_val = info[0]
+        res_val = info[1]
+        status_val = info[2]
 
     info = {"iterations": iter_val, "residual": res_val, "status": status_val}
     return x, info

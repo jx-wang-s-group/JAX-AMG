@@ -121,7 +121,6 @@ def get_build_vars():
             "jax is required to build this package. Please install it first."
         )
 
-
     CUDA_HOME = find_cuda()
     print(f"\033[1;34m[setup.py] CUDA_HOME: {CUDA_HOME}\033[0m")
     if not CUDA_HOME:
@@ -217,7 +216,7 @@ def get_build_vars():
 build_vars = get_build_vars()
 
 ext = Extension(
-    "jaxamg._amgx_ext",
+    "jaxamg._amgx",
     sources=["jaxamg/amgx_custom_call.cc"],
     include_dirs=build_vars["include_dirs"],
     library_dirs=build_vars["library_dirs"],

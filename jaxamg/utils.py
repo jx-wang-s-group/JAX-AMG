@@ -11,8 +11,11 @@ import scipy.sparse as sp
 from collections import defaultdict
 import atexit
 
+from typing import cast, Callable
+from jax.typing import ArrayLike, DTypeLike
 
-def to_scipy(A: jsp.BCSR, format="csr") -> sp.spmatrix:
+
+def to_scipy(A: jsp.BCSR, format: str = "csr") -> sp.spmatrix:
     """Convert a JAX BCSR matrix to Scipy sparse matrix format.
 
     Args:
@@ -23,10 +26,12 @@ def to_scipy(A: jsp.BCSR, format="csr") -> sp.spmatrix:
     Returns:
         Scipy sparse matrix in the specified format
     """
-    # First convert to CSR (most efficient from BCSR)
-    A_csr = sp.csr_matrix(
-        (np.asarray(A.data), np.asarray(A.indices), np.asarray(A.indptr)), shape=A.shape
-    )
+    # First convert to CSR
+    data = np.asarray(A.data).ravel()
+    indices = np.asarray(A.indices).astype(int)
+    indptr = np.asarray(A.indptr).astype(int)
+    nrow, ncol = A.shape
+    A_csr = sp.csr_matrix((data, indices, indptr), shape=(nrow, ncol))
 
     # Convert to requested format
     if format == "csr":
@@ -47,7 +52,11 @@ def to_scipy(A: jsp.BCSR, format="csr") -> sp.spmatrix:
         )
 
 
-def get_sparsity_pattern(A_callable, shape, tol=1e-10):
+def get_sparsity_pattern(
+    A_callable: Callable,
+    shape: tuple[int, int],
+    tol: float = 1e-10,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Determine the sparsity pattern of a linear operator by applying it to basis vectors.
     Returns (rows, cols) of non-zero entries.
@@ -87,7 +96,9 @@ def get_sparsity_pattern(A_callable, shape, tol=1e-10):
     return rows, cols
 
 
-def get_column_coloring(rows, cols, shape):
+def get_column_coloring(
+    rows: np.ndarray, cols: np.ndarray, shape: tuple[int, int]
+) -> tuple[np.ndarray, int]:
     """
     Compute a coloring of the columns such that no two columns with the same color
     share a non-zero row, enabling simultaneous evaluation.
@@ -116,7 +127,7 @@ def get_column_coloring(rows, cols, shape):
 
     # Greedy Coloring
     # Sorting columns by generic ID or degree usually sufficient for structured grids.
-    column_colors = {}
+    column_colors: dict[int, int] = {}
     n_colors = 0
     all_cols = sorted(list(set(cols)))
 
@@ -138,7 +149,14 @@ def get_column_coloring(rows, cols, shape):
     return final_colors, n_colors
 
 
-def materialize_sparse_matrix(A_callable, shape, rows, cols, column_colors, n_colors):
+def materialize_sparse_matrix(
+    A_callable: Callable,
+    shape: tuple[int, int],
+    rows: ArrayLike,
+    cols: ArrayLike,
+    column_colors: ArrayLike,
+    n_colors: int,
+) -> jsp.BCSR:
     """
     Materialize the values of a sparse matrix inside JIT using graph coloring.
 
@@ -189,7 +207,7 @@ def materialize_sparse_matrix(A_callable, shape, rows, cols, column_colors, n_co
     return jsp.BCSR((values_sorted, cols_sorted, indptr), shape=shape)
 
 
-def get_preferred_dtype(A, b):
+def get_preferred_dtype(A: ArrayLike | Callable, b: ArrayLike) -> DTypeLike:
     """
     Determine the preferred precision (float32 or float64) for the solver.
 
@@ -198,24 +216,31 @@ def get_preferred_dtype(A, b):
     - If b is float64, use float64.
     - If A provides float64 data, use float64 (promoting b if necessary).
     """
-    target_dtype = jnp.float32
-    if b is not None:
-        target_dtype = b.dtype
 
-    # If A suggests float64, prefer that
-    if hasattr(A, "dtype"):
+    target_dtype = getattr(b, "dtype", jnp.float32)
+
+    a_dtype = getattr(A, "dtype", None)
+    a_data = getattr(A, "data", None)
+    a_data_dtype = getattr(a_data, "dtype", None)
+
+    # Check A.dtype
+    if a_dtype is not None:
         # e.g. JAX arrays, sparse matrices
-        if A.dtype == jnp.float64 or A.dtype == np.float64:
+        if a_dtype == jnp.float64 or a_dtype == np.float64:
             target_dtype = jnp.float64
-    elif hasattr(A, "data") and hasattr(A.data, "dtype"):
+
+    # Check A.data.dtype
+    if a_data_dtype is not None:
         # e.g. BCOO, BCSR
-        if A.data.dtype == jnp.float64 or A.data.dtype == np.float64:
+        if a_data_dtype == jnp.float64 or a_data_dtype == np.float64:
             target_dtype = jnp.float64
 
     return target_dtype
 
 
-def _ensure_bcsr_properties(A, target_dtype, use_int64_indices=False):
+def _ensure_bcsr_properties(
+    A: jsp.BCSR, target_dtype: DTypeLike, use_int64_indices: bool = False
+) -> jsp.BCSR:
     """Ensure BCSR matrix has correct data type and index types.
 
     Args:
@@ -237,7 +262,7 @@ def _ensure_bcsr_properties(A, target_dtype, use_int64_indices=False):
         # Temporarily enable X64 mode to allow int64 arrays
         if A.indices.dtype != np.int64:
             try:
-                original_x64 = jax.config.jax_enable_x64
+                original_x64 = jax.config.read("jax_enable_x64")
                 jax.config.update("jax_enable_x64", True)
                 try:
                     indices_int64 = jnp.array(A.indices, dtype=jnp.int64)
@@ -284,7 +309,9 @@ def _ensure_bcsr_properties(A, target_dtype, use_int64_indices=False):
     return A
 
 
-def to_bcsr_matrix(A, *, b=None, use_int64_indices=False):
+def to_bcsr_matrix(
+    A: ArrayLike | Callable, b: ArrayLike, use_int64_indices: bool = False
+) -> jsp.BCSR:
     """
     Normalize input 'A' to a BCSR matrix.
 
@@ -296,13 +323,20 @@ def to_bcsr_matrix(A, *, b=None, use_int64_indices=False):
         use_int64_indices: If True, use int64 for column indices (required for MPI).
                           If False (default), use int32 (for single-GPU mode).
     """
+
+    A_bcsr: jsp.BCSR
+
     # 1. Handle Callables (materialize via graph coloring)
     if callable(A):
+        A = cast(Callable, A)
         # Check for cached coloring info attached to the callable
         cached_info = getattr(A, "_coloring_info", None)
 
         if b is None:
             raise TypeError("Callable A requires RHS b to infer size.")
+
+        b = jnp.asarray(b)
+
         if b.ndim != 1:
             raise ValueError(f"RHS b must be 1D, got shape {b.shape}.")
 
@@ -345,19 +379,36 @@ def to_bcsr_matrix(A, *, b=None, use_int64_indices=False):
 
         # Materialize using graph coloring (works efficienty inside JIT)
         # Note: materialize_sparse_matrix already returns a BCSR
-        A = materialize_sparse_matrix(A, shape, rows, cols, column_colors, n_colors)
+        A_bcsr = materialize_sparse_matrix(
+            A, shape, rows, cols, column_colors, n_colors
+        )
 
     # 2. Convert to BCSR from other formats
     target_dtype = get_preferred_dtype(A, b)
 
     if isinstance(A, jsp.BCSR):
-        pass  # Already BCSR
+        A_bcsr = A
     elif isinstance(A, jsp.BCOO):
-        A = jsp.BCSR.from_bcoo(A)
+        A_bcsr = jsp.BCSR.from_bcoo(A)
     elif sp.issparse(A):
         # Use numpy dtype for scipy conversion
         np_dtype = np.float64 if target_dtype == jnp.float64 else np.float32
-        A = jsp.BCSR.from_scipy_sparse(A.astype(np_dtype))
+        if isinstance(
+            A,
+            (
+                sp.csr_matrix,
+                sp.csc_matrix,
+                sp.coo_matrix,
+                sp.bsr_matrix,
+                sp.lil_matrix,
+                sp.dok_matrix,
+            ),
+        ):
+            A_bcsr = jsp.BCSR.from_scipy_sparse(A.astype(np_dtype))
+        else:
+            raise TypeError(
+                f"Unsupported scipy sparse matrix type: {type(A).__name__}."
+            )
     elif isinstance(A, (np.ndarray, jnp.ndarray)):
         if A.ndim != 2:
             raise ValueError(f"Dense matrix must be 2D, got shape {A.shape}")
@@ -365,7 +416,9 @@ def to_bcsr_matrix(A, *, b=None, use_int64_indices=False):
             A = jnp.array(
                 A
             )  # Ensure JAX array before fromdense if needed, or just let fromdense handle it
-        A = jsp.BCSR.fromdense(A)
+        A_bcsr = jsp.BCSR.fromdense(A)
+    elif callable(A):
+        pass  # Already handled above
     else:
         raise TypeError(
             f"Matrix A must be one of: BCSR, BCOO, SciPy sparse, dense array (NumPy/JAX), or callable. "
@@ -373,7 +426,9 @@ def to_bcsr_matrix(A, *, b=None, use_int64_indices=False):
         )
 
     # 3. Standardize properties
-    return _ensure_bcsr_properties(A, target_dtype, use_int64_indices=use_int64_indices)
+    return _ensure_bcsr_properties(
+        A_bcsr, target_dtype, use_int64_indices=use_int64_indices
+    )
 
 
 # AMGX finalization: runs during Python exit (before MPI_FINALIZE)
@@ -381,7 +436,7 @@ def to_bcsr_matrix(A, *, b=None, use_int64_indices=False):
 _amgx_finalized = False
 
 
-def _finalize_amgx():
+def _finalize_amgx() -> None:
     """Finalize AMGX library before program exit (runs before MPI_FINALIZE)."""
     global _amgx_finalized
     if not _amgx_finalized:
@@ -395,9 +450,9 @@ def _finalize_amgx():
             except (ImportError, Exception):
                 pass
 
-            from jaxamg import _amgx_ext
+            from jaxamg import _amgx
 
-            _amgx_ext.finalize()
+            _amgx.finalize()
             _amgx_finalized = True
         except Exception:
             pass  # Ignore cleanup errors

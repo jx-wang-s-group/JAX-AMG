@@ -1,10 +1,11 @@
 import json
 import tempfile
 import os
-from typing import Dict, Any, Union, Optional
+
+from typing import Any
 
 
-def _format_config(config: Dict) -> str:
+def _format_config(config: dict | None) -> str:
     """
     Format configuration for AmgX.
 
@@ -30,19 +31,19 @@ def _format_config(config: Dict) -> str:
         raise
 
 
-def prepare_config(user_config: Optional[Dict] = None, **kwargs) -> str:
+def prepare_config(user_config: dict | None = None, **kwargs: Any) -> str:
     """
     Prepare the final configuration string for AmgX.
 
-    Merges the user config into defaults (PBICGSTAB+AMG), applies overrides (kwargs),
+    Merges the user config into defaults, applies overrides (kwargs),
     and injects residual tracking settings.
     """
     if user_config is not None and not isinstance(user_config, dict):
         raise TypeError(
-            f"Config must be a dictionary, got {type(user_config).__name__}. String configuration is no longer supported."
+            f"Config must be a dictionary, got {type(user_config).__name__}."
         )
 
-    # Default config: PBICGSTAB + AMG with block Jacobi smoother
+    # Default config
     defaults = {
         "solver": "PBICGSTAB",
         "preconditioner": {
@@ -69,9 +70,9 @@ def prepare_config(user_config: Optional[Dict] = None, **kwargs) -> str:
         elif isinstance(user_config.get("solver"), dict):
             is_nested = True
 
-    if is_nested:
+    if user_config and is_nested:
         merged_config = user_config.copy()
-    else:
+    elif not is_nested:
         merged_config = defaults.copy()
         if user_config:
             merged_config.update(user_config)

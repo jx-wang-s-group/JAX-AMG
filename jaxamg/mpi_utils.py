@@ -3,11 +3,18 @@
 import jax.numpy as jnp
 import jax.experimental.sparse as jsp
 import numpy as np
-from typing import Tuple
-from dataclasses import dataclass
+import scipy.sparse as sp
+
+from typing import cast, TYPE_CHECKING
+from jax.typing import ArrayLike
+
+if TYPE_CHECKING:
+    from mpi4py.MPI import Comm
 
 
-def partition_csr_matrix(A_global, rank, nranks):
+def partition_csr_matrix(
+    A_global: jsp.BCSR | sp.csr_matrix, rank: int, nranks: int
+) -> tuple[jsp.BCSR, int, int]:
     """Partition global CSR matrix across MPI ranks (row-based).
 
     Args:
@@ -41,16 +48,13 @@ def partition_csr_matrix(A_global, rank, nranks):
     # Extract local partition
     nnz_start = indptr[row_start]
     nnz_end = indptr[row_end]
-    local_indptr = indptr[row_start : row_end + 1] - nnz_start
-    local_indices = indices[nnz_start:nnz_end]
-    local_data = data[nnz_start:nnz_end]
 
     # Create BCSR: convert to JAX if SciPy, or ensure int32 indices if already JAX
-    if is_scipy:
-        local_data = jnp.array(local_data)
-        local_indices = jnp.array(local_indices)
-        local_indptr = jnp.array(local_indptr)
-    else:
+    local_indptr = jnp.asarray(indptr[row_start : row_end + 1] - nnz_start)
+    local_indices = jnp.asarray(indices[nnz_start:nnz_end])
+    local_data = jnp.asarray(data[nnz_start:nnz_end])
+
+    if not is_scipy:
         local_indices = local_indices.astype(jnp.int32)
         local_indptr = local_indptr.astype(jnp.int32)
 
@@ -58,7 +62,9 @@ def partition_csr_matrix(A_global, rank, nranks):
     return A_local, row_start, row_end
 
 
-def validate_partition(A_local, nglobal, row_start, row_end):
+def validate_partition(
+    A_local: jsp.BCSR, nglobal: int, row_start: int, row_end: int
+) -> None:
     """Validate partitioned matrix structure and print diagnostics."""
     n_local = row_end - row_start
 
@@ -87,7 +93,9 @@ def validate_partition(A_local, nglobal, row_start, row_end):
         print(f"✓ Partition validated: {n_local} rows, no non-zeros")
 
 
-def partition_vector(b_global, rank, nranks):
+def partition_vector(
+    b_global: ArrayLike, rank: int, nranks: int
+) -> tuple[ArrayLike, int, int]:
     """Partition global vector across MPI ranks (row-based).
 
     Args:
@@ -100,6 +108,7 @@ def partition_vector(b_global, rank, nranks):
         row_start: Starting row index (global)
         row_end: Ending row index (global, exclusive)
     """
+    b_global = jnp.asarray(b_global)
     n = len(b_global)
     rows_per_rank = n // nranks
     row_start = rank * rows_per_rank
@@ -107,7 +116,9 @@ def partition_vector(b_global, rank, nranks):
     return b_global[row_start:row_end], row_start, row_end
 
 
-def gather_solution(x_local, comm, root=0):
+def gather_solution(
+    x_local: ArrayLike, comm: "Comm", root: int = 0
+) -> ArrayLike | None:
     """Gather distributed solution to root rank using MPI Gatherv.
 
     Args:
@@ -124,6 +135,7 @@ def gather_solution(x_local, comm, root=0):
     x_local_np = np.array(x_local, dtype=np.float64)
     n_local = len(x_local_np)
     all_sizes = comm.gather(n_local, root=root)
+    all_sizes = cast(list, all_sizes)
 
     if rank == root:
         n_global = sum(all_sizes)
@@ -139,7 +151,7 @@ def gather_solution(x_local, comm, root=0):
         return None
 
 
-def get_partition_info(n_global, rank, nranks):
+def get_partition_info(n_global: int, rank: int, nranks: int) -> tuple[int, int, int]:
     """Compute partition information for distributed problem."""
     local_size = n_global // nranks
     remainder = n_global % nranks

@@ -11,9 +11,12 @@ import jax.experimental.sparse as jsp
 import numpy as np
 import scipy.sparse as sp
 
+from typing import cast, Callable, Any
+from jax.typing import DTypeLike
+
 
 def tridiagonal_matrix(
-    n: int, diagonal_value: float = 2.0, dtype=jnp.float32
+    n: int, diagonal_value: float = 2.0, dtype: DTypeLike = jnp.float32
 ) -> jsp.BCSR:
     """Create a tridiagonal matrix in BCSR format with [-1, diagonal_value, -1] pattern.
 
@@ -270,8 +273,12 @@ def poisson3d_matrix(n: int, skew: float = 0.0) -> jsp.BCSR:
 
 
 def tridiagonal_matrix_distributed(
-    n_global, rank, nranks, diagonal_value=2.0, dtype=jnp.float32
-):
+    n_global: int,
+    rank: int,
+    nranks: int,
+    diagonal_value: float = 2.0,
+    dtype: DTypeLike = jnp.float32,
+) -> tuple[jsp.BCSR, int, int]:
     """Create distributed tridiagonal matrix [-1, diagonal_value, -1] for MPI.
 
     Args:
@@ -325,7 +332,9 @@ def tridiagonal_matrix_distributed(
     return A_local, row_start, row_end
 
 
-def poisson_matrix_distributed(nx, ny, rank, nranks, dtype=jnp.float32):
+def poisson_matrix_distributed(
+    nx: int, ny: int, rank: int, nranks: int, dtype: DTypeLike = jnp.float32
+) -> tuple[jsp.BCSR, int, int]:
     """Create distributed 2D Poisson matrix with 5-point stencil for MPI.
 
     Args:
@@ -385,7 +394,7 @@ def poisson_matrix_distributed(nx, ny, rank, nranks, dtype=jnp.float32):
             vals.append(-1.0)
 
     # Convert JAX dtype to NumPy dtype
-    np_dtype = np.float32 if dtype == jnp.float32 else np.float64
+    np_dtype: type = np.float32 if dtype == jnp.float32 else np.float64
 
     A_local_scipy = sp.csr_matrix(
         (vals, (rows, cols)),
@@ -405,14 +414,14 @@ def poisson_matrix_distributed(nx, ny, rank, nranks, dtype=jnp.float32):
     return A_local, row_start, row_end
 
 
-def tridiagonal_operator(diagonal_value: float = 2.0):
+def tridiagonal_operator(diagonal_value: float = 2.0) -> Callable:
     """Create a tridiagonal operator with [-1, diagonal_value, -1] pattern."""
     kernel = jnp.array([-1.0, diagonal_value, -1.0])
     matvec = lambda x: jnp.convolve(x, kernel, mode="same")
     return matvec
 
 
-def poisson_operator(skew: float = 0.0):
+def poisson_operator(skew: float = 0.0) -> Callable:
     """Create a 2D Poisson operator (flat input).
 
     The operator represents the discretization of -Δu + skew * (∂u/∂x + ∂u/∂y)
@@ -454,7 +463,9 @@ def poisson_operator(skew: float = 0.0):
     return matvec
 
 
-def poisson_operator_distributed(n_side, row_start, row_end, skew=0.0):
+def poisson_operator_distributed(
+    n_side: int, row_start: int, row_end: int, skew: float = 0.0
+) -> Callable:
     """
     Create a distributed Poisson operator.
 
@@ -606,7 +617,7 @@ def convection_diffusion_matrix_2d(
     return jsp.BCSR((vals, cols, indptr), shape=(n2, n2))
 
 
-def rhs_ones(n: int, dtype=jnp.float32):
+def rhs_ones(n: int, dtype=jnp.float32) -> jax.Array:
     """Create a constant RHS vector of ones.
 
     Args:
@@ -619,7 +630,7 @@ def rhs_ones(n: int, dtype=jnp.float32):
     return jnp.ones(n, dtype=dtype)
 
 
-def rhs_linear(n: int, dtype=jnp.float32):
+def rhs_linear(n: int, dtype=jnp.float32) -> jax.Array:
     """Create a linearly increasing RHS vector.
 
     Args:
@@ -632,7 +643,7 @@ def rhs_linear(n: int, dtype=jnp.float32):
     return jnp.linspace(0, 1, n, dtype=dtype)
 
 
-def rhs_random(n: int, seed: int = 0, dtype=jnp.float32):
+def rhs_random(n: int, seed: int = 0, dtype: DTypeLike = jnp.float32) -> jax.Array:
     """Create a random RHS vector.
 
     Args:

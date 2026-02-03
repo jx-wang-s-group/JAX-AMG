@@ -6,11 +6,28 @@ This module provides functions to cache metadata, enabling efficient usage with 
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+
 from . import config as amgx_config
 from . import utils
 
+from typing import Any, Callable, TYPE_CHECKING
+from jax.typing import ArrayLike
 
-def with_cache(A, *, coloring=None, mpi=None, is_symmetric=False):
+
+if TYPE_CHECKING:
+    from mpi4py.MPI import Comm
+
+
+def with_cache(
+    A: ArrayLike | Callable,
+    *,
+    coloring: (
+        tuple[np.ndarray, np.ndarray, np.ndarray, int, tuple[int, int]] | None
+    ) = None,
+    mpi: dict[str, Any] | None = None,
+    is_symmetric: bool = False,
+) -> ArrayLike | Callable:
     """
     Attach cached metadata (coloring, MPI info, or symmetry) to a matrix or operator.
 
@@ -57,7 +74,12 @@ def with_cache(A, *, coloring=None, mpi=None, is_symmetric=False):
     return A
 
 
-def cache_mpi_metadata(config, comm, nglobal, partition_info):
+def cache_mpi_metadata(
+    config: dict,
+    comm: "Comm",
+    nglobal: int,
+    partition_info: tuple[int, int],
+) -> dict[str, Any]:
     """
     Pre-compute and cache MPI metadata for JIT-compatible solver usage.
 
@@ -73,7 +95,7 @@ def cache_mpi_metadata(config, comm, nglobal, partition_info):
         config: AmgX configuration dict or string
         comm: MPI communicator (from mpi4py.MPI.COMM_WORLD)
         nglobal: Global matrix size (total rows across all ranks)
-        partition_info: Tuple (row_start, row_end) indicating which rows this rank owns
+        partition_info: tuple (row_start, row_end) indicating which rows this rank owns
 
     Returns:
         Dict containing MPI metadata:
@@ -115,7 +137,9 @@ def cache_mpi_metadata(config, comm, nglobal, partition_info):
     }
 
 
-def cache_coloring(operator, shape):
+def cache_coloring(
+    operator: Any, shape: tuple[int, int] | int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, tuple[int, int]]:
     """
     Compute and cache coloring information for an operator.
 

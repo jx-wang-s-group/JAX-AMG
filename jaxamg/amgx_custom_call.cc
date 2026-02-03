@@ -595,7 +595,7 @@ namespace
 
 } // namespace
 
-PYBIND11_MODULE(_amgx_ext, m)
+PYBIND11_MODULE(_amgx, m)
 {
   m.def("get_amgx_solve_handler", []()
         { return py::capsule(reinterpret_cast<void *>(AmgxSolve)); });
