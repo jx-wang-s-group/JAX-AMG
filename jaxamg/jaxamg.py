@@ -6,7 +6,8 @@ import functools
 import numpy as np
 from enum import IntEnum
 
-from . import _amgx, utils, config as amgx_config
+from . import _amgx, config as amgx_config
+from .utils import *
 
 from typing import cast, Callable, Any, TYPE_CHECKING
 from jax.typing import ArrayLike
@@ -485,7 +486,7 @@ def _get_solver_primitive_mpi(
 
 
 def amg_solve(
-    A: ArrayLike | Callable,
+    A: MatrixOrOperator,
     b: ArrayLike,
     config: dict | None = None,
     comm: "Comm | None" = None,
@@ -539,7 +540,7 @@ def amg_solve(
         config_str = amgx_config.prepare_config(config, **kwargs)
 
     # Detect desired precision
-    target_dtype = utils.get_preferred_dtype(A, b)
+    target_dtype = get_preferred_dtype(A, b)
     if target_dtype == jnp.float64 and b.dtype != jnp.float64:
         b = b.astype(jnp.float64)
 
@@ -559,7 +560,7 @@ def amg_solve(
                 )
 
         # Convert A to BCSR with int64 indices (required for MPI)
-        A_csr = utils.to_bcsr_matrix(A, b=b, use_int64_indices=True)
+        A_csr = to_bcsr_matrix(A, b=b, use_int64_indices=True)
 
         if mpi_cache is not None:
             # Use pre-cached MPI metadata
@@ -609,7 +610,7 @@ def amg_solve(
 
     else:
         # Single-GPU mode: use int32 indices
-        A_csr = utils.to_bcsr_matrix(A, b)
+        A_csr = to_bcsr_matrix(A, b)
 
         # Get cached primitive for this configuration
         solver = _get_solver_primitive(config_str, is_symmetric=is_symmetric)

@@ -126,18 +126,22 @@ def main():
 
         # Gather final b from all ranks
         b_final_list = comm.gather(np.array(b_current), root=0)
-        b_final_global = jnp.concatenate(b_final_list)
 
-        # Compute reference loss on the same final b
-        A_global = tridiagonal_matrix(n_global, diagonal_value=4.0, dtype=jnp.float64)
-        x_ref, _ = amg_solve(A_global, b_final_global, solver="CG")
-        loss_ref = float(jnp.sum(x_ref * x_ref))
+        if b_final_list is not None:
+            b_final_global = jnp.concatenate(b_final_list)
 
-        print(f"  MPI loss:        {loss_current_global:.6e}")
-        print(f"  Single-GPU loss: {loss_ref:.6e}")
-        print(
-            f"  Relative error:  {abs(loss_current_global - loss_ref) / abs(loss_ref):.2e}"
-        )
+            # Compute reference loss on the same final b
+            A_global = tridiagonal_matrix(
+                n_global, diagonal_value=4.0, dtype=jnp.float64
+            )
+            x_ref, _ = amg_solve(A_global, b_final_global, solver="CG")
+            loss_ref = float(jnp.sum(x_ref * x_ref))
+
+            print(f"  MPI loss:        {loss_current_global:.6e}")
+            print(f"  Single-GPU loss: {loss_ref:.6e}")
+            print(
+                f"  Relative error:  {abs(loss_current_global - loss_ref) / abs(loss_ref):.2e}"
+            )
     else:
         comm.gather(np.array(b_current), root=0)
 

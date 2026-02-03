@@ -2,9 +2,6 @@
 
 import pytest
 import numpy as np
-import scipy.sparse as sp
-import jax.numpy as jnp
-import jax.experimental.sparse as jsp
 
 from jaxamg import amg_solve
 from jaxamg.matrices import tridiagonal_matrix, rhs_ones

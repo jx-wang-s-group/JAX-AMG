@@ -1,6 +1,5 @@
 import pytest
 import numpy as np
-import jax.numpy as jnp
 from jaxamg import amg_solve, AMGXStatus
 from jaxamg.matrices import tridiagonal_matrix, rhs_ones
 
@@ -71,7 +70,7 @@ def test_config_nested(linear_system):
             "tolerance": 1e-6,
         },
     }
-    x, info = amg_solve(A, b, config=config)
+    _, info = amg_solve(A, b, config=config)
     assert info["status"] == AMGXStatus.SUCCESS
 
     # Check residual tracking injection is successful even if not explicitly requested

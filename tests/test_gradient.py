@@ -2,6 +2,7 @@
 
 import pytest
 import numpy as np
+import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import jax
 import jax.numpy as jnp
@@ -16,6 +17,8 @@ from jaxamg.matrices import (
     rhs_random,
 )
 from jaxamg.utils import to_scipy
+
+from typing import cast
 
 
 def l2_loss(A, b, config={"solver": "CG"}):
@@ -53,7 +56,7 @@ class TestGradient:
         # Compute gradient with SciPy (∂L/∂b = 2 * A^(-T) * x)
         x, _ = amg_solve(A, b, solver="CG")
         # Convert JAX CSR to scipy for comparison
-        A_sp = to_scipy(A)
+        A_sp = cast(sp.csr_matrix, to_scipy(A))
         grad_sp = 2.0 * spla.spsolve(A_sp.T.tocsr(), np.asarray(x))
 
         # Comparison with SciPy solution
@@ -85,7 +88,7 @@ class TestGradient:
         grad_jax = jax.grad(loss)(b)
 
         # Compute gradient with SciPy
-        A_sp = to_scipy(A)
+        A_sp = cast(sp.csr_matrix, to_scipy(A))
         grad_sp = spla.spsolve(A_sp.T.tocsr(), np.asarray(v))
 
         # Comparison with SciPy solution

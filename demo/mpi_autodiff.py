@@ -92,7 +92,7 @@ def main():
     grad_gathered = comm.gather(np.array(grad_mpi), root=0)
     loss_total = comm.reduce(float(loss_mpi), op=MPI.SUM, root=0)
 
-    if rank == 0:
+    if rank == 0 and b_gathered is not None and grad_gathered is not None:
         print(f"\nValidating against single-GPU result...")
 
         b_global = jnp.concatenate(b_gathered)

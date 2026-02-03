@@ -113,7 +113,9 @@ def main():
             config=config,
         )
 
+        x_mpi = jnp.asarray(x_mpi)
         diff = jnp.linalg.norm(x_mpi - x_ref) / jnp.linalg.norm(x_ref)
+
         print(f"  Residual (MPI): {info['residual']:.2e}")
         print(f"  Residual (single-GPU): {info_ref['residual']:.2e}")
         print(f"  First 5 entries (MPI solution): {x_mpi[:5]}")

@@ -13,7 +13,6 @@ from mpi4py import MPI
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from jaxamg import amg_solve, cache_mpi_metadata, with_cache
 from jaxamg.matrices import (

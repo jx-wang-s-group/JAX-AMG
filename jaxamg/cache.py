@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import config as amgx_config
-from . import utils
+from .utils import *
 
 from typing import Any, Callable, TYPE_CHECKING
 from jax.typing import ArrayLike
@@ -20,14 +20,14 @@ if TYPE_CHECKING:
 
 
 def with_cache(
-    A: ArrayLike | Callable,
+    A: MatrixOrOperator,
     *,
     coloring: (
         tuple[np.ndarray, np.ndarray, np.ndarray, int, tuple[int, int]] | None
     ) = None,
     mpi: dict[str, Any] | None = None,
     is_symmetric: bool = False,
-) -> ArrayLike | Callable:
+) -> MatrixOrOperator:
     """
     Attach cached metadata (coloring, MPI info, or symmetry) to a matrix or operator.
 
@@ -179,8 +179,8 @@ def cache_coloring(
             )
 
     # Compute sparsity pattern and coloring
-    rows, cols = utils.get_sparsity_pattern(operator, shape)
-    column_colors, n_colors = utils.get_column_coloring(rows, cols, shape)
+    rows, cols = get_sparsity_pattern(operator, shape)
+    column_colors, n_colors = get_column_coloring(rows, cols, shape)
 
     cache = (rows, cols, column_colors, n_colors, shape)
 

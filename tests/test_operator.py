@@ -1,9 +1,7 @@
 """Tests for callable linear operator support."""
 
-import pytest
 import numpy as np
 import jax
-import jax.numpy as jnp
 
 from jaxamg import amg_solve, cache_coloring, with_cache, AMGXStatus
 from jaxamg.matrices import (

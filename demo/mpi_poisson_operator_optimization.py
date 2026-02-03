@@ -13,7 +13,6 @@ from mpi4py import MPI
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from jaxamg import (
     amg_solve,
@@ -24,7 +23,6 @@ from jaxamg import (
 from jaxamg.matrices import (
     rhs_ones,
     poisson_operator,
-    poisson_matrix,
     poisson_operator_distributed,
 )
 from jaxamg.mpi_utils import get_partition_info

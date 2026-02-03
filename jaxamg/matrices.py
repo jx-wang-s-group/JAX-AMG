@@ -11,7 +11,7 @@ import jax.experimental.sparse as jsp
 import numpy as np
 import scipy.sparse as sp
 
-from typing import cast, Callable, Any
+from typing import Callable
 from jax.typing import DTypeLike
 
 

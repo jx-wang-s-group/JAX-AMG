@@ -15,6 +15,10 @@ from typing import cast, Callable
 from jax.typing import ArrayLike, DTypeLike
 
 
+Matrix = ArrayLike | jsp.JAXSparse | sp.spmatrix
+MatrixOrOperator = Matrix | Callable
+
+
 def to_scipy(A: jsp.BCSR, format: str = "csr") -> sp.spmatrix:
     """Convert a JAX BCSR matrix to Scipy sparse matrix format.
 
@@ -207,7 +211,7 @@ def materialize_sparse_matrix(
     return jsp.BCSR((values_sorted, cols_sorted, indptr), shape=shape)
 
 
-def get_preferred_dtype(A: ArrayLike | Callable, b: ArrayLike) -> DTypeLike:
+def get_preferred_dtype(A: MatrixOrOperator, b: ArrayLike) -> DTypeLike:
     """
     Determine the preferred precision (float32 or float64) for the solver.
 
@@ -310,7 +314,7 @@ def _ensure_bcsr_properties(
 
 
 def to_bcsr_matrix(
-    A: ArrayLike | Callable, b: ArrayLike, use_int64_indices: bool = False
+    A: MatrixOrOperator, b: ArrayLike, use_int64_indices: bool = False
 ) -> jsp.BCSR:
     """
     Normalize input 'A' to a BCSR matrix.
