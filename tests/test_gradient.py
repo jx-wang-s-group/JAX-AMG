@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 from jax.test_util import check_grads
 
-from jaxamg import amg_solve, cache_coloring, with_coloring
+from jaxamg import amg_solve, cache_coloring, with_cache
 from jaxamg.matrices import (
     tridiagonal_matrix,
     tridiagonal_operator,
@@ -142,7 +142,9 @@ class TestGradient:
 
         @jax.jit
         def loss(diagonal_value):
-            A = with_coloring(tridiagonal_operator(diagonal_value), coloring_cache)
+            A = with_cache(
+                tridiagonal_operator(diagonal_value), coloring=coloring_cache
+            )
             return l2_loss(A, b)
 
         diagonal_value = 4.0

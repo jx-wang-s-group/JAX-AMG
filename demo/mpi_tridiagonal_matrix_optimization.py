@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jaxamg import amg_solve, cache_mpi_metadata, with_mpi_cache
+from jaxamg import amg_solve, cache_mpi_metadata, with_cache
 from jaxamg.matrices import (
     tridiagonal_operator,
     tridiagonal_matrix_distributed,
@@ -85,7 +85,7 @@ def main():
             dtype=jnp.float64,
         )
 
-        A = with_mpi_cache(A_loc, mpi_cache)
+        A = with_cache(A_loc, mpi=mpi_cache)
         x_pred_loc, _ = amg_solve(A, b_loc)
 
         loss_loc = jnp.sum((x_pred_loc - x_true_loc) ** 2)

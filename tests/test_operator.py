@@ -5,7 +5,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from jaxamg import amg_solve, cache_coloring, with_coloring, AMGXStatus
+from jaxamg import amg_solve, cache_coloring, with_cache, AMGXStatus
 from jaxamg.matrices import (
     tridiagonal_matrix,
     tridiagonal_operator,
@@ -46,7 +46,9 @@ class TestOperator:
         # Solve with JIT using cached coloring
         @jax.jit
         def solve(diagonal_value, b):
-            A = with_coloring(tridiagonal_operator(diagonal_value), coloring_cache)
+            A = with_cache(
+                tridiagonal_operator(diagonal_value), coloring=coloring_cache
+            )
             x, _ = amg_solve(A, b, solver="CG")
             return x
 

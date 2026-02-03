@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jaxamg import amg_solve, cache_mpi_metadata, with_mpi_cache
+from jaxamg import amg_solve, cache_mpi_metadata, with_cache
 from jaxamg.matrices import (
     tridiagonal_matrix,
     tridiagonal_matrix_distributed,
@@ -69,7 +69,7 @@ def main():
     mpi_cache = cache_mpi_metadata(config, comm, n_global, (row_start, row_end))
 
     # Attach MPI cache to matrix
-    A_local = with_mpi_cache(A_local, mpi_cache)
+    A_local = with_cache(A_local, mpi=mpi_cache)
 
     def loss_fn(b_loc):
         """Loss function using cached MPI metadata - JIT will be applied to grad."""

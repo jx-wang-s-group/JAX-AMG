@@ -299,7 +299,7 @@ def to_bcsr_matrix(A, *, b=None, use_int64_indices=False):
     # 1. Handle Callables (materialize via graph coloring)
     if callable(A):
         # Check for cached coloring info attached to the callable
-        cached_info = getattr(A, "_amgx_coloring_info", None)
+        cached_info = getattr(A, "_coloring_info", None)
 
         if b is None:
             raise TypeError("Callable A requires RHS b to infer size.")
@@ -334,7 +334,7 @@ def to_bcsr_matrix(A, *, b=None, use_int64_indices=False):
 
             cached_info = (rows, cols, column_colors, n_colors, shape)
             try:
-                setattr(A, "_amgx_coloring_info", cached_info)
+                setattr(A, "_coloring_info", cached_info)
             except Exception:
                 pass  # Ignore if caching fails (e.g. on partials or immutable objects)
 

@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jaxamg import amg_solve, cache_mpi_metadata, with_mpi_cache
+from jaxamg import amg_solve, cache_mpi_metadata, with_cache
 from jaxamg.matrices import tridiagonal_matrix_distributed, tridiagonal_matrix
 
 jax.config.update("jax_enable_x64", True)
@@ -60,7 +60,7 @@ def main():
 
     # Define loss function
     def loss_local(b_loc):
-        A = with_mpi_cache(A_local, mpi_cache)
+        A = with_cache(A_local, mpi=mpi_cache)
         x_loc, _ = amg_solve(A, b_loc)
         return jnp.sum(x_loc * x_loc)
 

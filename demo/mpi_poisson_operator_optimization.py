@@ -18,9 +18,8 @@ import numpy as np
 from jaxamg import (
     amg_solve,
     cache_mpi_metadata,
-    with_mpi_cache,
+    with_cache,
     cache_coloring,
-    with_coloring,
 )
 from jaxamg.matrices import (
     rhs_ones,
@@ -102,7 +101,7 @@ def main():
     # Define loss function
     def loss_local(skew, b_loc, x_true_loc):
         op = poisson_operator_distributed(grid_size, row_start, row_end, skew=skew)
-        A = with_mpi_cache(with_coloring(op, coloring_cache), mpi_cache)
+        A = with_cache(op, coloring=coloring_cache, mpi=mpi_cache)
 
         x_pred_loc, info = amg_solve(A, b_loc)
 

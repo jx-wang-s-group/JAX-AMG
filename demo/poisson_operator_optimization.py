@@ -7,7 +7,7 @@ Use JIT with parameterized Poisson operator for end-to-end optimization of the s
 import jax
 import jax.numpy as jnp
 
-from jaxamg import amg_solve, cache_coloring, with_coloring
+from jaxamg import amg_solve, cache_coloring, with_cache
 from jaxamg.matrices import tridiagonal_operator, rhs_ones, poisson_operator
 
 
@@ -29,7 +29,7 @@ def main():
     # Define loss function
     def loss_fn(skew, b, x_true):
         # Create operator with cached coloring
-        A = with_coloring(poisson_operator(skew), coloring_cache)
+        A = with_cache(poisson_operator(skew), coloring=coloring_cache)
 
         # Solve
         x_pred, _ = amg_solve(A, b)

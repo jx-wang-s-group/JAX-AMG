@@ -437,7 +437,7 @@ def amg_solve(
         config: Dict or string of AmgX configuration parameters.
         **kwargs: Additional configuration parameters.
 
-    If A is attached with mpi_cache (`_amgx_mpi_cache` attribute, set by `with_mpi_cache`), then comm, nglobal, and partition_info are not needed.
+    If A is attached with MPI cache (via `with_cache`), then comm, nglobal, and partition_info are not needed.
 
     Returns:
         x: Solution vector (float32 or float64). In MPI mode, returns local portion.
@@ -451,8 +451,8 @@ def amg_solve(
             "Please ensure you have a CUDA-enabled GPU and JAX is installed with CUDA support."
         )
 
-    # Check if MPI cache is attached to A (via with_mpi_cache)
-    mpi_cache = getattr(A, "_amgx_mpi_cache", None)
+    # Check if MPI cache is attached to A (via with_cache)
+    mpi_cache = getattr(A, "_mpi_cache", None)
 
     # Prepare configuration string/file (skip if using mpi_cache which already has config_str)
     if mpi_cache is not None:
@@ -606,27 +606,39 @@ def cache_mpi_metadata(config, comm, nglobal, partition_info):
     }
 
 
-def with_mpi_cache(A, mpi_cache):
+def with_cache(A, *, coloring=None, mpi=None):
     """
-    Attach cached MPI metadata to a matrix or operator.
+    Attach cached metadata (coloring or MPI info) to a matrix or operator.
 
-    This allows using matrices/operators inside JIT-compiled functions
-    without passing mpi_cache as a parameter to amg_solve.
+    This cache allows using matrices/operators inside JIT-compiled functions
+    without recomputing metadata or passing it as separate arguments.
 
     Args:
-        A: A matrix (BCSR/CSR) or operator.
-        mpi_cache: Cached MPI metadata from `cache_mpi_metadata()`.
+        A: A matrix or operator.
+        coloring: Cached coloring information from `cache_coloring()`.
+        mpi: Cached MPI metadata from `cache_mpi_metadata()`.
 
     Returns:
-        The same matrix/operator with MPI cache attached.
+        The same matrix/operator with requested cache attached.
     """
-    try:
-        object.__setattr__(A, "_amgx_mpi_cache", mpi_cache)
-    except Exception as e:
-        raise TypeError(
-            f"Cannot attach MPI cache to object of type {type(A).__name__}. "
-            f"Error: {e}"
-        )
+    if coloring is not None:
+        try:
+            object.__setattr__(A, "_coloring_info", coloring)
+        except Exception as e:
+            raise TypeError(
+                f"Cannot attach coloring cache to object of type {type(A).__name__}. "
+                f"Error: {e}"
+            )
+
+    if mpi is not None:
+        try:
+            object.__setattr__(A, "_mpi_cache", mpi)
+        except Exception as e:
+            raise TypeError(
+                f"Cannot attach MPI cache to object of type {type(A).__name__}. "
+                f"Error: {e}"
+            )
+
     return A
 
 
@@ -642,7 +654,7 @@ def cache_coloring(operator, shape):
         shape: Shape of the operator (n, m) or int size (for n×n matrix).
 
     Returns:
-        Cached coloring information that can be reattached with `with_coloring()`.
+        Cached coloring information that can be reattached with `with_cache(..., coloring=...)`.
 
     Example:
         >>> A = tridiagonal_operator(diagonal_value=2.0)
@@ -650,14 +662,14 @@ def cache_coloring(operator, shape):
         >>>
         >>> @jax.jit
         >>> def solve(diag, b):
-        >>>     A = with_coloring(tridiagonal_operator(diag), cache)
+        >>>     A = with_cache(tridiagonal_operator(diag), coloring=cache)
         >>>     return amg_solve(A, b)
     """
     if isinstance(shape, int):
         shape = (shape, shape)
 
     # Check if already cached
-    existing_cache = getattr(operator, "_amgx_coloring_info", None)
+    existing_cache = getattr(operator, "_coloring_info", None)
     if existing_cache is not None:
         # Verify size matches
         cached_shape = existing_cache[4]
@@ -677,32 +689,8 @@ def cache_coloring(operator, shape):
 
     # Try to attach to operator for convenience
     try:
-        setattr(operator, "_amgx_coloring_info", cache)
+        setattr(operator, "_coloring_info", cache)
     except Exception:
         pass  # Ignore if caching fails
 
     return cache
-
-
-def with_coloring(operator, cache):
-    """
-    Attach cached coloring information to an operator.
-
-    This allows using parameterized operators inside JIT-compiled functions
-    without recomputing the sparsity pattern and coloring.
-
-    Args:
-        operator: A callable operator.
-        cache: Cached coloring information from `cache_coloring()`.
-
-    Returns:
-        The same operator with coloring cache attached.
-    """
-    try:
-        object.__setattr__(operator, "_amgx_coloring_info", cache)
-    except Exception as e:
-        raise TypeError(
-            f"Cannot attach coloring cache to operator of type {type(operator).__name__}. "
-            f"Error: {e}"
-        )
-    return operator
