@@ -122,7 +122,7 @@ def _amgx_solve_mpi_impl(
 
 
 @functools.lru_cache(maxsize=32)
-def _get_solver_primitive(config_str):
+def _get_solver_primitive(config_str, is_symmetric=False):
     """
     Returns a JAX custom_vjp primitive for AmgX solve with a specific configuration.
     Cached to avoid recompilation for identical configurations.
@@ -147,9 +147,14 @@ def _get_solver_primitive(config_str):
         A, x = residuals
 
         # Solve A^T λ = g_x
-        solver = _get_solver_primitive(config_str)
-        A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
-        adj_b, _ = solver(A_T, g_x)
+        solver = _get_solver_primitive(config_str, is_symmetric)
+
+        # Check if matrix is symmetric
+        if is_symmetric:
+            adj_b, _ = solver(A, g_x)
+        else:
+            A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
+            adj_b, _ = solver(A_T, g_x)
 
         n = A.shape[0]
         row_lengths = A.indptr[1:] - A.indptr[:-1]
@@ -168,7 +173,7 @@ def _get_solver_primitive(config_str):
 
 
 @functools.lru_cache(maxsize=32)
-def _get_solver_primitive_mpi(config_str, nglobal, comm_ptr, lrank):
+def _get_solver_primitive_mpi(config_str, nglobal, comm_ptr, lrank, is_symmetric=False):
     """
     Create cached JAX custom_vjp primitive for MPI AmgX solve.
     Supports automatic differentiation in distributed setting.
@@ -370,23 +375,29 @@ def _get_solver_primitive_mpi(config_str, nglobal, comm_ptr, lrank):
 
                 return out_data, out_indices, out_indptr_truncated
 
-        # Execute transpose on host via callback
-        # Use simple pure_callback signature
-        at_data, at_indices, at_indptr = jax.pure_callback(
-            transpose_callback,
-            (A.data, A.indices, A.indptr),  # Output shapes derived from A
-            A.data,
-            A.indices,
-            A.indptr,
-            A.shape,
-            recvcounts,
-        )
-
-        # Reconstruct BCSR for A^T
-        A_T = jsp.BCSR((at_data, at_indices, at_indptr), shape=A.shape)
-
         # Backward solve: A^T @ adj_b = g_x
-        (adj_b, _), _ = solve(A_T, g_x, recvcounts, displs)
+
+        # Check if matrix is symmetric
+        if is_symmetric:
+            # Skip distributed transpose
+            (adj_b, _), _ = solve(A, g_x, recvcounts, displs)
+        else:
+            # Execute transpose on host via callback
+            # Use simple pure_callback signature
+            at_data, at_indices, at_indptr = jax.pure_callback(
+                transpose_callback,
+                (A.data, A.indices, A.indptr),  # Output shapes derived from A
+                A.data,
+                A.indices,
+                A.indptr,
+                A.shape,
+                recvcounts,
+            )
+
+            # Reconstruct BCSR for A^T
+            A_T = jsp.BCSR((at_data, at_indices, at_indptr), shape=A.shape)
+
+            (adj_b, _), _ = solve(A_T, g_x, recvcounts, displs)
 
         # Gather x across all ranks for gradient computation
         x_global = allgather(x, recvcounts, displs, comm_ptr_arr)
@@ -465,6 +476,9 @@ def amg_solve(
     if target_dtype == jnp.float64 and b.dtype != jnp.float64:
         b = b.astype(jnp.float64)
 
+    # Check for symmetry attribute on A
+    is_symmetric = getattr(A, "_is_symmetric", False)
+
     # Branch: MPI mode or single-GPU mode
     if mpi_cache is not None or comm is not None:
         # MPI MODE
@@ -487,6 +501,7 @@ def amg_solve(
                 mpi_cache["nglobal"],
                 mpi_cache["comm_ptr"],
                 mpi_cache["lrank"],
+                is_symmetric=is_symmetric,
             )
             recvcounts = jnp.array(mpi_cache["recvcounts_tuple"], dtype=jnp.int32)
             displs = jnp.array(mpi_cache["displs_tuple"], dtype=jnp.int32)
@@ -520,7 +535,9 @@ def amg_solve(
             recvcounts = jnp.array(recvcounts_val)
             displs = jnp.array(displs_val)
 
-            solver = _get_solver_primitive_mpi(config_str, nglobal, comm_ptr, lrank)
+            solver = _get_solver_primitive_mpi(
+                config_str, nglobal, comm_ptr, lrank, is_symmetric=is_symmetric
+            )
             (x, stats), _ = solver(A_csr, b, recvcounts, displs)
 
     else:
@@ -528,7 +545,7 @@ def amg_solve(
         A_csr = utils.to_bcsr_matrix(A, b=b)
 
         # Get cached primitive for this configuration
-        solver = _get_solver_primitive(config_str)
+        solver = _get_solver_primitive(config_str, is_symmetric=is_symmetric)
 
         # Returns (x, stats_array)
         x, stats = solver(A_csr, b)
@@ -606,9 +623,9 @@ def cache_mpi_metadata(config, comm, nglobal, partition_info):
     }
 
 
-def with_cache(A, *, coloring=None, mpi=None):
+def with_cache(A, *, coloring=None, mpi=None, is_symmetric=False):
     """
-    Attach cached metadata (coloring or MPI info) to a matrix or operator.
+    Attach cached metadata (coloring, MPI info, or symmetry) to a matrix or operator.
 
     This cache allows using matrices/operators inside JIT-compiled functions
     without recomputing metadata or passing it as separate arguments.
@@ -617,6 +634,8 @@ def with_cache(A, *, coloring=None, mpi=None):
         A: A matrix or operator.
         coloring: Cached coloring information from `cache_coloring()`.
         mpi: Cached MPI metadata from `cache_mpi_metadata()`.
+        is_symmetric: If True, indicates the matrix is symmetric, allowing
+                      optimizations like skipping transpose in backward pass.
 
     Returns:
         The same matrix/operator with requested cache attached.
@@ -636,6 +655,15 @@ def with_cache(A, *, coloring=None, mpi=None):
         except Exception as e:
             raise TypeError(
                 f"Cannot attach MPI cache to object of type {type(A).__name__}. "
+                f"Error: {e}"
+            )
+
+    if is_symmetric:
+        try:
+            object.__setattr__(A, "_is_symmetric", True)
+        except Exception as e:
+            raise TypeError(
+                f"Cannot attach symmetry info to object of type {type(A).__name__}. "
                 f"Error: {e}"
             )
 

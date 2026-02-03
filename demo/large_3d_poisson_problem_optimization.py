@@ -15,7 +15,7 @@ for large systems.
 import time
 import jax
 import jax.numpy as jnp
-from jaxamg import amg_solve
+from jaxamg import amg_solve, with_cache
 from jaxamg.matrices import rhs_ones, poisson3d_matrix
 
 
@@ -49,7 +49,8 @@ def main():
     # Define loss function and optimization step
     def solve_model(theta):
         b = b0 * theta
-        x, _ = amg_solve(A, b, solver="CG")
+        A_ = with_cache(A, is_symmetric=True)
+        x, _ = amg_solve(A_, b, solver="CG")
         return x
 
     def loss_fn(theta):

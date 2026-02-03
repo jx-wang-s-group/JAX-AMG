@@ -75,7 +75,6 @@ def main():
     mpi_cache = cache_mpi_metadata(config, comm, n_global, (row_start, row_end))
 
     # Define loss function
-    @jax.jit
     def loss_local(diag, b_loc, x_true_loc):
         A_loc, _, _ = tridiagonal_matrix_distributed(
             n_global,
@@ -85,7 +84,7 @@ def main():
             dtype=jnp.float64,
         )
 
-        A = with_cache(A_loc, mpi=mpi_cache)
+        A = with_cache(A_loc, mpi=mpi_cache, is_symmetric=True)
         x_pred_loc, _ = amg_solve(A, b_loc)
 
         loss_loc = jnp.sum((x_pred_loc - x_true_loc) ** 2)
