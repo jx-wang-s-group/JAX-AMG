@@ -11,7 +11,7 @@ import jax.experimental.sparse as jsp
 import numpy as np
 import scipy.sparse as sp
 
-from typing import Callable
+from typing import cast, Callable
 from jax.typing import DTypeLike
 
 
@@ -272,6 +272,45 @@ def poisson3d_matrix(n: int, skew: float = 0.0) -> jsp.BCSR:
     return jsp.BCSR((vals, cols, indptr), shape=(n3, n3))
 
 
+def random_matrix(
+    n: int,
+    density: float = 0.01,
+    dtype: DTypeLike = jnp.float32,
+    seed: int = 0,
+) -> jsp.BCSR:
+    """Create a random sparse matrix in BCSR format.
+
+    Args:
+        n: Size of the matrix (n x n)
+        density: Density of non-zero entries (default 0.01)
+        dtype: Data type for matrix values (default jnp.float32)
+        seed: Random seed for reproducibility (default 0)
+
+    Returns:
+        JAX BCSR random sparse matrix
+    """
+    # Generate random sparse matrix using SciPy
+    np_dtype: type = np.float32 if dtype == jnp.float32 else np.float64
+    rng = np.random.default_rng(seed)
+    A = cast(
+        sp.csr_matrix,
+        sp.random(
+            n, n, density=density, format="csr", dtype=np_dtype, random_state=rng
+        ),
+    )
+
+    # Make it diagonally dominant for better conditioning
+    diag = abs(A).sum(axis=1).A1 + 1.0
+    A.setdiag(diag)
+
+    # Convert to JAX BCSR
+    values = jnp.array(A.data)
+    indices = jnp.array(A.indices, dtype=jnp.int32)
+    indptr = jnp.array(A.indptr, dtype=jnp.int32)
+
+    return jsp.BCSR((values, indices, indptr), shape=(n, n))
+
+
 def tridiagonal_matrix_distributed(
     n_global: int,
     rank: int,
@@ -412,6 +451,64 @@ def poisson_matrix_distributed(
     )
 
     return A_local, row_start, row_end
+
+
+def random_matrix_distributed(
+    n_global: int,
+    rank: int,
+    nranks: int,
+    density: float = 0.01,
+    dtype: DTypeLike = jnp.float32,
+    seed: int = 0,
+) -> tuple[jsp.BCSR, int, int]:
+    """Create a distributed random sparse matrix in BCSR format for MPI.
+
+    Args:
+        n_global: Global matrix size (n_global x n_global)
+        rank: MPI rank (0-indexed)
+        nranks: Total number of MPI ranks
+        density: Density of non-zero entries (default 0.01)
+        dtype: Data type for matrix values (default jnp.float32)
+        seed: Random seed for reproducibility (default 0)
+
+    Returns:
+        A_local: Local BCSR matrix partition (JAX)
+        row_start: Starting row index (global)
+        row_end: Ending row index (global, exclusive)
+    """
+    # Row-based partitioning
+    rows_per_rank = n_global // nranks
+    row_start = rank * rows_per_rank
+    row_end = (rank + 1) * rows_per_rank if rank < nranks - 1 else n_global
+    n_local = row_end - row_start
+
+    np_dtype: type = np.float32 if dtype == jnp.float32 else np.float64
+    # Offset seed for each rank for reproducibility
+    rng = np.random.default_rng(seed + rank)
+    A_local = cast(
+        sp.csr_matrix,
+        sp.random(
+            n_local,
+            n_global,
+            density=density,
+            format="csr",
+            dtype=np_dtype,
+            random_state=rng,
+        ),
+    )
+    # Make it diagonally dominant for better conditioning
+    diag = abs(A_local).sum(axis=1).A1 + 1.0
+    A_local.setdiag(diag, k=row_start)
+
+    values = jnp.array(A_local.data)
+    indices = jnp.array(A_local.indices, dtype=jnp.int32)
+    indptr = jnp.array(A_local.indptr, dtype=jnp.int32)
+
+    return (
+        jsp.BCSR((values, indices, indptr), shape=(n_local, n_global)),
+        row_start,
+        row_end,
+    )
 
 
 def tridiagonal_operator(diagonal_value: float = 2.0) -> Callable:
