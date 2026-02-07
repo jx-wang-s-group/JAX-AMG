@@ -37,7 +37,7 @@ def find_cuda():
 
 
 def find_amgx():
-    print("\033[1;34m[setup.py] Detecting AMGX installation...\033[0m")
+    print("\033[1;34m[setup.py] Detecting AmgX installation...\033[0m")
     # Try environment variables
     amgx_root = os.environ.get("AMGX_ROOT")
     amgx_build = os.environ.get("AMGX_BUILD")
@@ -133,9 +133,9 @@ def get_build_vars():
     print(f"\033[1;34m[setup.py] AMGX_ROOT: {AMGX_ROOT}\033[0m")
     print(f"\033[1;34m[setup.py] AMGX_BUILD: {AMGX_BUILD}\033[0m")
     if not AMGX_ROOT or not AMGX_BUILD:
-        warnings.warn(
-            f"AMGX not found (AMGX_ROOT: {AMGX_ROOT}, AMGX_BUILD: {AMGX_BUILD}). "
-            "Building without AMGX support."
+        raise RuntimeError(
+            f"AmgX not found (AMGX_ROOT: {AMGX_ROOT}, AMGX_BUILD: {AMGX_BUILD}). "
+            "This package requires AmgX. Please install AmgX and set AMGX_ROOT and AMGX_BUILD."
         )
 
     XLA_FFI_INCLUDE = ffi.include_dir()

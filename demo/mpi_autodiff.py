@@ -66,7 +66,9 @@ def main():
     }
 
     # Pre-cache MPI metadata
-    mpi_cache = cache_mpi_metadata(config, comm, n_global, (row_start, row_end))
+    mpi_cache = cache_mpi_metadata(
+        config, comm, n_global, (row_start, row_end), A_local
+    )
 
     # Attach MPI cache to matrix
     A_local = with_cache(A_local, mpi=mpi_cache)

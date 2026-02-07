@@ -10,6 +10,7 @@
 #include <amgx_c.h>
 #include <xla/ffi/api/ffi.h>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <fstream>
@@ -495,6 +496,26 @@ namespace
   // MPI AllGather Custom Call
   // -------------------------------------------------------------------------
 
+  // Check if CUDA-aware MPI should be used (respects MPI4JAX convention)
+  static bool use_cuda_aware_mpi()
+  {
+    static int cached = -1;
+    if (cached == -1)
+    {
+      const char *env = std::getenv("MPI4JAX_USE_CUDA_MPI");
+      if (env != nullptr)
+      {
+        cached = (std::string(env) == "1" || std::string(env) == "true") ? 1 : 0;
+      }
+      else
+      {
+        // Default: use host-staged MPI (safer, works with all MPI implementations)
+        cached = 0;
+      }
+    }
+    return cached == 1;
+  }
+
   template <typename T, ffi::DataType DType>
   ffi::Error AmgxAllGatherInternal(cudaStream_t stream,
                                    ffi::Buffer<DType> sendbuf,
@@ -521,30 +542,41 @@ namespace
     cudaMemcpy(counts_h.data(), recvcounts.typed_data(), nranks * sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(displs_h.data(), displs.typed_data(), nranks * sizeof(int), cudaMemcpyDeviceToHost);
 
-    // Staging buffers on Host for MPI communication (Safer than assuming CUDA-aware MPI)
     int send_count = static_cast<int>(sendbuf.element_count());
-    int total_recv_count = displs_h.back() + counts_h.back(); // Last displacement + last count = total size
-
-    std::vector<T> send_host(send_count);
-    std::vector<T> recv_host(total_recv_count);
-
-    // Copy D2H
-    // Note: sendbuf.typed_data() returns const T*, cast if needed or use directly if memcpy accepts const
-    cudaMemcpy(send_host.data(), sendbuf.typed_data(), send_count * sizeof(T), cudaMemcpyDeviceToHost);
-
-    // MPI Call
+    int total_recv_count = displs_h.back() + counts_h.back();
     MPI_Datatype mpi_type = (sizeof(T) == 8) ? MPI_DOUBLE : MPI_FLOAT;
-    int err = MPI_Allgatherv(send_host.data(), send_count, mpi_type,
-                             recv_host.data(), counts_h.data(), displs_h.data(), mpi_type,
-                             *mpi_comm);
+
+    int err;
+    if (use_cuda_aware_mpi())
+    {
+      // CUDA-aware MPI: pass GPU pointers directly
+      err = MPI_Allgatherv(
+          const_cast<T *>(sendbuf.typed_data()), send_count, mpi_type,
+          recvbuf->typed_data(), counts_h.data(), displs_h.data(), mpi_type,
+          *mpi_comm);
+    }
+    else
+    {
+      // Host-staged MPI (default, compatible with all MPI implementations)
+      std::vector<T> send_host(send_count);
+      std::vector<T> recv_host(total_recv_count);
+
+      cudaMemcpy(send_host.data(), sendbuf.typed_data(), send_count * sizeof(T), cudaMemcpyDeviceToHost);
+
+      err = MPI_Allgatherv(send_host.data(), send_count, mpi_type,
+                           recv_host.data(), counts_h.data(), displs_h.data(), mpi_type,
+                           *mpi_comm);
+
+      if (err == MPI_SUCCESS)
+      {
+        cudaMemcpy(recvbuf->typed_data(), recv_host.data(), total_recv_count * sizeof(T), cudaMemcpyHostToDevice);
+      }
+    }
 
     if (err != MPI_SUCCESS)
     {
       return ffi::Error::Internal("MPI_Allgatherv failed");
     }
-
-    // Copy H2D
-    cudaMemcpy(recvbuf->typed_data(), recv_host.data(), total_recv_count * sizeof(T), cudaMemcpyHostToDevice);
 
     return ffi::Error::Success();
   }

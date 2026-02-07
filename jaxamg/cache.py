@@ -14,7 +14,6 @@ from .utils import *
 from typing import Any, Callable, TYPE_CHECKING
 from jax.typing import ArrayLike
 
-
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
 
@@ -79,6 +78,7 @@ def cache_mpi_metadata(
     comm: "Comm",
     nglobal: int,
     partition_info: tuple[int, int],
+    A: MatrixOrOperator,
 ) -> dict[str, Any]:
     """
     Pre-compute and cache MPI metadata for JIT-compatible solver usage.
@@ -87,15 +87,17 @@ def cache_mpi_metadata(
     - Computes static MPI communication metadata (recvcounts, displs)
     - Prepares MPI communicator pointer and local rank
     - Prepares config string
+    - Computes max nnz across all ranks
 
     The cached metadata can be reused across multiple JIT-compiled function calls
-    with different matrices or operators.
+    with different matrices or operators (same structure).
 
     Args:
         config: AmgX configuration dict or string
         comm: MPI communicator (from mpi4py.MPI.COMM_WORLD)
         nglobal: Global matrix size (total rows across all ranks)
         partition_info: tuple (row_start, row_end) indicating which rows this rank owns
+        A: Matrix or operator to compute max nnz for buffer sizing
 
     Returns:
         Dict containing MPI metadata:
@@ -105,6 +107,7 @@ def cache_mpi_metadata(
         - 'lrank': Local GPU rank
         - 'nglobal': Global matrix size
         - 'config_str': Prepared configuration string
+        - 'max_nnz': Maximum nnz across all ranks
     """
     from mpi4py import MPI
 
@@ -127,14 +130,58 @@ def cache_mpi_metadata(
     # Prepare config string
     config_str = amgx_config.prepare_config(config)
 
-    return {
+    # Compute max_nnz across all ranks
+    # For sparse matrices (BCSR), get nnz from data array
+    if hasattr(A, "data"):
+        local_nnz = len(A.data)
+    elif callable(A):
+        # For distributed operators, we need to use global size for proper materialization
+        # The operator shape is (n_local, n_global): takes global vector, returns local portion
+        from .utils import (
+            get_sparsity_pattern,
+            get_column_coloring,
+            materialize_sparse_matrix,
+        )
+
+        # Check if operator already has cached coloring
+        cached_info = getattr(A, "_coloring_info", None)
+
+        if cached_info is not None:
+            # Use cached sparsity pattern
+            rows, cols, column_colors, n_colors, shape = cached_info
+            A_materialized = materialize_sparse_matrix(
+                A, shape, rows, cols, column_colors, n_colors
+            )
+        else:
+            # Compute sparsity pattern with correct shape for distributed operator
+            shape = (n_local, nglobal)
+            rows, cols = get_sparsity_pattern(A, shape)
+            column_colors, n_colors = get_column_coloring(rows, cols, shape)
+            A_materialized = materialize_sparse_matrix(
+                A, shape, rows, cols, column_colors, n_colors
+            )
+
+        local_nnz = len(A_materialized.data)
+    else:
+        raise TypeError(
+            f"Matrix A must be BCSR, BCOO, SciPy sparse, dense array, or callable. "
+            f"Got {type(A).__name__}."
+        )
+
+    all_nnz = comm.allgather(local_nnz)
+    max_nnz = max(all_nnz)
+
+    cache_dict = {
         "recvcounts_tuple": tuple(recvcounts.tolist()),
         "displs_tuple": tuple(displs.tolist()),
         "comm_ptr": comm_ptr,
         "lrank": lrank,
         "nglobal": nglobal,
         "config_str": config_str,
+        "max_nnz": max_nnz,
     }
+
+    return cache_dict
 
 
 def cache_coloring(

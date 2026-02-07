@@ -183,7 +183,7 @@ class TestSolver:
             # Check solution
             np.testing.assert_allclose(b, A @ x, rtol=1e-5)
 
-    @pytest.mark.parametrize("solver", ["BICGSTAB", "PBICGSTAB"])
+    @pytest.mark.parametrize("solver", ["CG", "PBICGSTAB"])
     def test_convection_diffusion_solve(self, solver):
         """Test solving 2D convection-diffusion equation with analytic solution."""
 
@@ -220,13 +220,11 @@ class TestSolver:
             n, epsilon=epsilon, theta=theta, velocity=velocity
         )
 
-        # Solve (BICGSTAB ignores the preconditioner)
         u, info = amg_solve(A, b, solver=solver)
 
         # Verify solver status
-        if solver == "BICGSTAB":
-            # BICGSTAB should not converge
-            # (Note: will converge if float64 is used)
+        if solver == "CG":
+            # CG should not converge
             assert info["status"] == AMGXStatus.NOT_CONVERGED
         else:
             # PBICGSTAB with AMG preconditioner should converge

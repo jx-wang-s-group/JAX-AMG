@@ -69,11 +69,28 @@ def main():
 
     config = {
         "solver": "PCG",
-        "preconditioner": {"solver": "MULTICOLOR_DILU"},
+        "preconditioner": {"solver": "JACOBI_L1"},
+        "communicator": "MPI_DIRECT",
+        "min_rows_latency_hiding": 0,
+        "obtain_timings": 1,
+        "print_solve_stats": 1,
     }
-    mpi_cache = cache_mpi_metadata(config, comm, n_global, (row_start, row_end))
+
+    # Create dummy matrix for caching
+    dummy_A, _, _ = tridiagonal_matrix_distributed(
+        n_global,
+        rank,
+        nranks,
+        diagonal_value=diag_init,
+        dtype=jnp.float64,
+    )
+
+    mpi_cache = cache_mpi_metadata(
+        config, comm, n_global, (row_start, row_end), dummy_A
+    )
 
     # Define loss function
+    @jax.jit
     def loss_local(diag, b_loc, x_true_loc):
         A_loc, _, _ = tridiagonal_matrix_distributed(
             n_global,

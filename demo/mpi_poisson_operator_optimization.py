@@ -35,7 +35,7 @@ def main():
     rank = comm.Get_rank()
     nranks = comm.Get_size()
 
-    gpu_ids = [0, 1, 2, 3]
+    gpu_ids = [0, 1, 3, 4]
     gpu_id = gpu_ids[rank]
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
@@ -60,7 +60,7 @@ def main():
             A_true,
             b_global,
             solver="PBICGSTAB",
-            preconditioner={"solver": "MULTICOLOR_DILU"},
+            preconditioner={"solver": "JACOBI_L1"},
             tolerance=1e-8,
         )
     else:
@@ -81,22 +81,28 @@ def main():
     # Configuration for solver
     config = {
         "solver": "PBICGSTAB",
-        "preconditioner": {"solver": "AMG"},
+        "preconditioner": {"solver": "JACOBI_L1"},
+        "communicator": "MPI_DIRECT",
         "max_iters": 50,
         "tolerance": 1e-6,
     }
 
+    # Create dummy operator for caching
+    dummy_op = poisson_operator_distributed(grid_size, row_start, row_end, skew=1.0)
+
     # Cache MPI metadata
-    mpi_cache = cache_mpi_metadata(config, comm, n_global, (row_start, row_end))
+    mpi_cache = cache_mpi_metadata(
+        config, comm, n_global, (row_start, row_end), dummy_op
+    )
 
     # Cache coloring
-    dummy_op = poisson_operator_distributed(grid_size, row_start, row_end, skew=0.0)
     coloring_cache = cache_coloring(dummy_op, shape=(n_local, n_global))
 
     if rank == 0:
         print("\nStarting optimization...")
 
     # Define loss function
+    # @jax.jit
     def loss_local(skew, b_loc, x_true_loc):
         op = poisson_operator_distributed(grid_size, row_start, row_end, skew=skew)
         A = with_cache(op, coloring=coloring_cache, mpi=mpi_cache)

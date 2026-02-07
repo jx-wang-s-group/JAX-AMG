@@ -56,7 +56,9 @@ def main():
     # Cache MPI metadata for JIT-compatible solver usage
     if rank == 0:
         print(f"Caching MPI metadata for JIT...")
-    mpi_cache = cache_mpi_metadata(config, comm, n_global, (row_start, row_end))
+    mpi_cache = cache_mpi_metadata(
+        config, comm, n_global, (row_start, row_end), A_local
+    )
 
     # Define loss function
     def loss_local(b_loc):

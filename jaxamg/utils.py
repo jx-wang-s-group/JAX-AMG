@@ -14,7 +14,6 @@ import atexit
 from typing import cast, Callable
 from jax.typing import ArrayLike, DTypeLike
 
-
 Matrix = ArrayLike | jsp.JAXSparse | sp.spmatrix
 MatrixOrOperator = Matrix | Callable
 
@@ -435,13 +434,13 @@ def to_bcsr_matrix(
     )
 
 
-# AMGX finalization: runs during Python exit (before MPI_FINALIZE)
+# AmgX finalization: runs during Python exit (before MPI_FINALIZE)
 # Note: C++ does not register atexit - Python controls cleanup order
 _amgx_finalized = False
 
 
 def _finalize_amgx() -> None:
-    """Finalize AMGX library before program exit (runs before MPI_FINALIZE)."""
+    """Finalize AmgX library before program exit (runs before MPI_FINALIZE)."""
     global _amgx_finalized
     if not _amgx_finalized:
         try:

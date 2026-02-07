@@ -1,4 +1,4 @@
-"""MPI utilities for distributed AMGX solving."""
+"""MPI utilities for distributed AmgX solving."""
 
 import jax.numpy as jnp
 import jax.experimental.sparse as jsp
@@ -40,10 +40,7 @@ def partition_csr_matrix(
         raise ValueError(f"Unsupported matrix type: {type(A_global)}")
 
     # Row-based partitioning
-    rows_per_rank = n // nranks
-    row_start = rank * rows_per_rank
-    row_end = (rank + 1) * rows_per_rank if rank < nranks - 1 else n
-    n_local = row_end - row_start
+    row_start, row_end, n_local = get_partition_info(n, rank, nranks)
 
     # Extract local partition
     nnz_start = indptr[row_start]
@@ -110,9 +107,7 @@ def partition_vector(
     """
     b_global = jnp.asarray(b_global)
     n = len(b_global)
-    rows_per_rank = n // nranks
-    row_start = rank * rows_per_rank
-    row_end = (rank + 1) * rows_per_rank if rank < nranks - 1 else n
+    row_start, row_end, _ = get_partition_info(n, rank, nranks)
     return b_global[row_start:row_end], row_start, row_end
 
 

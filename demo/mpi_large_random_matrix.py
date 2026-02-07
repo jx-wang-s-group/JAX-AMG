@@ -51,6 +51,7 @@ def main():
     config = {
         "solver": "PBICGSTAB",
         "preconditioner": {"solver": "MULTICOLOR_DILU"},
+        "communicator": "MPI_DIRECT",
         "tolerance": 1e-6,
         "monitor_residual": 1,
     }

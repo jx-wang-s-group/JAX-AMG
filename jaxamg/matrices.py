@@ -11,6 +11,8 @@ import jax.experimental.sparse as jsp
 import numpy as np
 import scipy.sparse as sp
 
+from .mpi_utils import get_partition_info
+
 from typing import cast, Callable
 from jax.typing import DTypeLike
 
@@ -333,10 +335,7 @@ def tridiagonal_matrix_distributed(
         row_end: Ending row index (global, exclusive)
     """
     # Row-based partitioning
-    rows_per_rank = n_global // nranks
-    row_start = rank * rows_per_rank
-    row_end = (rank + 1) * rows_per_rank if rank < nranks - 1 else n_global
-    n_local = row_end - row_start
+    row_start, row_end, n_local = get_partition_info(n_global, rank, nranks)
 
     data, indices, indptr = [], [], [0]
 
@@ -391,10 +390,7 @@ def poisson_matrix_distributed(
     n = nx * ny
 
     # Row-based partitioning
-    rows_per_rank = n // nranks
-    row_start = rank * rows_per_rank
-    row_end = (rank + 1) * rows_per_rank if rank < nranks - 1 else n
-    n_local = row_end - row_start
+    row_start, row_end, n_local = get_partition_info(n, rank, nranks)
 
     rows, cols, vals = [], [], []
 
@@ -477,10 +473,7 @@ def random_matrix_distributed(
         row_end: Ending row index (global, exclusive)
     """
     # Row-based partitioning
-    rows_per_rank = n_global // nranks
-    row_start = rank * rows_per_rank
-    row_end = (rank + 1) * rows_per_rank if rank < nranks - 1 else n_global
-    n_local = row_end - row_start
+    row_start, row_end, n_local = get_partition_info(n_global, rank, nranks)
 
     np_dtype: type = np.float32 if dtype == jnp.float32 else np.float64
     # Offset seed for each rank for reproducibility
