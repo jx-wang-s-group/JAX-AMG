@@ -173,17 +173,17 @@ def _mpi4jax_alltoallv_transpose(
     # Compute partition info as JAX arrays for operations that need them
     r_counts = jnp.array(recvcounts_tuple, dtype=jnp.int32)
     displs = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int64), jnp.cumsum(r_counts[:-1]).astype(jnp.int64)]
+        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(r_counts[:-1]).astype(jnp.int32)]
     )
 
     # --- Step 1: Convert CSR to COO format ---
     row_counts = indptr[1:] - indptr[:-1]
     # Use static n_local for jnp.arange
     row_indices_local = jnp.repeat(
-        jnp.arange(n_local, dtype=indices.dtype), row_counts, total_repeat_length=nnz
+        jnp.arange(n_local, dtype=jnp.int32), row_counts, total_repeat_length=nnz
     )
     row_indices_global = row_indices_local + my_row_start
-    col_indices_global = indices
+    col_indices_global = indices.astype(jnp.int32)
 
     # --- Step 2: Determine destination ranks ---
     dest_ranks = jnp.searchsorted(displs, col_indices_global, side="right") - 1
@@ -237,14 +237,18 @@ def _mpi4jax_alltoallv_transpose(
 
     # Initialize send buffers with zeros
     send_data = jnp.zeros((size, max_per_rank), dtype=data.dtype)
-    send_rows = jnp.zeros((size, max_per_rank), dtype=indices.dtype)
-    send_cols = jnp.zeros((size, max_per_rank), dtype=indices.dtype)
+    send_rows = jnp.zeros((size, max_per_rank), dtype=jnp.int32)
+    send_cols = jnp.zeros((size, max_per_rank), dtype=jnp.int32)
 
     # Scatter data into send buffers
     # 2D indexing: send_data[dest_ranks_sorted[i], positions[i]] = data_sorted[i]
     send_data = send_data.at[dest_ranks_sorted, positions].set(data_sorted)
-    send_rows = send_rows.at[dest_ranks_sorted, positions].set(rows_sorted)
-    send_cols = send_cols.at[dest_ranks_sorted, positions].set(cols_sorted)
+    send_rows = send_rows.at[dest_ranks_sorted, positions].set(
+        rows_sorted.astype(jnp.int32)
+    )
+    send_cols = send_cols.at[dest_ranks_sorted, positions].set(
+        cols_sorted.astype(jnp.int32)
+    )
 
     # --- Step 7: GPU-direct alltoall via mpi4jax ---
     recv_data = mpi4jax.alltoall(send_data, comm=comm)
@@ -293,8 +297,8 @@ def _mpi4jax_alltoallv_transpose(
 
     # Initialize output arrays with size = nnz (same as input for shape compatibility)
     recv_data_flat = jnp.zeros(nnz, dtype=data.dtype)
-    recv_rows_flat = jnp.zeros(nnz, dtype=indices.dtype)
-    recv_cols_flat = jnp.zeros(nnz, dtype=indices.dtype)
+    recv_rows_flat = jnp.zeros(nnz, dtype=jnp.int32)
+    recv_cols_flat = jnp.zeros(nnz, dtype=jnp.int32)
 
     # Scatter valid elements to their positions
     # Use segment_sum pattern: only positions >= 0 are valid
@@ -351,14 +355,18 @@ def _mpi4jax_alltoallv_transpose(
 
     # Pad if needed (transpose may have different nnz, but for square matrices it's the same)
     out_data_padded = jnp.zeros(target_nnz, dtype=data.dtype)
-    out_indices_padded = jnp.zeros(target_nnz, dtype=indices.dtype)
+    out_indices_padded = jnp.zeros(target_nnz, dtype=jnp.int32)
     out_data_padded = out_data_padded.at[:actual_nnz].set(out_data[:target_nnz])
     out_indices_padded = out_indices_padded.at[:actual_nnz].set(
         out_indices[:target_nnz]
     )
     out_indptr = out_indptr.at[-1].set(target_nnz)
 
-    return out_data_padded, out_indices_padded, out_indptr
+    # Convert output indices to int64
+    with temp_enable_x64():
+        out_indices_int64 = out_indices_padded.astype(jnp.int64)
+
+    return out_data_padded, out_indices_int64, out_indptr
 
 
 def _amgx_solve_impl(

@@ -41,7 +41,7 @@ def main():
         print(f"\nPartitioning matrix across {nranks} ranks...")
 
     A_local, row_start, row_end = poisson_matrix_distributed(
-        grid_size, grid_size, rank, nranks, dtype=jnp.float32
+        grid_size, grid_size, rank, nranks
     )
     n_local = row_end - row_start
 

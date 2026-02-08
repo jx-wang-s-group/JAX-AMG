@@ -358,10 +358,11 @@ def tridiagonal_matrix_distributed(
 
         indptr.append(len(data))
 
+    # Indices are int32 by default; converted to int64 by _ensure_bcsr_properties if needed for MPI
     A_local = jsp.BCSR(
         (
             jnp.array(data, dtype=dtype),
-            jnp.array(indices, dtype=int),
+            jnp.array(indices, dtype=jnp.int32),
             jnp.array(indptr, dtype=jnp.int32),
         ),
         shape=(n_local, n_global),
@@ -437,10 +438,11 @@ def poisson_matrix_distributed(
         dtype=np_dtype,
     )
 
+    # Indices are int32 by default; converted to int64 by _ensure_bcsr_properties if needed for MPI
     A_local = jsp.BCSR(
         (
             jnp.array(A_local_scipy.data, dtype=dtype),
-            jnp.array(A_local_scipy.indices, dtype=int),
+            jnp.array(A_local_scipy.indices, dtype=jnp.int32),
             jnp.array(A_local_scipy.indptr, dtype=jnp.int32),
         ),
         shape=(n_local, n),
@@ -493,11 +495,12 @@ def random_matrix_distributed(
     diag = abs(A_local).sum(axis=1).A1 + 1.0
     A_local.setdiag(diag, k=row_start)
 
+    # Indices are int32 by default; converted to int64 by _ensure_bcsr_properties if needed for MPI
     return (
         jsp.BCSR(
             (
                 jnp.array(A_local.data, dtype=dtype),
-                jnp.array(A_local.indices, dtype=int),
+                jnp.array(A_local.indices, dtype=jnp.int32),
                 jnp.array(A_local.indptr, dtype=jnp.int32),
             ),
             shape=(n_local, n_global),
