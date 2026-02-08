@@ -172,7 +172,7 @@ def poisson_matrix(n: int, skew: float = 0.0) -> jsp.BCSR:
     # Build indptr
     indptr = jnp.zeros(n2 + 1, dtype=jnp.int32)
     row_counts = jnp.bincount(rows, length=n2)
-    indptr = indptr.at[1:].set(jnp.cumsum(row_counts))
+    indptr = indptr.at[1:].set(jnp.cumsum(row_counts).astype(jnp.int32))
 
     return jsp.BCSR((vals, cols, indptr), shape=(n2, n2))
 
@@ -269,7 +269,7 @@ def poisson3d_matrix(n: int, skew: float = 0.0) -> jsp.BCSR:
     # Build indptr
     indptr = jnp.zeros(n3 + 1, dtype=jnp.int32)
     row_counts = jnp.bincount(rows, length=n3)
-    indptr = indptr.at[1:].set(jnp.cumsum(row_counts))
+    indptr = indptr.at[1:].set(jnp.cumsum(row_counts).astype(jnp.int32))
 
     return jsp.BCSR((vals, cols, indptr), shape=(n3, n3))
 
@@ -318,7 +318,7 @@ def tridiagonal_matrix_distributed(
     rank: int,
     nranks: int,
     diagonal_value: float = 2.0,
-    dtype: DTypeLike = jnp.float32,
+    dtype: DTypeLike | None = None,
 ) -> tuple[jsp.BCSR, int, int]:
     """Create distributed tridiagonal matrix [-1, diagonal_value, -1] for MPI.
 
@@ -327,7 +327,7 @@ def tridiagonal_matrix_distributed(
         rank: MPI rank (0-indexed)
         nranks: Total number of MPI ranks
         diagonal_value: Value on main diagonal (default: 2.0)
-        dtype: Data type for matrix values (default: jnp.float32)
+        dtype: Data type for matrix values
 
     Returns:
         A_local: Local BCSR matrix partition (JAX)
@@ -361,7 +361,7 @@ def tridiagonal_matrix_distributed(
     A_local = jsp.BCSR(
         (
             jnp.array(data, dtype=dtype),
-            jnp.array(indices, dtype=jnp.int32),
+            jnp.array(indices, dtype=int),
             jnp.array(indptr, dtype=jnp.int32),
         ),
         shape=(n_local, n_global),
@@ -371,7 +371,7 @@ def tridiagonal_matrix_distributed(
 
 
 def poisson_matrix_distributed(
-    nx: int, ny: int, rank: int, nranks: int, dtype: DTypeLike = jnp.float32
+    nx: int, ny: int, rank: int, nranks: int, dtype: DTypeLike | None = None
 ) -> tuple[jsp.BCSR, int, int]:
     """Create distributed 2D Poisson matrix with 5-point stencil for MPI.
 
@@ -380,7 +380,7 @@ def poisson_matrix_distributed(
         ny: Grid size in y-direction
         rank: MPI rank (0-indexed)
         nranks: Total number of MPI ranks
-        dtype: Data type for matrix values (default: jnp.float32)
+        dtype: Data type for matrix values
 
     Returns:
         A_local: Local BCSR matrix partition (JAX)
@@ -439,8 +439,8 @@ def poisson_matrix_distributed(
 
     A_local = jsp.BCSR(
         (
-            jnp.array(A_local_scipy.data),
-            jnp.array(A_local_scipy.indices, dtype=jnp.int32),
+            jnp.array(A_local_scipy.data, dtype=dtype),
+            jnp.array(A_local_scipy.indices, dtype=int),
             jnp.array(A_local_scipy.indptr, dtype=jnp.int32),
         ),
         shape=(n_local, n),
@@ -454,7 +454,7 @@ def random_matrix_distributed(
     rank: int,
     nranks: int,
     density: float = 0.01,
-    dtype: DTypeLike = jnp.float32,
+    dtype: DTypeLike | None = None,
     seed: int = 0,
 ) -> tuple[jsp.BCSR, int, int]:
     """Create a distributed random sparse matrix in BCSR format for MPI.
@@ -464,7 +464,7 @@ def random_matrix_distributed(
         rank: MPI rank (0-indexed)
         nranks: Total number of MPI ranks
         density: Density of non-zero entries (default 0.01)
-        dtype: Data type for matrix values (default jnp.float32)
+        dtype: Data type for matrix values
         seed: Random seed for reproducibility (default 0)
 
     Returns:
@@ -493,25 +493,30 @@ def random_matrix_distributed(
     diag = abs(A_local).sum(axis=1).A1 + 1.0
     A_local.setdiag(diag, k=row_start)
 
-    values = jnp.array(A_local.data)
-    indices = jnp.array(A_local.indices, dtype=jnp.int32)
-    indptr = jnp.array(A_local.indptr, dtype=jnp.int32)
-
     return (
-        jsp.BCSR((values, indices, indptr), shape=(n_local, n_global)),
+        jsp.BCSR(
+            (
+                jnp.array(A_local.data, dtype=dtype),
+                jnp.array(A_local.indices, dtype=int),
+                jnp.array(A_local.indptr, dtype=jnp.int32),
+            ),
+            shape=(n_local, n_global),
+        ),
         row_start,
         row_end,
     )
 
 
-def tridiagonal_operator(diagonal_value: float = 2.0) -> Callable:
+def tridiagonal_operator(
+    diagonal_value: float = 2.0, dtype: DTypeLike | None = None
+) -> Callable:
     """Create a tridiagonal operator with [-1, diagonal_value, -1] pattern."""
-    kernel = jnp.array([-1.0, diagonal_value, -1.0])
+    kernel = jnp.array([-1.0, diagonal_value, -1.0], dtype=dtype)
     matvec = lambda x: jnp.convolve(x, kernel, mode="same")
     return matvec
 
 
-def poisson_operator(skew: float = 0.0) -> Callable:
+def poisson_operator(skew: float = 0.0, dtype: DTypeLike | None = None) -> Callable:
     """Create a 2D Poisson operator (flat input).
 
     The operator represents the discretization of -Δu + skew * (∂u/∂x + ∂u/∂y)
@@ -520,6 +525,7 @@ def poisson_operator(skew: float = 0.0) -> Callable:
     Args:
         skew: Skew-symmetric coefficient (default 0.0 for symmetric Poisson)
               Non-zero values add convection-like terms, making the operator non-symmetric.
+        dtype: Data type of the operator
 
     Returns:
         Callable operator that applies the Poisson stencil to a flattened 2D array
@@ -533,7 +539,7 @@ def poisson_operator(skew: float = 0.0) -> Callable:
             [-1.0 - skew / 2.0, 4.0, -1.0 + skew / 2.0],
             [0.0, -1.0 + skew / 2.0, 0.0],
         ],
-        dtype=jnp.float32,
+        dtype=dtype,
     )
 
     def matvec(u_flat):
@@ -554,7 +560,11 @@ def poisson_operator(skew: float = 0.0) -> Callable:
 
 
 def poisson_operator_distributed(
-    n_side: int, row_start: int, row_end: int, skew: float = 0.0
+    n_side: int,
+    row_start: int,
+    row_end: int,
+    skew: float = 0.0,
+    dtype: DTypeLike | None = None,
 ) -> Callable:
     """
     Create a distributed Poisson operator.
@@ -567,6 +577,7 @@ def poisson_operator_distributed(
         row_start: Starting global row index for this rank
         row_end: Ending global row index for this rank (exclusive)
         skew: Skew-symmetric coefficient (default 0.0)
+        dtype: Data type of the operator
 
     Returns:
         Callable operator u_global_flat -> local_segment_flat
@@ -579,7 +590,7 @@ def poisson_operator_distributed(
             [-1.0 - skew / 2.0, 4.0, -1.0 + skew / 2.0],
             [0.0, -1.0 + skew / 2.0, 0.0],
         ],
-        dtype=jnp.float64,
+        dtype=dtype,
     )
 
     def matvec(u_flat):
@@ -598,7 +609,11 @@ def poisson_operator_distributed(
 
 
 def convection_diffusion_matrix_2d(
-    n: int, epsilon: float = 1.0, theta: float = 0.0, velocity: float = 100.0
+    n: int,
+    epsilon: float = 1.0,
+    theta: float = 0.0,
+    velocity: float = 100.0,
+    dtype: DTypeLike | None = None,
 ) -> jsp.BCSR:
     """Create a 2D convection-diffusion matrix on an n×n grid.
 
@@ -617,6 +632,7 @@ def convection_diffusion_matrix_2d(
         epsilon: Diffusion coefficient
         theta: Flow angle in radians
         velocity: Flow velocity magnitude
+        dtype: Data type for matrix values
 
     Returns:
         JAX BCSR matrix
@@ -634,11 +650,11 @@ def convection_diffusion_matrix_2d(
     row_indices = i_flat * n + j_flat
 
     # Initialize coefficients
-    diag_vals = jnp.zeros(n2, dtype=jnp.float32)
-    left_vals = jnp.zeros(n2, dtype=jnp.float32)
-    right_vals = jnp.zeros(n2, dtype=jnp.float32)
-    top_vals = jnp.zeros(n2, dtype=jnp.float32)
-    bottom_vals = jnp.zeros(n2, dtype=jnp.float32)
+    diag_vals = jnp.zeros(n2, dtype=dtype)
+    left_vals = jnp.zeros(n2, dtype=dtype)
+    right_vals = jnp.zeros(n2, dtype=dtype)
+    top_vals = jnp.zeros(n2, dtype=dtype)
+    bottom_vals = jnp.zeros(n2, dtype=dtype)
 
     # Diffusion (Standard 5-point central difference)
     # Coefficients scaled by h^2 to keep matrix well-scaled
@@ -702,12 +718,12 @@ def convection_diffusion_matrix_2d(
     # Indptr
     indptr = jnp.zeros(n2 + 1, dtype=jnp.int32)
     row_counts = jnp.bincount(rows, length=n2)
-    indptr = indptr.at[1:].set(jnp.cumsum(row_counts))
+    indptr = indptr.at[1:].set(jnp.cumsum(row_counts).astype(jnp.int32))
 
     return jsp.BCSR((vals, cols, indptr), shape=(n2, n2))
 
 
-def rhs_ones(n: int, dtype=jnp.float32) -> jax.Array:
+def rhs_ones(n: int, dtype: DTypeLike | None = None) -> jax.Array:
     """Create a constant RHS vector of ones.
 
     Args:
@@ -720,7 +736,7 @@ def rhs_ones(n: int, dtype=jnp.float32) -> jax.Array:
     return jnp.ones(n, dtype=dtype)
 
 
-def rhs_linear(n: int, dtype=jnp.float32) -> jax.Array:
+def rhs_linear(n: int, dtype: DTypeLike | None = None) -> jax.Array:
     """Create a linearly increasing RHS vector.
 
     Args:
@@ -733,7 +749,7 @@ def rhs_linear(n: int, dtype=jnp.float32) -> jax.Array:
     return jnp.linspace(0, 1, n, dtype=dtype)
 
 
-def rhs_random(n: int, seed: int = 0, dtype: DTypeLike = jnp.float32) -> jax.Array:
+def rhs_random(n: int, seed: int = 0, dtype: DTypeLike | None = None) -> jax.Array:
     """Create a random RHS vector.
 
     Args:

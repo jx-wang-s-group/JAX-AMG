@@ -338,7 +338,7 @@ def _mpi4jax_alltoallv_transpose(
     row_counts_at = jnp.sum(row_one_hot, axis=0)
 
     out_indptr = jnp.zeros(n_local + 1, dtype=indptr.dtype)
-    out_indptr = out_indptr.at[1:].set(jnp.cumsum(row_counts_at))
+    out_indptr = out_indptr.at[1:].set(jnp.cumsum(row_counts_at).astype(jnp.int32))
 
     # Output data and indices (already sorted)
     out_data = v_sorted
@@ -507,16 +507,6 @@ def _get_solver_primitive_mpi(
     from mpi4py import MPI
     import warnings
 
-    # Check for x64 mode requirement
-    if not jax.config.read("jax_enable_x64"):
-        warnings.warn(
-            "MPI mode requires JAX_ENABLE_X64=1 for int64 index support. "
-            "Set os.environ['JAX_ENABLE_X64'] = '1' before importing jax, "
-            "or call jax.config.update('jax_enable_x64', True) at startup.",
-            UserWarning,
-            stacklevel=3,
-        )
-
     comm = MPI.COMM_WORLD
 
     def allgather(
@@ -624,7 +614,7 @@ def _get_solver_primitive_mpi(
             row_lengths,
             total_repeat_length=len(A.data),
         )
-        grad_values = -adj_b[row_indices] * x_global[A.indices]
+        grad_values = -adj_b[row_indices] * x_global[A.indices.astype(jnp.int32)]
         grad_A = jsp.BCSR((grad_values, A.indices, A.indptr), shape=A.shape)
 
         return grad_A, adj_b, None, None

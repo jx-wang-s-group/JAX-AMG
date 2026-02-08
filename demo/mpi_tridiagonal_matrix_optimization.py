@@ -9,6 +9,7 @@ Usage:
 """
 
 import os
+
 from mpi4py import MPI
 
 import jax
@@ -22,15 +23,16 @@ from jaxamg.matrices import (
 )
 from jaxamg.mpi_utils import get_partition_info
 
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", False)
 
 
 def main():
+
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     nranks = comm.Get_size()
 
-    gpu_ids = [0, 1, 2, 3]
+    gpu_ids = [1, 3]
     gpu_id = gpu_ids[rank]
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
@@ -48,7 +50,7 @@ def main():
 
     # Generate ground truth solution using single-GPU on rank 0
     if rank == 0:
-        b_global = rhs_ones(n_global).astype(jnp.float64)
+        b_global = rhs_ones(n_global)
         A_true = tridiagonal_operator(true_diag)
         x_target_global, _ = amg_solve(A_true, b_global)
     else:
@@ -61,7 +63,7 @@ def main():
     row_start, row_end, n_local = get_partition_info(n_global, rank, nranks)
 
     x_target_local = jnp.array(x_target_global[row_start:row_end])
-    b_local = rhs_ones(n_local, dtype=jnp.float64)
+    b_local = rhs_ones(n_local)
 
     comm.Barrier()
     print(f"  Rank {rank}: {n_local} rows [{row_start}:{row_end})")
@@ -82,7 +84,6 @@ def main():
         rank,
         nranks,
         diagonal_value=diag_init,
-        dtype=jnp.float64,
     )
 
     mpi_cache = cache_mpi_metadata(
@@ -97,7 +98,6 @@ def main():
             rank,
             nranks,
             diagonal_value=diag,
-            dtype=jnp.float64,
         )
 
         A = with_cache(A_loc, mpi=mpi_cache, is_symmetric=True)

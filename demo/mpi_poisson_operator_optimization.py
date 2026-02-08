@@ -53,7 +53,7 @@ def main():
 
     # Generate ground truth solution using single-GPU on rank 0
     if rank == 0:
-        b_global = rhs_ones(n_global, dtype=jnp.float64)
+        b_global = rhs_ones(n_global)
         A_true = poisson_operator(true_skew)
 
         x_target_global, info = amg_solve(
@@ -72,7 +72,7 @@ def main():
     # Partition
     row_start, row_end, n_local = get_partition_info(n_global, rank, nranks)
     x_target_local = jnp.array(x_target_global[row_start:row_end])
-    b_local = rhs_ones(n_local, dtype=jnp.float64)
+    b_local = rhs_ones(n_local)
 
     comm.Barrier()
     print(f"  Rank {rank}: {n_local} rows [{row_start}:{row_end})")

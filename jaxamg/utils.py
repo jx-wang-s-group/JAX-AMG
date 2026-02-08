@@ -9,6 +9,7 @@ import jax.experimental.sparse as jsp
 import numpy as np
 import scipy.sparse as sp
 from collections import defaultdict
+import contextlib
 import atexit
 
 from typing import cast, Callable
@@ -16,6 +17,34 @@ from jax.typing import ArrayLike, DTypeLike
 
 Matrix = ArrayLike | jsp.JAXSparse | sp.spmatrix
 MatrixOrOperator = Matrix | Callable
+
+
+@contextlib.contextmanager
+def temp_enable_x64():
+    """Context manager to temporarily enable x64 mode."""
+    original_x64 = jax.config.read("jax_enable_x64")
+    if not original_x64:
+        jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        if not original_x64:
+            jax.config.update("jax_enable_x64", False)
+
+
+def ensure_int64_array(data: ArrayLike) -> jax.Array:
+    """Create a JAX array with int64 dtype, temporarily enabling x64 if needed.
+
+    This avoids truncation warnings when running in float32 mode (default JAX).
+
+    Args:
+        data: Data to convert to int64 array
+
+    Returns:
+        Device array with int64 dtype
+    """
+    with temp_enable_x64():
+        return jnp.array(data, dtype=jnp.int64)
 
 
 def to_scipy(A: jsp.BCSR, format: str = "csr") -> sp.spmatrix:
@@ -205,7 +234,7 @@ def materialize_sparse_matrix(
 
     indptr = jnp.zeros(n + 1, dtype=jnp.int32)
     row_counts = jnp.bincount(rows_sorted, length=n)
-    indptr = indptr.at[1:].set(jnp.cumsum(row_counts))
+    indptr = indptr.at[1:].set(jnp.cumsum(row_counts).astype(jnp.int32))
 
     return jsp.BCSR((values_sorted, cols_sorted, indptr), shape=shape)
 
@@ -265,16 +294,14 @@ def _ensure_bcsr_properties(
         # Temporarily enable X64 mode to allow int64 arrays
         if A.indices.dtype != np.int64:
             try:
-                original_x64 = jax.config.read("jax_enable_x64")
-                jax.config.update("jax_enable_x64", True)
-                try:
+                # Use context manager to keep x64 enabled during BCSR construction
+                # This prevents JAX from truncating the indices back to int32
+                with temp_enable_x64():
                     indices_int64 = jnp.array(A.indices, dtype=jnp.int64)
                     A = jsp.BCSR(
                         (A.data, indices_int64, A.indptr),
                         shape=A.shape,
                     )
-                finally:
-                    jax.config.update("jax_enable_x64", original_x64)
             except Exception as e:
                 raise ValueError(
                     f"Matrix column indices must be int64 for MPI, got {A.indices.dtype}. Error: {e}"
