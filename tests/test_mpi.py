@@ -186,7 +186,7 @@ def test_mpi_partition(mpi_context):
 def test_mpi_allgatherv(mpi_context):
     """Test variable-size allgatherv."""
     comm, rank, nranks = mpi_context
-    from jaxamg.jaxamg import _mpi4jax_allgatherv
+    from jaxamg.mpi_utils import _mpi4jax_allgatherv
 
     # Create variable sized arrays per rank: Rank r sends [r] * (r+1)
     # Rank 0: [0]
@@ -227,7 +227,7 @@ def test_mpi_transpose(mpi_context):
     comm, rank, nranks = mpi_context
     from mpi4py import MPI
 
-    from jaxamg.jaxamg import _mpi4jax_alltoallv_transpose
+    from jaxamg.mpi_utils import _mpi4jax_alltoallv_transpose
 
     grid_size = 4
     n_global = grid_size**2
