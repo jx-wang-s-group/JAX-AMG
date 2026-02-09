@@ -1,12 +1,13 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from jaxamg.matrices import tridiagonal_operator
 from jaxamg.utils import (
-    get_sparsity_pattern,
     get_column_coloring,
+    get_sparsity_pattern,
     materialize_sparse_matrix,
 )
-from jaxamg.matrices import tridiagonal_operator
 
 
 class TestGraphColoring:

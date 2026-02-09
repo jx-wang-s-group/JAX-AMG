@@ -9,18 +9,19 @@ matrices are created via automatic partitioning of the global matrix.
 """
 
 import os
-from mpi4py import MPI
-import jax.numpy as jnp
 import time
 
+import jax.numpy as jnp
+from mpi4py import MPI
+
 from jaxamg import amg_solve
+from jaxamg.matrices import poisson_matrix, rhs_linear
 from jaxamg.mpi_utils import (
-    validate_partition,
     gather_solution,
     partition_csr_matrix,
     partition_vector,
+    validate_partition,
 )
-from jaxamg.matrices import poisson_matrix, rhs_linear
 
 
 def main():
@@ -39,13 +40,13 @@ def main():
     if rank == 0:
         print(f"Setting up MPI 2D Poisson problem on {grid_size}x{grid_size} grid...")
         print(f"MPI ranks: {nranks}")
-        print(f"Creating global matrix on rank 0...")
+        print("Creating global matrix on rank 0...")
 
         # Create global matrix
         A_global = poisson_matrix(grid_size)
         b_global = rhs_linear(n)
 
-        print(f"Broadcasting matrix structure to all ranks...")
+        print("Broadcasting matrix structure to all ranks...")
     else:
         A_global = None
         b_global = None
@@ -74,7 +75,7 @@ def main():
 
     comm.Barrier()
     if rank == 0:
-        print(f"\nSolving distributed system...")
+        print("\nSolving distributed system...")
 
     # Solver configuration
     config = {
@@ -106,7 +107,7 @@ def main():
     x_mpi = gather_solution(x_local, comm, root=0)
 
     if rank == 0:
-        print(f"Validating against single-GPU result...")
+        print("Validating against single-GPU result...")
         x_ref, info_ref = amg_solve(
             poisson_matrix(grid_size),
             rhs_linear(n),

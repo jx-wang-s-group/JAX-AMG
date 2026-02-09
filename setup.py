@@ -1,24 +1,36 @@
+"""
+JAX-AMG package setup with native extension for AmgX bindings.
+
+This setup.py builds the C++ extension that bridges JAX FFI with NVIDIA AmgX.
+
+Environment Variables:
+    CUDA_HOME: Path to CUDA toolkit (auto-detected if not set)
+    AMGX_ROOT: Path to AmgX source directory (required)
+    AMGX_BUILD: Path to AmgX build directory (defaults to AMGX_ROOT/build)
+    JAXAMG_ENABLE_MPI: Override to force MPI linkage (usually not needed)
+"""
+
 import os
 import subprocess
-from setuptools import setup, Extension, find_packages
-import warnings
+from pathlib import Path
 
-# Auto-detection functions
+from setuptools import Extension, setup
 
 
-def find_cuda():
-    # Print CUDA detection attempt
+def find_cuda() -> str | None:
+    """Auto-detect CUDA installation path."""
     print("\033[1;34m[setup.py] Detecting CUDA installation...\033[0m")
-    # Try environment variable
+
+    # Try environment variable first
     cuda_home = os.environ.get("CUDA_HOME")
-    if cuda_home and os.path.exists(cuda_home):
+    if cuda_home and Path(cuda_home).exists():
         return cuda_home
 
     # Try which nvcc
     try:
         nvcc_path = subprocess.check_output(["which", "nvcc"], text=True).strip()
-        cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
-        if os.path.exists(cuda_home):
+        cuda_home = str(Path(nvcc_path).parent.parent)
+        if Path(cuda_home).exists():
             return cuda_home
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
@@ -27,182 +39,214 @@ def find_cuda():
     import glob
 
     cuda_paths = glob.glob("/usr/local/cuda-*") + ["/usr/local/cuda", "/usr/cuda"]
-    # Sort to prefer newest version
-    cuda_paths.sort(reverse=True)
+    cuda_paths.sort(reverse=True)  # Prefer newest version
     for path in cuda_paths:
-        if os.path.exists(path) and os.path.isdir(path):
+        if Path(path).is_dir():
             return path
 
     return None
 
 
-def find_amgx():
+def find_amgx() -> tuple[str | None, str | None]:
+    """Auto-detect AmgX installation path."""
     print("\033[1;34m[setup.py] Detecting AmgX installation...\033[0m")
-    # Try environment variables
+
     amgx_root = os.environ.get("AMGX_ROOT")
     amgx_build = os.environ.get("AMGX_BUILD")
 
-    if amgx_root and os.path.exists(amgx_root):
+    if amgx_root and Path(amgx_root).exists():
         if not amgx_build:
-            # Try to guess build directory
-            guess = os.path.join(amgx_root, "build")
-            if os.path.exists(guess):
-                amgx_build = guess
+            guess = Path(amgx_root) / "build"
+            if guess.exists():
+                amgx_build = str(guess)
         return amgx_root, amgx_build
 
     # Try common locations
-    home = os.path.expanduser("~")
-    common_amgx_parents = [
-        home,
-        "/opt",
-        "/usr/local",
+    common_dirs = [
+        Path.home(),
+        Path("/opt"),
+        Path("/usr/local"),
     ]
 
-    for parent in common_amgx_parents:
-        if os.path.exists(parent):
-            amgx_path = os.path.join(parent, "amgx")
-            if os.path.exists(amgx_path):
-                # Found something named amgx, check for include/amgx_c.h
-                if os.path.exists(os.path.join(amgx_path, "include", "amgx_c.h")):
-                    # Found it! Now check for build directory
-                    guess = os.path.join(amgx_path, "build")
-                    if os.path.exists(guess):
-                        return amgx_path, guess
-                    # If include exists but build doesn't, still return root
-                    return amgx_path, None
+    for parent in common_dirs:
+        amgx_path = parent / "amgx"
+        if amgx_path.exists() and (amgx_path / "include" / "amgx_c.h").exists():
+            build_path = amgx_path / "build"
+            return str(amgx_path), str(build_path) if build_path.exists() else None
 
     return None, None
 
 
-# Find MPI C++ compiler
-def find_mpicxx():
+def find_mpicxx() -> str | None:
+    """Find MPI C++ compiler if available."""
     print("\033[1;34m[setup.py] Detecting MPI C++ compiler...\033[0m")
-    # Try environment variable
-    mpicxx_bin = os.environ.get("MPICXX")
-    if mpicxx_bin:
-        # Check if it exists in PATH or as a file
-        if os.path.isabs(mpicxx_bin) and os.path.exists(mpicxx_bin):
-            return mpicxx_bin
-        # Try to locate in PATH
+
+    mpicxx_env = os.environ.get("MPICXX")
+    if mpicxx_env:
+        if Path(mpicxx_env).exists():
+            return mpicxx_env
         try:
-            mpicxx_path = subprocess.check_output(
-                ["which", mpicxx_bin], text=True
-            ).strip()
-            if os.path.exists(mpicxx_path):
-                return mpicxx_path
+            result = subprocess.check_output(["which", mpicxx_env], text=True).strip()
+            if Path(result).exists():
+                return result
         except (subprocess.CalledProcessError, FileNotFoundError):
             pass
+
     # Try common MPI compiler names
     for candidate in ["mpicxx", "mpiCC", "mpic++"]:
         try:
-            mpicxx_path = subprocess.check_output(
-                ["which", candidate], text=True
-            ).strip()
-            if os.path.exists(mpicxx_path):
-                return mpicxx_path
+            result = subprocess.check_output(["which", candidate], text=True).strip()
+            if Path(result).exists():
+                return result
         except (subprocess.CalledProcessError, FileNotFoundError):
             continue
+
     return None
 
 
-# Defer heavy imports until after dependency checks
-def get_build_vars():
+def get_mpi_flags(mpicxx_bin: str) -> tuple[list[str], list[str], list[str]]:
+    """Extract MPI compile and link flags from MPI compiler wrapper."""
+    try:
+        compile_output = subprocess.check_output(
+            [mpicxx_bin, "--showme:compile"], text=True
+        ).strip()
+        compile_flags = compile_output.split()
+
+        link_output = subprocess.check_output(
+            [mpicxx_bin, "--showme:link"], text=True
+        ).strip()
+        link_flags = link_output.split()
+
+        include_dirs = [f[2:] for f in compile_flags if f.startswith("-I")]
+        library_dirs = [f[2:] for f in link_flags if f.startswith("-L")]
+        libraries = [f[2:] for f in link_flags if f.startswith("-l")]
+
+        return include_dirs, library_dirs, libraries
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return [], [], []
+
+
+def get_build_config() -> dict:
+    """Gather all build configuration."""
     print("\033[1;34m[setup.py] Gathering build configuration...\033[0m")
+
+    # Check for required build dependencies
     try:
         import pybind11
     except ImportError:
         raise RuntimeError(
-            "pybind11 is required to build this package. Please install it first."
+            "pybind11 is required to build this package. "
+            "Install with: pip install pybind11>=2.10.0"
         )
+
     try:
         from jax import ffi
     except ImportError:
         raise RuntimeError(
-            "jax is required to build this package. Please install it first."
+            "jax is required to build this package. "
+            "Install with: pip install jax>=0.4.35"
         )
 
-    CUDA_HOME = find_cuda()
-    print(f"\033[1;34m[setup.py] CUDA_HOME: {CUDA_HOME}\033[0m")
-    if not CUDA_HOME:
+    # Find CUDA
+    cuda_home = find_cuda()
+    print(f"\033[1;34m[setup.py] CUDA_HOME: {cuda_home}\033[0m")
+    if not cuda_home:
         raise RuntimeError(
-            "CUDA_HOME not found. Please ensure CUDA Toolkit is installed, "
-            "or set CUDA_HOME environment variable manually."
+            "CUDA not found. Please install CUDA Toolkit and either:\n"
+            "  1. Set CUDA_HOME environment variable, or\n"
+            "  2. Ensure nvcc is in your PATH"
         )
 
-    AMGX_ROOT, AMGX_BUILD = find_amgx()
-    print(f"\033[1;34m[setup.py] AMGX_ROOT: {AMGX_ROOT}\033[0m")
-    print(f"\033[1;34m[setup.py] AMGX_BUILD: {AMGX_BUILD}\033[0m")
-    if not AMGX_ROOT or not AMGX_BUILD:
+    # Find AmgX
+    amgx_root, amgx_build = find_amgx()
+    print(f"\033[1;34m[setup.py] AMGX_ROOT: {amgx_root}\033[0m")
+    print(f"\033[1;34m[setup.py] AMGX_BUILD: {amgx_build}\033[0m")
+    if not amgx_root or not amgx_build:
         raise RuntimeError(
-            f"AmgX not found (AMGX_ROOT: {AMGX_ROOT}, AMGX_BUILD: {AMGX_BUILD}). "
-            "This package requires AmgX. Please install AmgX and set AMGX_ROOT and AMGX_BUILD."
+            "AmgX not found. Please:\n"
+            "  1. Set AMGX_ROOT to the AmgX source directory\n"
+            "  2. Set AMGX_BUILD to the AmgX build directory (or build in AMGX_ROOT/build)\n"
+            "  See INSTALL.md for details on building AmgX."
         )
 
-    XLA_FFI_INCLUDE = ffi.include_dir()
-
-    # Get MPI compile and link flags
-    mpicxx_bin = find_mpicxx()
-    print(f"\033[1;34m[setup.py] MPICXX: {mpicxx_bin}\033[0m")
-    if mpicxx_bin:
-        try:
-            mpi_compile_output = subprocess.check_output(
-                [mpicxx_bin, "--showme:compile"], text=True
-            ).strip()
-            mpi_compile_flags = mpi_compile_output.split()
-
-            mpi_link_output = subprocess.check_output(
-                [mpicxx_bin, "--showme:link"], text=True
-            ).strip()
-            mpi_link_flags = mpi_link_output.split()
-
-            mpi_include_dirs = [
-                flag[2:] for flag in mpi_compile_flags if flag.startswith("-I")
-            ]
-            mpi_library_dirs = [
-                flag[2:] for flag in mpi_link_flags if flag.startswith("-L")
-            ]
-            mpi_libraries = [
-                flag[2:] for flag in mpi_link_flags if flag.startswith("-l")
-            ]
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            warnings.warn(
-                "mpicxx found but could not extract flags. Building without MPI support."
-            )
-            mpi_include_dirs = []
-            mpi_library_dirs = []
-            mpi_libraries = []
-    else:
-        warnings.warn("mpicxx not found. Building without MPI support.")
-        mpi_include_dirs = []
-        mpi_library_dirs = []
-        mpi_libraries = []
-
+    # Build include and library paths
     include_dirs = [
         pybind11.get_include(),
-        XLA_FFI_INCLUDE,
+        ffi.include_dir(),
+        str(Path(amgx_root) / "include"),
+        str(Path(cuda_home) / "include"),
     ]
-    if AMGX_ROOT:
-        include_dirs.append(os.path.join(AMGX_ROOT, "include"))
-    include_dirs.append(os.path.join(CUDA_HOME, "include"))
-    include_dirs += mpi_include_dirs
 
-    library_dirs = []
-    if AMGX_BUILD:
-        library_dirs.append(AMGX_BUILD)
-    library_dirs.append(os.path.join(CUDA_HOME, "lib64"))
-    library_dirs += mpi_library_dirs
+    library_dirs = [
+        amgx_build,
+        str(Path(cuda_home) / "lib64"),
+    ]
+
+    libraries = ["amgxsh", "cudart"]
+
+    # Check if AmgX was built with MPI by inspecting for undefined MPI symbols
+    def amgx_requires_mpi() -> bool:
+        """Check if libamgxsh.so has undefined MPI symbols (requires MPI at runtime)."""
+        libamgx = Path(amgx_build) / "libamgxsh.so"
+        if not libamgx.exists():
+            return False
+        try:
+            # Use nm to check for undefined MPI symbols
+            # AmgX uses dynamic MPI loading, so ldd won't show MPI
+            nm_output = subprocess.check_output(
+                ["nm", "-D", str(libamgx)], text=True, stderr=subprocess.DEVNULL
+            )
+            # Look for undefined MPI symbols (lines starting with U)
+            return "U MPI_" in nm_output
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+    amgx_needs_mpi = amgx_requires_mpi()
+    env_enable_mpi = os.environ.get("JAXAMG_ENABLE_MPI", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+    # Auto-enable MPI if AmgX requires it
+    enable_mpi = env_enable_mpi or amgx_needs_mpi
+
+    if amgx_needs_mpi and not env_enable_mpi:
+        print(
+            "\033[1;33m[setup.py] Auto-detected: AmgX was built with MPI support\033[0m"
+        )
+
+    if enable_mpi:
+        mpicxx_bin = find_mpicxx()
+        print(f"\033[1;34m[setup.py] MPICXX: {mpicxx_bin}\033[0m")
+
+        if mpicxx_bin:
+            mpi_includes, mpi_libdirs, mpi_libs = get_mpi_flags(mpicxx_bin)
+            include_dirs.extend(mpi_includes)
+            library_dirs.extend(mpi_libdirs)
+            libraries.extend(mpi_libs)
+            print("\033[1;32m[setup.py] MPI support enabled\033[0m")
+        else:
+            if amgx_needs_mpi:
+                print(
+                    "\033[1;31m[setup.py] ERROR: AmgX requires MPI but mpicxx not found.\n"
+                    "  Please install MPI (e.g., 'apt install libopenmpi-dev') or\n"
+                    "  rebuild AmgX without MPI: cmake .. -DAMGX_NO_MPI=ON\033[0m"
+                )
+            else:
+                print(
+                    "\033[1;33m[setup.py] WARNING: JAXAMG_ENABLE_MPI=1 but mpicxx not found. "
+                    "Building without MPI linkage.\033[0m"
+                )
+    else:
+        print(
+            "\033[1;34m[setup.py] MPI support disabled (AmgX built without MPI)\033[0m"
+        )
 
     runtime_library_dirs = list(library_dirs)
 
-    libraries = []
-    if AMGX_BUILD:
-        libraries.append("amgxsh")
-    libraries.append("cudart")
-    libraries += mpi_libraries
-
     print(f"\033[1;34m[setup.py] include_dirs: {include_dirs}\033[0m")
     print(f"\033[1;34m[setup.py] library_dirs: {library_dirs}\033[0m")
-    print(f"\033[1;34m[setup.py] runtime_library_dirs: {runtime_library_dirs}\033[0m")
     print(f"\033[1;34m[setup.py] libraries: {libraries}\033[0m")
 
     return {
@@ -213,24 +257,22 @@ def get_build_vars():
     }
 
 
-build_vars = get_build_vars()
+# Build configuration
+build_config = get_build_config()
 
-ext = Extension(
+# C++ extension module
+ext_module = Extension(
     "jaxamg._amgx",
     sources=["jaxamg/amgx_custom_call.cc"],
-    include_dirs=build_vars["include_dirs"],
-    library_dirs=build_vars["library_dirs"],
-    runtime_library_dirs=build_vars["runtime_library_dirs"],
-    libraries=build_vars["libraries"],
+    include_dirs=build_config["include_dirs"],
+    library_dirs=build_config["library_dirs"],
+    runtime_library_dirs=build_config["runtime_library_dirs"],
+    libraries=build_config["libraries"],
     extra_compile_args=["-O3", "-std=c++17"],
+    language="c++",
 )
 
+# Setup (metadata now in pyproject.toml)
 setup(
-    name="jaxamg",
-    version="0.0.1",
-    packages=["jaxamg"],
-    ext_modules=[ext],
-    setup_requires=["pybind11>=2.6.0", "jax"],
-    install_requires=["pybind11>=2.6.0", "jax"],
-    python_requires=">=3.8",
+    ext_modules=[ext_module],
 )

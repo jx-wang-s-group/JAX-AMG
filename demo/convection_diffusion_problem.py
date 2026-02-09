@@ -15,6 +15,7 @@ and compares the numerical solution to the exact solution.
 
 import jax.numpy as jnp
 import numpy as np
+
 from jaxamg import amg_solve
 from jaxamg.matrices import convection_diffusion_matrix_2d
 

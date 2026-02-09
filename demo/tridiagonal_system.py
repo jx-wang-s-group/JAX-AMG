@@ -5,8 +5,9 @@ which arises from discretizing the 1D Laplacian operator.
 """
 
 import jax.numpy as jnp
+
 from jaxamg import amg_solve
-from jaxamg.matrices import tridiagonal_matrix, rhs_ones
+from jaxamg.matrices import rhs_ones, tridiagonal_matrix
 
 
 def main():

@@ -5,16 +5,17 @@ This module provides common sparse matrix patterns and right-hand-side
 vector generators for testing and demonstration purposes.
 """
 
+from collections.abc import Callable
+from typing import cast
+
 import jax
-import jax.numpy as jnp
 import jax.experimental.sparse as jsp
+import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
+from jax.typing import DTypeLike
 
 from .mpi_utils import get_partition_info
-
-from typing import cast, Callable
-from jax.typing import DTypeLike
 
 
 def tridiagonal_matrix(
@@ -30,8 +31,6 @@ def tridiagonal_matrix(
     Returns:
         JAX BCSR matrix with [-1, diagonal_value, -1] pattern
     """
-    # Total non-zeros: 2 + 3*(n-2) + 2 = 3*n - 2
-    nnz = 3 * n - 2
 
     # Build values array efficiently using vectorized operations
     # Pattern: [diag, -1] + [-1, diag, -1] * (n-2) + [-1, diag]

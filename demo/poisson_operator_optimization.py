@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxamg import amg_solve, cache_coloring, with_cache
-from jaxamg.matrices import tridiagonal_operator, rhs_ones, poisson_operator
+from jaxamg.matrices import poisson_operator, rhs_ones
 
 
 def main():

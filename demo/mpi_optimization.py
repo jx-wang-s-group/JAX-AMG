@@ -9,14 +9,14 @@ Usage:
 """
 
 import os
-from mpi4py import MPI
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from mpi4py import MPI
 
 from jaxamg import amg_solve, cache_mpi_metadata, with_cache
-from jaxamg.matrices import tridiagonal_matrix_distributed, tridiagonal_matrix
+from jaxamg.matrices import tridiagonal_matrix, tridiagonal_matrix_distributed
 
 jax.config.update("jax_enable_x64", True)
 
@@ -33,7 +33,7 @@ def main():
     n_global = 64
 
     if rank == 0:
-        print(f"Setting up MPI-distributed optimization")
+        print("Setting up MPI-distributed optimization")
         print(f"MPI ranks: {nranks}")
         print(f"Global system size: {n_global}")
         print()
@@ -55,7 +55,7 @@ def main():
 
     # Cache MPI metadata for JIT-compatible solver usage
     if rank == 0:
-        print(f"Caching MPI metadata for JIT...")
+        print("Caching MPI metadata for JIT...")
     mpi_cache = cache_mpi_metadata(
         config, comm, n_global, (row_start, row_end), A_local
     )
@@ -77,7 +77,7 @@ def main():
     num_iterations = 10
 
     if rank == 0:
-        print(f"Gradient Descent Optimization:")
+        print("Gradient Descent Optimization:")
         print(f"Learning rate: {learning_rate}")
         print(f"Iterations: {num_iterations}")
         print()

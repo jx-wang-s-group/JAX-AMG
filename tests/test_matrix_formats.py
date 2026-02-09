@@ -1,10 +1,10 @@
 """Test solver with differnet matrix input formats."""
 
-import pytest
 import numpy as np
+import pytest
 
 from jaxamg import amg_solve
-from jaxamg.matrices import tridiagonal_matrix, rhs_ones
+from jaxamg.matrices import rhs_ones, tridiagonal_matrix
 from jaxamg.utils import to_scipy
 
 

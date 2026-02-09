@@ -2,17 +2,18 @@
 Helper functions for BCSR matrix operations.
 """
 
+import atexit
+import contextlib
+from collections import defaultdict
+from collections.abc import Callable
+from typing import cast
+
 import jax
-from jax import core
-import jax.numpy as jnp
 import jax.experimental.sparse as jsp
+import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
-from collections import defaultdict
-import contextlib
-import atexit
-
-from typing import cast, Callable
+from jax import core
 from jax.typing import ArrayLike, DTypeLike
 
 Matrix = ArrayLike | jsp.JAXSparse | sp.spmatrix

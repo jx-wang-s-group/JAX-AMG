@@ -1,7 +1,8 @@
-import pytest
 import numpy as np
-from jaxamg import amg_solve, AMGXStatus
-from jaxamg.matrices import tridiagonal_matrix, rhs_ones
+import pytest
+
+from jaxamg import AMGXStatus, amg_solve
+from jaxamg.matrices import rhs_ones, tridiagonal_matrix
 
 
 @pytest.fixture

@@ -1,7 +1,7 @@
 """Pytest configuration and fixtures for jaxamg tests."""
 
-import pytest
 import jax
+import pytest
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -1,18 +1,18 @@
 """Test basic solver functionality."""
 
-import pytest
-import numpy as np
-import scipy.sparse.linalg as spla
 import jax
-import jax.numpy as jnp
 import jax.experimental.sparse as jsp
+import jax.numpy as jnp
+import numpy as np
+import pytest
+import scipy.sparse.linalg as spla
 
-from jaxamg import amg_solve, AMGXStatus
+from jaxamg import AMGXStatus, amg_solve
 from jaxamg.matrices import (
-    tridiagonal_matrix,
-    poisson_matrix,
     convection_diffusion_matrix_2d,
+    poisson_matrix,
     rhs_ones,
+    tridiagonal_matrix,
 )
 from jaxamg.utils import to_scipy
 

@@ -9,17 +9,18 @@ Validates results against single-GPU reference solution.
 """
 
 import os
-from mpi4py import MPI
-import jax.numpy as jnp
 import time
 
+import jax.numpy as jnp
+from mpi4py import MPI
+
 from jaxamg import amg_solve
+from jaxamg.matrices import poisson_matrix, poisson_matrix_distributed, rhs_linear
 from jaxamg.mpi_utils import (
-    validate_partition,
     gather_solution,
     partition_vector,
+    validate_partition,
 )
-from jaxamg.matrices import poisson_matrix, poisson_matrix_distributed, rhs_linear
 
 
 def main():
@@ -58,7 +59,7 @@ def main():
     b_local, _, _ = partition_vector(b_global, rank, nranks)
 
     if rank == 0:
-        print(f"\nSolving distributed system...")
+        print("\nSolving distributed system...")
 
     # Solver configuration
     config = {
@@ -90,7 +91,7 @@ def main():
     x_mpi = gather_solution(x_local, comm, root=0)
 
     if rank == 0:
-        print(f"Validating against single-GPU result...")
+        print("Validating against single-GPU result...")
         x_ref, info_ref = amg_solve(
             poisson_matrix(grid_size),
             rhs_linear(n),

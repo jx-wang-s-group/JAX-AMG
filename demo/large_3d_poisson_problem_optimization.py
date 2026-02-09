@@ -13,10 +13,12 @@ for large systems.
 """
 
 import time
+
 import jax
 import jax.numpy as jnp
+
 from jaxamg import amg_solve, with_cache
-from jaxamg.matrices import rhs_ones, poisson3d_matrix
+from jaxamg.matrices import poisson3d_matrix, rhs_ones
 
 
 def main():
@@ -73,7 +75,7 @@ def main():
     theta = 10.0  # Initial guess
     lr = 0.5  # Learning rate
 
-    print(f"\nStarting optimization:")
+    print("\nStarting optimization:")
     print(f"Initial theta: {theta:.4f}")
     print(f"Target theta:  {theta_true:.4f}")
     print(f"Learning rate: {lr}")

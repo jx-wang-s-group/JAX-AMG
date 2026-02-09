@@ -10,16 +10,15 @@ Usage:
 
 import os
 
-from mpi4py import MPI
-
 import jax
 import jax.numpy as jnp
+from mpi4py import MPI
 
 from jaxamg import amg_solve, cache_mpi_metadata, with_cache
 from jaxamg.matrices import (
-    tridiagonal_operator,
-    tridiagonal_matrix_distributed,
     rhs_ones,
+    tridiagonal_matrix_distributed,
+    tridiagonal_operator,
 )
 from jaxamg.mpi_utils import get_partition_info
 

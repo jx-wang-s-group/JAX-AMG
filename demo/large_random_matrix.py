@@ -3,6 +3,7 @@ Demo: Solving a large random sparse linear system.
 """
 
 import time
+
 from jaxamg import amg_solve
 from jaxamg.matrices import random_matrix, rhs_random
 

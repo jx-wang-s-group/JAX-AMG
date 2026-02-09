@@ -1,11 +1,11 @@
 """MPI utilities for distributed AmgX solving."""
 
-import jax.numpy as jnp
+from typing import TYPE_CHECKING, cast
+
 import jax.experimental.sparse as jsp
+import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
-
-from typing import cast, TYPE_CHECKING
 from jax.typing import ArrayLike
 
 if TYPE_CHECKING:

@@ -4,15 +4,14 @@ Caching utilities.
 This module provides functions to cache metadata, enabling efficient usage with JAX JIT compilation.
 """
 
+from typing import TYPE_CHECKING, Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from . import config as amgx_config
 from .utils import *
-
-from typing import Any, Callable, TYPE_CHECKING
-from jax.typing import ArrayLike
 
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
@@ -138,8 +137,8 @@ def cache_mpi_metadata(
         # For distributed operators, we need to use global size for proper materialization
         # The operator shape is (n_local, n_global): takes global vector, returns local portion
         from .utils import (
-            get_sparsity_pattern,
             get_column_coloring,
+            get_sparsity_pattern,
             materialize_sparse_matrix,
         )
 

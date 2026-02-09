@@ -5,8 +5,9 @@ This demonstrates solver's ability to efficiently solve very large sparse linear
 """
 
 import time
+
 from jaxamg import amg_solve
-from jaxamg.matrices import rhs_ones, poisson3d_matrix
+from jaxamg.matrices import poisson3d_matrix, rhs_ones
 
 
 def main():

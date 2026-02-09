@@ -1,16 +1,18 @@
-import jax
-import jax.numpy as jnp
-import jax.ffi as ffi
-import jax.experimental.sparse as jsp
 import functools
-import numpy as np
+from collections.abc import Callable
 from enum import IntEnum
+from typing import TYPE_CHECKING, Any, cast
 
-from . import _amgx, config as amgx_config
-from .utils import *
-
-from typing import cast, Callable, Any, TYPE_CHECKING
+import jax
+import jax.experimental.sparse as jsp
+import jax.ffi as ffi
+import jax.numpy as jnp
+import numpy as np
 from jax.typing import ArrayLike
+
+from . import _amgx
+from . import config as amgx_config
+from .utils import *
 
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
@@ -108,7 +110,6 @@ def _mpi4jax_allgatherv(
 
     max_count = max(recvcounts_tuple)
     nranks = len(recvcounts_tuple)
-    nglobal = sum(recvcounts_tuple)
 
     # Pad sendbuf to max_count (known at trace time)
     padded = jnp.zeros(max_count, dtype=sendbuf.dtype)
@@ -201,28 +202,14 @@ def _mpi4jax_alltoallv_transpose(
     one_hot = jax.nn.one_hot(dest_ranks_sorted, size, dtype=jnp.int32)
     send_counts = jnp.sum(one_hot, axis=0)
 
-    # --- Step 5: Exchange counts via mpi4jax ---
-    # Reshape for alltoall: each rank sends its count to each other rank
+    # --- Step 5: Exchange counts and compute buffer sizes ---
     recv_counts = mpi4jax.alltoall(send_counts.reshape(size, 1), comm=comm).flatten()
-
-    # Compute global max for padding via allreduce
     local_max = jnp.maximum(jnp.max(send_counts), jnp.max(recv_counts))
     local_max = jnp.maximum(local_max, 1)  # At least 1 to avoid empty arrays
-    global_max_arr = mpi4jax.allreduce(local_max, op=MPI.MAX, comm=comm)
-    # global_max is now a JAX array; use it directly (traced value)
+    mpi4jax.allreduce(local_max, op=MPI.MAX, comm=comm)  # Sync buffer size
 
-    # --- Step 6: Build padded send buffers using scatter ---
-    # Compute position of each element within its destination's buffer
-    send_displs = jnp.concatenate(
-        [
-            jnp.array([0], dtype=jnp.int32),
-            jnp.cumsum(send_counts[:-1]).astype(jnp.int32),
-        ]
-    )
-
-    # For each element i, its position within dest buffer is:
-    # (index within sorted array) - (start index for its destination)
-    # We compute this using cumsum per destination
+    # --- Step 6: Build padded send buffers ---
+    # Compute position for each element within its destination's buffer
     dest_mask = dest_ranks_sorted[:, None] == jnp.arange(size)  # (nnz, size)
     cumsum_per_dest = jnp.cumsum(
         dest_mask.astype(jnp.int32), axis=0
@@ -250,12 +237,12 @@ def _mpi4jax_alltoallv_transpose(
         cols_sorted.astype(jnp.int32)
     )
 
-    # --- Step 7: GPU-direct alltoall via mpi4jax ---
+    # --- Step 7: Exchange data via GPU-direct alltoall ---
     recv_data = mpi4jax.alltoall(send_data, comm=comm)
     recv_rows = mpi4jax.alltoall(send_rows, comm=comm)
     recv_cols = mpi4jax.alltoall(send_cols, comm=comm)
 
-    # --- Step 8: Extract valid received data ---
+    # --- Step 8: Extract valid received data and build A^T ---
     # Flatten and concatenate valid portions from each rank
     recv_displs = jnp.concatenate(
         [
@@ -263,7 +250,6 @@ def _mpi4jax_alltoallv_transpose(
             jnp.cumsum(recv_counts[:-1]).astype(jnp.int32),
         ]
     )
-    total_recv = jnp.sum(recv_counts)
 
     # Create index arrays for gathering valid data
     # For each rank r, we take recv_data[r, 0:recv_counts[r]]
@@ -283,7 +269,6 @@ def _mpi4jax_alltoallv_transpose(
     # Extract valid elements using boolean indexing equivalent
     # Since we can't use dynamic boolean indexing in JIT, use where + scatter
     # Compute destination indices in the output array
-    recv_counts_expanded = recv_counts[rank_indices]
     within_rank_pos = pos_indices
     # Cumsum of recv_counts gives starting position for each rank in output
     # Position in output = recv_displs[rank] + within_rank_pos (if valid)
@@ -321,7 +306,6 @@ def _mpi4jax_alltoallv_transpose(
     recv_rows_flat = recv_rows_flat.at[valid_positions].add(masked_rows)
     recv_cols_flat = recv_cols_flat.at[valid_positions].add(masked_cols)
 
-    # --- Step 9: Build A^T in CSR format ---
     # For A^T: recv_cols becomes local row (was column in A), recv_rows becomes col (was row in A)
     at_rows_local = recv_cols_flat - my_row_start  # Local row index in A^T
     at_cols = recv_rows_flat  # Column index in A^T (global row in A)
@@ -512,8 +496,8 @@ def _get_solver_primitive_mpi(
         max_nnz: Maximum nnz across all ranks for transpose buffer sizing.
                  Must be provided when using non-symmetric matrices (required for backward pass).
     """
+
     from mpi4py import MPI
-    import warnings
 
     comm = MPI.COMM_WORLD
 

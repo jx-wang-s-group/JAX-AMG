@@ -1,21 +1,21 @@
-import pytest
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.test_util import check_grads
 
-from jaxamg import amg_solve, AMGXStatus, with_cache, cache_mpi_metadata
-from jaxamg.mpi_utils import (
-    gather_solution,
-    partition_vector,
-    partition_csr_matrix,
-    validate_partition,
-)
+from jaxamg import AMGXStatus, amg_solve, cache_mpi_metadata, with_cache
 from jaxamg.matrices import (
     poisson_matrix,
     poisson_matrix_distributed,
     rhs_linear,
     tridiagonal_matrix_distributed,
+)
+from jaxamg.mpi_utils import (
+    gather_solution,
+    partition_csr_matrix,
+    partition_vector,
+    validate_partition,
 )
 
 

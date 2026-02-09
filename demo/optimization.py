@@ -7,8 +7,9 @@ and JIT compilation with the AmgX solver for gradient-based optimization.
 
 import jax
 import jax.numpy as jnp
+
 from jaxamg import amg_solve
-from jaxamg.matrices import tridiagonal_matrix, rhs_ones, rhs_linear, rhs_random
+from jaxamg.matrices import rhs_linear, rhs_ones, rhs_random, tridiagonal_matrix
 
 
 def main():

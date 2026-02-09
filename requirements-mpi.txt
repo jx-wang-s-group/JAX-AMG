@@ -1,0 +1,11 @@
+# JAX-AMG MPI Requirements
+# Install with: pip install -r requirements-mpi.txt
+# Requires MPI library (e.g., OpenMPI) to be installed on the system
+
+-r requirements.txt
+
+# MPI bindings
+mpi4py>=3.1.0
+
+# JAX MPI support
+mpi4jax>=0.4.0

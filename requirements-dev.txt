@@ -1,0 +1,14 @@
+# JAX-AMG Development Requirements
+# Install with: pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# Testing
+pytest>=7.0.0
+pytest-mpi>=0.6
+
+# Code quality
+black
+mypy
+ruff
+pre-commit

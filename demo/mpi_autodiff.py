@@ -9,17 +9,17 @@ Usage:
 """
 
 import os
-from mpi4py import MPI
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from mpi4py import MPI
 
 from jaxamg import amg_solve, cache_mpi_metadata, with_cache
 from jaxamg.matrices import (
+    rhs_random,
     tridiagonal_matrix,
     tridiagonal_matrix_distributed,
-    rhs_random,
 )
 
 jax.config.update("jax_enable_x64", True)
@@ -82,7 +82,7 @@ def main():
     loss_and_grad_fn = jax.jit(jax.value_and_grad(loss_fn))
 
     if rank == 0:
-        print(f"\nComputing loss and gradient...")
+        print("\nComputing loss and gradient...")
 
     loss_mpi, grad_mpi = loss_and_grad_fn(b_local)
 
@@ -95,7 +95,7 @@ def main():
     loss_total = comm.reduce(float(loss_mpi), op=MPI.SUM, root=0)
 
     if rank == 0 and b_gathered is not None and grad_gathered is not None:
-        print(f"\nValidating against single-GPU result...")
+        print("\nValidating against single-GPU result...")
 
         b_global = jnp.concatenate(b_gathered)
         A_global = tridiagonal_matrix(n_global, dtype=jnp.float64)

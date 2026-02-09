@@ -1,8 +1,9 @@
 """Tests for matrix construction functions in jaxamg.matrices."""
 
-import numpy as np
 import jax.numpy as jnp
-from jaxamg.matrices import poisson_matrix, poisson3d_matrix, poisson_matrix_distributed
+import numpy as np
+
+from jaxamg.matrices import poisson3d_matrix, poisson_matrix, poisson_matrix_distributed
 from jaxamg.mpi_utils import partition_csr_matrix
 
 

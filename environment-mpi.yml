@@ -1,0 +1,23 @@
+# JAX-AMG Distributed Environment (MPI Mode)
+# Create with: conda env create -f environment-mpi.yml
+# Activate with: conda activate jaxamg-mpi
+#
+# See INSTALL.md for more details.
+
+name: jaxamg-mpi
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.12
+  - pip
+  - pybind11
+  - numpy
+  - scipy
+  - openmpi-mpicc
+  - pip:
+      - jax[cuda13]
+      - mpi4py
+      - cython
+      - mpi4jax
+      - -e ".[mpi]"

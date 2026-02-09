@@ -6,9 +6,10 @@ Usage:
 """
 
 import os
-from mpi4py import MPI
-import jax.numpy as jnp
 import time
+
+import jax.numpy as jnp
+from mpi4py import MPI
 
 from jaxamg import amg_solve
 from jaxamg.matrices import random_matrix_distributed, rhs_random
@@ -45,7 +46,7 @@ def main():
     b_local = rhs_random(n_local, seed=42 + rank)
 
     if rank == 0:
-        print(f"\nSolving distributed system...")
+        print("\nSolving distributed system...")
 
     # Solver configuration
     config = {

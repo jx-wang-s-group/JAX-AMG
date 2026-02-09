@@ -1,0 +1,17 @@
+# JAX-AMG Base Environment (Single-GPU Mode)
+# Create with: conda env create -f environment.yml
+# Activate with: conda activate jaxamg
+
+name: jaxamg
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.12
+  - pip
+  - pybind11
+  - numpy
+  - scipy
+  - pip:
+      - jax[cuda13]
+      - -e .

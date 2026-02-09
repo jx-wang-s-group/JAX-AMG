@@ -1,3 +1,62 @@
 [build-system]
-requires = ["setuptools", "pybind11>=2.6.0", "jax==0.8.2"]
+requires = ["setuptools>=61.0", "pybind11>=2.10.0", "jax>=0.4.35"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "jaxamg"
+version = "0.1.0"
+description = "JAX bindings for NVIDIA AmgX sparse linear solver with automatic differentiation support"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "jax>=0.4.35",
+    "pybind11>=2.10.0",
+]
+
+[project.optional-dependencies]
+mpi = [
+    "mpi4py>=3.1.0",
+    "mpi4jax>=0.4.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-mpi>=0.6",
+    "pytest-mypy",
+    "black",
+    "mypy",
+    "ruff",
+    "pre-commit",
+]
+all = [
+    "jaxamg[mpi,dev]",
+]
+
+[tool.setuptools]
+packages = ["jaxamg"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501", "F403", "F405", "E731", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+"demo/*" = ["F841"]
+"tests/*" = ["F841"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_return_any = false
+check_untyped_defs = false
+disable_error_code = ["valid-type", "attr-defined", "no-any-return", "arg-type"]

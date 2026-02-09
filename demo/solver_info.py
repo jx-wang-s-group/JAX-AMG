@@ -3,7 +3,7 @@ Demo: Print solver information
 """
 
 from jaxamg.jaxamg import amg_solve
-from jaxamg.matrices import tridiagonal_matrix, rhs_ones
+from jaxamg.matrices import rhs_ones, tridiagonal_matrix
 
 
 def main():

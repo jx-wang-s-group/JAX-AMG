@@ -9,21 +9,21 @@ Usage:
 """
 
 import os
-from mpi4py import MPI
 
 import jax
 import jax.numpy as jnp
+from mpi4py import MPI
 
 from jaxamg import (
     amg_solve,
+    cache_coloring,
     cache_mpi_metadata,
     with_cache,
-    cache_coloring,
 )
 from jaxamg.matrices import (
-    rhs_ones,
     poisson_operator,
     poisson_operator_distributed,
+    rhs_ones,
 )
 from jaxamg.mpi_utils import get_partition_info
 

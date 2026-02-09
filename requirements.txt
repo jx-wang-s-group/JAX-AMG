@@ -1,0 +1,7 @@
+# JAX-AMG Core Requirements
+# Install with: pip install -r requirements.txt
+# For MPI support: pip install -r requirements-mpi.txt
+
+numpy>=1.24.0
+scipy>=1.10.0
+jax>=0.4.35

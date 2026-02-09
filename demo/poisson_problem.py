@@ -6,6 +6,7 @@ using the 5-point finite difference stencil.
 """
 
 import jax.numpy as jnp
+
 from jaxamg import amg_solve
 from jaxamg.matrices import poisson_matrix, rhs_ones
 

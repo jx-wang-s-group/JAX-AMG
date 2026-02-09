@@ -1,24 +1,24 @@
 """Test automatic differentiation with AmgX solver."""
 
-import pytest
-import numpy as np
-import scipy.sparse as sp
-import scipy.sparse.linalg as spla
+from typing import cast
+
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 from jax.test_util import check_grads
 
 from jaxamg import amg_solve, cache_coloring, with_cache
 from jaxamg.matrices import (
-    tridiagonal_matrix,
-    tridiagonal_operator,
     poisson_operator,
     rhs_ones,
     rhs_random,
+    tridiagonal_matrix,
+    tridiagonal_operator,
 )
 from jaxamg.utils import to_scipy
-
-from typing import cast
 
 
 def l2_loss(A, b, config={"solver": "CG"}):

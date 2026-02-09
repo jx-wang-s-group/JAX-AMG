@@ -1,15 +1,15 @@
 """Tests for callable linear operator support."""
 
-import numpy as np
 import jax
+import numpy as np
 
-from jaxamg import amg_solve, cache_coloring, with_cache, AMGXStatus
+from jaxamg import AMGXStatus, amg_solve, cache_coloring, with_cache
 from jaxamg.matrices import (
-    tridiagonal_matrix,
-    tridiagonal_operator,
     poisson_matrix,
     poisson_operator,
     rhs_ones,
+    tridiagonal_matrix,
+    tridiagonal_operator,
 )
 
 
