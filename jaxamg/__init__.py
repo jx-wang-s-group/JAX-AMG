@@ -8,8 +8,12 @@ from .jaxamg import (
     amg_solve,
 )
 
+# User-friendly alias
+solve = amg_solve
+
 __all__ = [
     "amg_solve",
+    "solve",
     "with_cache",
     "cache_coloring",
     "cache_mpi_metadata",

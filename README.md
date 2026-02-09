@@ -125,7 +125,7 @@ A simple tridiagonal system can be solved as:
 
 ```python
 import jax.numpy as jnp
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.matrices import tridiagonal_matrix
 
 # Create a simple tridiagonal system
@@ -134,7 +134,7 @@ A = tridiagonal_matrix(n, diagonal_value=2.0)
 b = jnp.ones(n, dtype=jnp.float32)
 
 # Solve Ax = b
-x, info = amg_solve(A, b)
+x, info = jaxamg.solve(A, b)
 ```
 
 ### MPI Distributed Solving
@@ -143,7 +143,7 @@ A distributed 2D Poisson system can be solved with GPU-aware MPI as:
 
 ```python
 from mpi4py import MPI
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.mpi_utils import partition_vector, gather_solution
 from jaxamg.matrices import poisson_matrix_distributed, rhs_ones
 
@@ -157,7 +157,7 @@ A_local, row_start, row_end = poisson_matrix_distributed(n, n, rank, nranks)
 b_local, _, _ = partition_vector(rhs_ones(n * n), rank, nranks)
 
 # Solve in distributed mode
-x_local, info = amg_solve(
+x_local, info = jaxamg.solve(
     A_local, b_local,
     comm=comm,
     nglobal=n * n,
