@@ -30,6 +30,8 @@ dev = [
     "mypy",
     "ruff",
     "pre-commit",
+    "mkdocs-material",
+    "mkdocstrings[python]",
 ]
 all = [
     "jaxamg[mpi,dev]",
