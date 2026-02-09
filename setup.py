@@ -166,7 +166,7 @@ def get_build_config() -> dict:
             "AmgX not found. Please:\n"
             "  1. Set AMGX_ROOT to the AmgX source directory\n"
             "  2. Set AMGX_BUILD to the AmgX build directory (or build in AMGX_ROOT/build)\n"
-            "  See INSTALL.md for details on building AmgX."
+            "  See https://github.com/NVIDIA/AMGX for details on building AmgX."
         )
 
     # Build include and library paths

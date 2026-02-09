@@ -2,7 +2,7 @@
 # Create with: conda env create -f environment-mpi.yml
 # Activate with: conda activate jaxamg-mpi
 #
-# See INSTALL.md for more details.
+# See README.md for more details.
 
 name: jaxamg-mpi
 channels:
