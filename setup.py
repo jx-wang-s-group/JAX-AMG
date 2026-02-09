@@ -263,7 +263,7 @@ build_config = get_build_config()
 # C++ extension module
 ext_module = Extension(
     "jaxamg._amgx",
-    sources=["jaxamg/amgx_custom_call.cc"],
+    sources=["jaxamg/_amgx.cc"],
     include_dirs=build_config["include_dirs"],
     library_dirs=build_config["library_dirs"],
     runtime_library_dirs=build_config["runtime_library_dirs"],
