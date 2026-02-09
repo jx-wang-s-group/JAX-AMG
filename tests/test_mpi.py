@@ -180,3 +180,120 @@ def test_mpi_partition(mpi_context):
     np.testing.assert_array_equal(A.todense(), A_local.todense())
     np.testing.assert_array_equal(row_start, row_start_auto)
     np.testing.assert_array_equal(row_end, row_end_auto)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_allgatherv(mpi_context):
+    """Test variable-size allgatherv."""
+    comm, rank, nranks = mpi_context
+    from jaxamg.jaxamg import _mpi4jax_allgatherv
+
+    # Create variable sized arrays per rank: Rank r sends [r] * (r+1)
+    # Rank 0: [0]
+    # Rank 1: [1, 1]
+    # Rank 2: [2, 2, 2]
+    size_local = rank + 1
+    sendbuf = jnp.ones(size_local, dtype=jnp.int32) * rank
+
+    # Expected global array
+    expected_parts = []
+    recvcounts = []
+    for r in range(nranks):
+        count = r + 1
+        expected_parts.append(np.ones(count, dtype=np.int32) * r)
+        recvcounts.append(count)
+
+    expected_global = np.concatenate(expected_parts)
+    recvcounts_tuple = tuple(recvcounts)
+
+    # Run allgatherv
+    gathered = _mpi4jax_allgatherv(sendbuf, recvcounts_tuple, comm)
+
+    # Check result
+    np.testing.assert_array_equal(gathered, expected_global)
+
+    # Check JIT compatibility
+    @jax.jit
+    def gathered_jit_fn(sendbuf):
+        return _mpi4jax_allgatherv(sendbuf, recvcounts_tuple, comm)
+
+    gathered_jit = gathered_jit_fn(sendbuf)
+    np.testing.assert_array_equal(gathered_jit, expected_global)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_transpose(mpi_context):
+    """Test distributed transpose on a non-symmetric matri."""
+    comm, rank, nranks = mpi_context
+    from mpi4py import MPI
+
+    from jaxamg.jaxamg import _mpi4jax_alltoallv_transpose
+
+    grid_size = 4
+    n_global = grid_size**2
+
+    # 1. Poisson matrix as base matrix
+    A_local, row_start, row_end = poisson_matrix_distributed(
+        grid_size, grid_size, rank, nranks
+    )
+
+    # 2. Make it non-symmetric by using global index to generate unique values
+    nnz_local = A_local.data.shape[0]
+
+    # Compute row indices for each element
+    row_counts = A_local.indptr[1:] - A_local.indptr[:-1]
+    row_indices_local = jnp.repeat(
+        jnp.arange(A_local.shape[0], dtype=jnp.int32),
+        row_counts,
+        total_repeat_length=nnz_local,
+    )
+    row_indices_global = row_indices_local + row_start
+
+    # Generate unique non-symmetric values
+    # Cast to float to match matrix dtype
+    new_data = (row_indices_global * n_global + A_local.indices).astype(
+        A_local.data.dtype
+    )
+
+    # Gather row counts (needed by transpose)
+    n_local = row_end - row_start
+    row_counts_global = comm.allgather(n_local)
+    recvcounts_tuple = tuple(row_counts_global)
+
+    # Calculate max_nnz across ranks
+    max_nnz = comm.allreduce(nnz_local, op=MPI.MAX)
+
+    # 3. Compute A^T
+    data_T, indices_T, indptr_T = _mpi4jax_alltoallv_transpose(
+        new_data, A_local.indices, A_local.indptr, recvcounts_tuple, comm, max_nnz
+    )
+
+    # Verify A^T is different from A (sanity check)
+    assert not np.allclose(data_T, new_data)
+
+    # 4. Compute (A^T)^T -> should be A
+    data_TT, indices_TT, indptr_TT = _mpi4jax_alltoallv_transpose(
+        data_T, indices_T, indptr_T, recvcounts_tuple, comm, max_nnz
+    )
+
+    # 5. Verify (A^T)^T == A
+    np.testing.assert_array_equal(indptr_TT, A_local.indptr)
+    np.testing.assert_array_equal(indices_TT, A_local.indices)
+    np.testing.assert_array_equal(data_TT, new_data)
+
+    # 6. Verify JIT compatibility
+    @jax.jit
+    def transpose_jit_fn(data, indices, indptr):
+        return _mpi4jax_alltoallv_transpose(
+            data, indices, indptr, recvcounts_tuple, comm, max_nnz
+        )
+
+    # Run JIT-compiled transpose
+    data_T_jit, indices_T_jit, indptr_T_jit = transpose_jit_fn(
+        new_data, A_local.indices, A_local.indptr
+    )
+
+    # Verify JIT output matches non-JIT output
+    np.testing.assert_array_equal(indptr_T_jit, indptr_T)
+    np.testing.assert_array_equal(indices_T_jit, indices_T)
+    np.testing.assert_allclose(data_T_jit, data_T)
