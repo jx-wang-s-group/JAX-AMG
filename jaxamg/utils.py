@@ -2,7 +2,6 @@
 Helper functions for BCSR matrix operations.
 """
 
-import atexit
 import contextlib
 from collections import defaultdict
 from collections.abc import Callable
@@ -460,33 +459,3 @@ def to_bcsr_matrix(
     return _ensure_bcsr_properties(
         A_bcsr, target_dtype, use_int64_indices=use_int64_indices
     )
-
-
-# AmgX finalization: runs during Python exit (before MPI_FINALIZE)
-# Note: C++ does not register atexit - Python controls cleanup order
-_amgx_finalized = False
-
-
-def _finalize_amgx() -> None:
-    """Finalize AmgX library before program exit (runs before MPI_FINALIZE)."""
-    global _amgx_finalized
-    if not _amgx_finalized:
-        try:
-            # MPI barrier if in MPI context (ensures coordinated cleanup)
-            try:
-                from mpi4py import MPI
-
-                if MPI.Is_initialized() and not MPI.Is_finalized():
-                    MPI.COMM_WORLD.Barrier()
-            except (ImportError, Exception):
-                pass
-
-            from jaxamg import _amgx
-
-            _amgx.finalize()
-            _amgx_finalized = True
-        except Exception:
-            pass  # Ignore cleanup errors
-
-
-atexit.register(_finalize_amgx)

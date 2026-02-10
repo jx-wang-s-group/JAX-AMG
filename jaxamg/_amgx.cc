@@ -12,9 +12,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <atomic>
 #include <string>
 #include <fstream>
 #include <vector>
+#include <list>
+#include <unordered_map>
+#include <functional>
+#include <utility>
 #include <mpi.h>
 
 namespace py = pybind11;
@@ -22,6 +27,200 @@ namespace ffi = xla::ffi;
 
 namespace
 {
+
+  // LRU Cache for AmgX solvers.
+  template <typename Key, typename Value>
+  class LRUCache
+  {
+  public:
+    explicit LRUCache(size_t capacity) : capacity_(capacity) {}
+
+    bool get(const Key &key, Value &value)
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = cache_map_.find(key);
+      if (it == cache_map_.end())
+      {
+        return false;
+      }
+      // Move to front
+      lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
+      value = it->second->second;
+      return true;
+    }
+
+    void put(const Key &key, const Value &value, std::function<void(Value &)> destructor)
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+
+      // If capacity is 0, don't cache at all. Destroy immediately.
+      if (capacity_ == 0)
+      {
+         if (destructor) destructor(const_cast<Value&>(value));
+         return;
+      }
+
+      auto it = cache_map_.find(key);
+      if (it != cache_map_.end())
+      {
+        lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
+        // Clean up old value before overwriting!
+        if (destructor)
+        {
+           destructor(it->second->second);
+        }
+        it->second->second = value;
+      }
+      else
+      {
+        if (cache_map_.size() >= capacity_)
+        {
+          auto last = lru_list_.end();
+          last--;
+          if (destructor)
+          {
+            destructor(last->second);
+          }
+          cache_map_.erase(last->first);
+          lru_list_.pop_back();
+        }
+        lru_list_.push_front({key, value});
+        cache_map_[key] = lru_list_.begin();
+      }
+    }
+
+    void erase(const Key &key, std::function<void(Value &)> destructor)
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = cache_map_.find(key);
+      if (it != cache_map_.end())
+      {
+        if (destructor) destructor(it->second->second);
+        lru_list_.erase(it->second);
+        cache_map_.erase(it);
+      }
+    }
+
+    void clear(std::function<void(Value &)> destructor)
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (auto &pair : lru_list_)
+      {
+         if (destructor) destructor(pair.second);
+      }
+      lru_list_.clear();
+      cache_map_.clear();
+    }
+
+  private:
+    size_t capacity_;
+    std::list<std::pair<Key, Value>> lru_list_;
+    std::unordered_map<Key, typename std::list<std::pair<Key, Value>>::iterator> cache_map_;
+    std::mutex mutex_;
+  };
+
+  struct CacheKey
+  {
+    const void *row_ptrs;
+    const void *col_indices;
+    int n_rows;
+    int nnz;
+    std::string config; // Config string content acts as part of key
+
+    bool operator==(const CacheKey &other) const
+    {
+      return row_ptrs == other.row_ptrs &&
+             col_indices == other.col_indices &&
+             n_rows == other.n_rows &&
+             nnz == other.nnz &&
+             config == other.config;
+    }
+  };
+} // namespace
+
+namespace std
+{
+  template <>
+  struct hash<CacheKey>
+  {
+    size_t operator()(const CacheKey &k) const
+    {
+      // Simple hash combination
+      size_t h1 = hash<const void *>()(k.row_ptrs);
+      size_t h2 = hash<const void *>()(k.col_indices);
+      size_t h3 = hash<int>()(k.n_rows);
+      size_t h4 = hash<int>()(k.nnz);
+      size_t h5 = hash<string>()(k.config);
+
+      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4);
+    }
+  };
+} // namespace std
+
+namespace
+{
+  struct CachedResources
+  {
+    AMGX_config_handle cfg;
+    AMGX_resources_handle rsrc;
+    AMGX_matrix_handle A;
+    AMGX_solver_handle solver;
+    AMGX_vector_handle x_vec;
+    AMGX_vector_handle b_vec;
+    bool owns_resources; // True if isolated (Cache=0), False if shared (Cache>=1)
+  };
+
+  // Global cache instance (heap-allocated to persist until explicit finalization).
+  LRUCache<CacheKey, CachedResources>& GetSolverCache()
+  {
+    static auto* cache = []() {
+      // Default to 1 (reuse enabled) for shared mode.
+      size_t capacity = 1;
+      const char* env_val = std::getenv("JAXAMG_CACHE_SIZE");
+      if (env_val) {
+        try {
+            capacity = std::stoul(env_val);
+            // capacity allowed to be 0
+        } catch (...) {
+            capacity = 1; // Fallback
+        }
+      }
+
+      return new LRUCache<CacheKey, CachedResources>(capacity);
+    }();
+    return *cache;
+  }
+
+  void DestroyResources(CachedResources &res)
+  {
+    try
+    {
+      // Prevent segfaults at program exit.
+      if (cudaDeviceSynchronize() != cudaSuccess) {
+          return;
+      }
+
+      // Destroy in reverse order of creation
+      // Always destroy solver to prevent leaks. GlobalResources (Shared Mode) persists memory pools.
+      if (res.solver) AMGX_solver_destroy(res.solver);
+
+      if (res.b_vec) AMGX_vector_destroy(res.b_vec);
+      if (res.x_vec) AMGX_vector_destroy(res.x_vec);
+      if (res.A) AMGX_matrix_destroy(res.A);
+
+      // Only destroy resources handle in Isolated Mode (Mode 0).
+      if (res.owns_resources) {
+          if (res.rsrc) AMGX_resources_destroy(res.rsrc);
+      }
+
+      if (res.cfg) AMGX_config_destroy(res.cfg);
+    }
+    catch (...)
+    {
+      // Swallow all exceptions during destruction to prevent 'terminate' on exit
+      // invalid_argument from CUDA is common during shutdown if context is gone
+    }
+  }
 
 // Undefine existing macro from amgx_c.h to allow custom error handling
 #ifdef AMGX_SAFE_CALL
@@ -55,12 +254,60 @@ namespace
     }                                                            \
   } while (0)
 
+  // Singleton for global AmgX resource management.
+  class GlobalResources {
+  public:
+      static GlobalResources& Get() {
+          static GlobalResources* instance = new GlobalResources();
+          return *instance;
+      }
+
+      AMGX_resources_handle GetHandle(AMGX_config_handle cfg) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (!handle_) {
+              // Create resources with the provided config.
+              // Note: We assume the first config providing resources settings
+              // is sufficient for the application's lifetime.
+              AMGX_SAFE_CALL_VOID(AMGX_resources_create_simple(&handle_, cfg));
+          }
+          return handle_;
+      }
+
+      void Destroy() {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (handle_) {
+              AMGX_SAFE_CALL_VOID(AMGX_resources_destroy(handle_));
+              handle_ = nullptr;
+          }
+      }
+
+  private:
+      GlobalResources() : handle_(nullptr) {}
+      ~GlobalResources() { Destroy(); }
+
+      AMGX_resources_handle handle_;
+      std::mutex mutex_;
+  };
+
+
   std::once_flag g_amgx_init_flag;
+
+  std::atomic<bool> g_amgx_finalized{false};
 
   void AmgxFinalize()
   {
-    AMGX_SAFE_CALL_VOID(AMGX_finalize());
+    bool expected = false;
+    if (g_amgx_finalized.compare_exchange_strong(expected, true)) {
+        // Clear cache and destroy all resources before finalizing AMGX
+        GetSolverCache().clear(DestroyResources);
+
+        // Destroy the global resources handle explicitly
+        GlobalResources::Get().Destroy();
+
+        // AMGX_SAFE_CALL_VOID(AMGX_finalize()); // Disable to avoid SEGFAULT at exit
+    }
   }
+
 
   // Custom callback to suppress AmgX library output (banners, version info)
   void PrintCallback(const char *msg, int length)
@@ -100,6 +347,10 @@ namespace
   {
     EnsureAmgxInitialized();
 
+    // Ensure input buffers are ready.
+    cudaStreamSynchronize(stream);
+
+    CachedResources res;
     // 1. Setup execution context
     int device;
     if (cudaGetDevice(&device) != cudaSuccess)
@@ -112,11 +363,8 @@ namespace
       return ffi::Error::Internal("cudaSetDevice failed");
     }
 
-    // Synchronize stream to ensure inputs are ready
-    cudaStreamSynchronize(stream);
-
-    // 2. Prepare data pointers (Device Mode / dFFI or dDDI)
-    // We cast to raw pointers to pass directly to AmgX, avoiding host transfers.
+    // 2. Prepare data pointers
+    // Cast to raw pointers to avoid host transfers.
     int *row_ptrs_data = const_cast<int *>(row_ptrs.typed_data());
     int *col_indices_data = const_cast<int *>(col_indices.typed_data());
     T *values_data = const_cast<T *>(values.typed_data());
@@ -126,81 +374,116 @@ namespace
 
     // Dimensions
     const int n_rows = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
+    const int nnz = static_cast<int>(values.element_count());
 
-    // 3. Initialize AmgX Resources
-    AMGX_config_handle cfg;
-    AMGX_resources_handle rsrc;
-    AMGX_matrix_handle A;
-    AMGX_vector_handle x_vec;
-    AMGX_vector_handle b_vec;
-    AMGX_solver_handle solver;
+    // 3. Check Cache
+    CacheKey key = {row_ptrs_data, col_indices_data, n_rows, nnz, std::string(config)};
+    // CachedResources res; // Removed duplicate declaration
+    bool cache_hit = GetSolverCache().get(key, res);
 
-    // Use teplated mode
-    const AMGX_Mode mode = Mode;
+    bool reuse_success = false;
 
-    // Prepare configuration
-    std::string config_str(config);
-
-    // Attempt to open as file to determine if it's a file path
-    std::ifstream file_check(config_str);
-    bool is_file = file_check.good();
-    file_check.close(); // Close the stream before AmgX tries to read
-
-    if (is_file)
+    if (cache_hit)
     {
-      AMGX_SAFE_CALL(AMGX_config_create_from_file(&cfg, config_str.c_str()));
-    }
-    else
-    {
-      AMGX_SAFE_CALL(AMGX_config_create(&cfg, config_str.c_str()));
+      // REUSE RESOURCES
+      // Update matrix values
+      // Note: AMGX_matrix_replace_coefficients signature: (mtx, n_rows, nnz, values, diag)
+      AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(res.A, n_rows, (int)values.element_count(), values_data, nullptr));
+
+      // Upload new RHS
+      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
+
+      // Reset X to zero
+      AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
+
+      reuse_success = true;
+
     }
 
-    AMGX_SAFE_CALL(AMGX_resources_create_simple(&rsrc, cfg));
+    if (!cache_hit)
+    {
 
-    // Create Matrix and Vectors
-    AMGX_SAFE_CALL(AMGX_matrix_create(&A, rsrc, mode));
-    AMGX_SAFE_CALL(AMGX_vector_create(&x_vec, rsrc, mode));
-    AMGX_SAFE_CALL(AMGX_vector_create(&b_vec, rsrc, mode));
-    AMGX_SAFE_CALL(AMGX_solver_create(&solver, rsrc, mode, cfg));
+      // Create new resources
+      // Use teplated mode
+      const AMGX_Mode mode = Mode;
 
-    // 4. Bind Data (No Copies)
-    // Upload matrix data (binds device pointers)
-    AMGX_SAFE_CALL(AMGX_matrix_upload_all(A, n_rows, (int)values.element_count(), 1, 1,
-                                          row_ptrs_data, col_indices_data, values_data, nullptr));
+      // Prepare configuration
+      std::string config_str(config);
 
-    // Bind RHS vector
-    AMGX_SAFE_CALL(AMGX_vector_upload(b_vec, n_rows, 1, b_data));
+      // Attempt to open as file to determine if it's a file path
+      std::ifstream file_check(config_str);
+      bool is_file = file_check.good();
+      file_check.close(); // Close the stream before AmgX tries to read
 
-    // Initialize solution vector to zero
-    AMGX_SAFE_CALL(AMGX_vector_set_zero(x_vec, n_rows, 1));
+      if (is_file)
+      {
+        AMGX_SAFE_CALL(AMGX_config_create_from_file(&res.cfg, config_str.c_str()));
+      }
+      else
+      {
+        AMGX_SAFE_CALL(AMGX_config_create(&res.cfg, config_str.c_str()));
+      }
+
+      // Determine allocation strategy based on cache size.
+      bool is_isolated = false; // Default to Shared Mode (Mode 1+)
+      const char* env_val = std::getenv("JAXAMG_CACHE_SIZE");
+      if (env_val) {
+        try {
+            unsigned long val = std::stoul(env_val);
+            if (val == 0) is_isolated = true;
+        } catch(...) {
+        }
+      }
+
+      if (is_isolated) {
+         // Mode 0: Isolated Resources
+         res.owns_resources = true;
+         AMGX_SAFE_CALL(AMGX_resources_create_simple(&res.rsrc, res.cfg));
+      } else {
+         // Mode 1+: Shared Global Resources
+         res.owns_resources = false;
+         res.rsrc = GlobalResources::Get().GetHandle(res.cfg);
+      }
+
+      // Create Matrix and Vectors
+      AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, mode));
+      AMGX_SAFE_CALL(AMGX_vector_create(&res.x_vec, res.rsrc, mode));
+      AMGX_SAFE_CALL(AMGX_vector_create(&res.b_vec, res.rsrc, mode));
+      AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, mode, res.cfg));
+
+      // Bind Data (No Copies)
+      // Upload matrix data (binds device pointers)
+
+      AMGX_SAFE_CALL(AMGX_matrix_upload_all(res.A, n_rows, (int)values.element_count(), 1, 1,
+                                            row_ptrs_data, col_indices_data, values_data, nullptr));
+
+      // Bind RHS vector
+      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
+
+      // Initialize solution vector to zero
+      AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
+    }
 
     // 5. Solve System
-    AMGX_SAFE_CALL(AMGX_solver_setup(solver, A));
-    AMGX_SAFE_CALL(AMGX_solver_solve(solver, b_vec, x_vec));
+    AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
+    AMGX_SAFE_CALL(AMGX_solver_solve(res.solver, res.b_vec, res.x_vec));
 
     // 6. Retrieve Results & Statistics
     AMGX_SOLVE_STATUS status;
-    AMGX_SAFE_CALL(AMGX_solver_get_status(solver, &status));
+    AMGX_SAFE_CALL(AMGX_solver_get_status(res.solver, &status));
 
     if (status == AMGX_SOLVE_FAILED)
     {
-      // Clean up before returning error
-      AMGX_solver_destroy(solver);
-      AMGX_vector_destroy(b_vec);
-      AMGX_vector_destroy(x_vec);
-      AMGX_matrix_destroy(A);
-      AMGX_resources_destroy(rsrc);
-      AMGX_config_destroy(cfg);
       return ffi::Error::Internal("AmgX solve failed");
     }
 
     int iters = 0;
     double residual = 0.0;
 
-    AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(solver, &iters));
+    AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(res.solver, &iters));
 
     // Retrieve residual at the final iteration
-    AMGX_SAFE_CALL(AMGX_solver_get_iteration_residual(solver, iters, 0, &residual));
+    AMGX_SAFE_CALL(AMGX_solver_get_iteration_residual(res.solver, iters, 0, &residual));
 
     // Transfer stats to output buffer [iters, residual, status]
     T stats_host[3] = {
@@ -210,18 +493,19 @@ namespace
     cudaMemcpyAsync(stats_data, stats_host, 3 * sizeof(T), cudaMemcpyHostToDevice, stream);
 
     // Download solution (copies from AmgX internal buffer to JAX output buffer)
-    AMGX_SAFE_CALL(AMGX_vector_download(x_vec, x_data));
+    AMGX_SAFE_CALL(AMGX_vector_download(res.x_vec, x_data));
 
-    // 7. Cleanup
-    AMGX_SAFE_CALL(AMGX_solver_destroy(solver));
-    AMGX_SAFE_CALL(AMGX_vector_destroy(b_vec));
-    AMGX_SAFE_CALL(AMGX_vector_destroy(x_vec));
-    AMGX_SAFE_CALL(AMGX_matrix_destroy(A));
-    AMGX_SAFE_CALL(AMGX_resources_destroy(rsrc));
-    AMGX_SAFE_CALL(AMGX_config_destroy(cfg));
+    // 7. Store in Cache (if new)
+    if (!cache_hit)
+    {
+       GetSolverCache().put(key, res, DestroyResources);
+    }
+    // Do NOT destroy resources here! They are now owned by the cache.
+    // Cleanup happens only on eviction via DestroyResources.
 
     return ffi::Error::Success();
   }
+
 
   /*
    * AmgxSolveMPIInternal: MPI-aware templated core implementation.
@@ -641,5 +925,9 @@ PYBIND11_MODULE(_amgx, m)
         { return py::capsule(reinterpret_cast<void *>(AmgxAllGather)); });
   m.def("get_amgx_allgather_double_handler", []()
         { return py::capsule(reinterpret_cast<void *>(AmgxAllGatherDouble)); });
-  m.def("finalize", &AmgxFinalize, "Finalize AMGX (call before MPI_FINALIZE in MPI mode)");
+
+  m.def("initialize", &EnsureAmgxInitialized);
+  m.def("finalize", &AmgxFinalize);
+  m.def("clear_solver_cache", []()
+        { GetSolverCache().clear(DestroyResources); });
 }

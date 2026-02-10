@@ -6,6 +6,8 @@ from .cache import (
 from .jaxamg import (
     AMGXStatus,
     amg_solve,
+    clear_solver_cache,
+    finalize,
 )
 
 # User-friendly alias
@@ -18,4 +20,7 @@ __all__ = [
     "cache_coloring",
     "cache_mpi_metadata",
     "AMGXStatus",
+    "AMGXStatus",
+    "clear_solver_cache",
+    "finalize",
 ]

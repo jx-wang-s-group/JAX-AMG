@@ -477,3 +477,21 @@ def amg_solve(
 
     info = {"iterations": iter_val, "residual": res_val, "status": status_val}
     return x, info
+
+
+def clear_solver_cache() -> None:
+    """
+    Clear the internal C++ AmgX solver cache.
+    This releases all cached AmgX resources (matrices, solvers, vectors).
+    """
+    _amgx.clear_solver_cache()
+
+
+def finalize() -> None:
+    """
+    Manually finalize AmgX resources.
+    This clears the cache and calls AMGX_finalize.
+    Normally called automatically at exit via atexit.
+    """
+    clear_solver_cache()
+    _amgx.finalize()
