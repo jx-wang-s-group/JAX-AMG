@@ -37,4 +37,5 @@ plugins:
 
 nav:
   - Home: index.md
+  - Caching: caching.md
   - API Reference: api.md
