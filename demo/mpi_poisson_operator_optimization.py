@@ -8,18 +8,11 @@ Usage:
     mpirun -n 4 python demo/mpi_poisson_operator_optimization.py
 """
 
-import os
-
 import jax
 import jax.numpy as jnp
 from mpi4py import MPI
 
-from jaxamg import (
-    amg_solve,
-    cache_coloring,
-    cache_mpi_metadata,
-    with_cache,
-)
+import jaxamg
 from jaxamg.matrices import (
     poisson_operator,
     poisson_operator_distributed,
@@ -34,10 +27,6 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     nranks = comm.Get_size()
-
-    gpu_ids = [0, 1, 3, 4]
-    gpu_id = gpu_ids[rank]
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     # Problem size
     grid_size = 16
@@ -56,7 +45,7 @@ def main():
         b_global = rhs_ones(n_global)
         A_true = poisson_operator(true_skew)
 
-        x_target_global, info = amg_solve(
+        x_target_global, info = jaxamg.solve(
             A_true,
             b_global,
             solver="PBICGSTAB",
@@ -91,12 +80,12 @@ def main():
     dummy_op = poisson_operator_distributed(grid_size, row_start, row_end, skew=1.0)
 
     # Cache MPI metadata
-    mpi_cache = cache_mpi_metadata(
+    mpi_cache = jaxamg.cache_mpi_metadata(
         config, comm, n_global, (row_start, row_end), dummy_op
     )
 
     # Cache coloring
-    coloring_cache = cache_coloring(dummy_op, shape=(n_local, n_global))
+    coloring_cache = jaxamg.cache_coloring(dummy_op, shape=(n_local, n_global))
 
     if rank == 0:
         print("\nStarting optimization...")
@@ -105,9 +94,9 @@ def main():
     # @jax.jit
     def loss_local(skew, b_loc, x_true_loc):
         op = poisson_operator_distributed(grid_size, row_start, row_end, skew=skew)
-        A = with_cache(op, coloring=coloring_cache, mpi=mpi_cache)
+        A = jaxamg.with_cache(op, coloring=coloring_cache, mpi=mpi_cache)
 
-        x_pred_loc, info = amg_solve(A, b_loc)
+        x_pred_loc, info = jaxamg.solve(A, b_loc)
 
         loss = jnp.sum((x_pred_loc - x_true_loc) ** 2) / n_global
         return loss
@@ -145,6 +134,9 @@ def main():
 
     if rank == 0:
         print(f"\nFinal skew: {skew_init:.4f}, True skew: {true_skew:.4f}")
+
+    comm.Barrier()
+    jaxamg.finalize()
 
 
 if __name__ == "__main__":

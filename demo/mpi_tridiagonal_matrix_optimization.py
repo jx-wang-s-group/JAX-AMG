@@ -8,13 +8,11 @@ Usage:
     mpirun -n 4 python demo/mpi_tridiagonal_matrix_optimization.py
 """
 
-import os
-
 import jax
 import jax.numpy as jnp
 from mpi4py import MPI
 
-from jaxamg import amg_solve, cache_mpi_metadata, with_cache
+import jaxamg
 from jaxamg.matrices import (
     rhs_ones,
     tridiagonal_matrix_distributed,
@@ -30,10 +28,6 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     nranks = comm.Get_size()
-
-    gpu_ids = [1, 3]
-    gpu_id = gpu_ids[rank]
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     n_global = 512
 
@@ -51,7 +45,7 @@ def main():
     if rank == 0:
         b_global = rhs_ones(n_global)
         A_true = tridiagonal_operator(true_diag)
-        x_target_global, _ = amg_solve(A_true, b_global)
+        x_target_global, _ = jaxamg.solve(A_true, b_global)
     else:
         x_target_global = None
 
@@ -85,7 +79,7 @@ def main():
         diagonal_value=diag_init,
     )
 
-    mpi_cache = cache_mpi_metadata(
+    mpi_cache = jaxamg.cache_mpi_metadata(
         config, comm, n_global, (row_start, row_end), dummy_A
     )
 
@@ -99,8 +93,8 @@ def main():
             diagonal_value=diag,
         )
 
-        A = with_cache(A_loc, mpi=mpi_cache, is_symmetric=True)
-        x_pred_loc, _ = amg_solve(A, b_loc)
+        A = jaxamg.with_cache(A_loc, mpi=mpi_cache, is_symmetric=True)
+        x_pred_loc, _ = jaxamg.solve(A, b_loc)
 
         loss_loc = jnp.sum((x_pred_loc - x_true_loc) ** 2)
         return loss_loc
@@ -141,6 +135,9 @@ def main():
     if rank == 0:
         print()
         print(f"Final diag: {diag_init:.4f}, True diag: {true_diag:.4f}")
+
+    comm.Barrier()
+    jaxamg.finalize()
 
 
 if __name__ == "__main__":

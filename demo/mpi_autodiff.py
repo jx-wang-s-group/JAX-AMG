@@ -8,14 +8,12 @@ Usage:
     mpirun -n 3 python demo/mpi_autodiff.py
 """
 
-import os
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 from mpi4py import MPI
 
-from jaxamg import amg_solve, cache_mpi_metadata, with_cache
+import jaxamg
 from jaxamg.matrices import (
     rhs_random,
     tridiagonal_matrix,
@@ -29,10 +27,6 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     nranks = comm.Get_size()
-
-    gpu_ids = [0, 1, 2]
-    gpu_id = gpu_ids[rank]
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     n_global = 1024
 
@@ -66,16 +60,16 @@ def main():
     }
 
     # Pre-cache MPI metadata
-    mpi_cache = cache_mpi_metadata(
+    mpi_cache = jaxamg.cache_mpi_metadata(
         config, comm, n_global, (row_start, row_end), A_local
     )
 
     # Attach MPI cache to matrix
-    A_local = with_cache(A_local, mpi=mpi_cache)
+    A_local = jaxamg.with_cache(A_local, mpi=mpi_cache, is_symmetric=True)
 
     def loss_fn(b_loc):
         """Loss function using cached MPI metadata - JIT will be applied to grad."""
-        x_loc, _ = amg_solve(A_local, b_loc)
+        x_loc, _ = jaxamg.solve(A_local, b_loc)
         return jnp.sum(x_loc**2)
 
     # JIT-compile the gradient computation
@@ -101,7 +95,7 @@ def main():
         A_global = tridiagonal_matrix(n_global, dtype=jnp.float64)
 
         def loss_fn_ref(b_vec):
-            x_ref, _ = amg_solve(A_global, b_vec, config=config)
+            x_ref, _ = jaxamg.solve(A_global, b_vec, config=config)
             return jnp.sum(x_ref**2)
 
         loss_ref, grad_ref = jax.value_and_grad(loss_fn_ref)(b_global)
@@ -115,6 +109,9 @@ def main():
         print(f"  Loss (single-GPU): {loss_ref:.4e}")
         print(f"  Loss relative error: {loss_error:.2e}")
         print(f"  Gradient relative error: {grad_error:.2e}")
+
+    comm.Barrier()
+    jaxamg.finalize()
 
 
 if __name__ == "__main__":

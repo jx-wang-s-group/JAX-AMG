@@ -5,13 +5,12 @@ Usage:
     mpirun -n 4 python demo/mpi_large_random_matrix.py
 """
 
-import os
 import time
 
 import jax.numpy as jnp
 from mpi4py import MPI
 
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.matrices import random_matrix_distributed, rhs_random
 
 
@@ -20,10 +19,6 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     nranks = comm.Get_size()
-
-    gpu_ids = [0, 1, 3]
-    gpu_id = gpu_ids[rank]
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     n = 100000
 
@@ -58,7 +53,7 @@ def main():
     }
 
     t_start = time.time()
-    x_local, info = amg_solve(
+    x_local, info = jaxamg.solve(
         A_local,
         b_local,
         config=config,
@@ -69,6 +64,7 @@ def main():
     solve_time = time.time() - t_start
 
     comm.Barrier()
+    jaxamg.finalize()
 
     if rank == 0:
         print(f"  Info: {info}")

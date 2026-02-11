@@ -8,13 +8,12 @@ Demonstrates distributed solving across multiple GPUs with MPI. Local
 matrices are created via automatic partitioning of the global matrix.
 """
 
-import os
 import time
 
 import jax.numpy as jnp
 from mpi4py import MPI
 
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.matrices import poisson_matrix, rhs_linear
 from jaxamg.mpi_utils import (
     gather_solution,
@@ -29,10 +28,6 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     nranks = comm.Get_size()
-
-    gpu_ids = [0, 1, 2, 3]
-    gpu_id = gpu_ids[rank]
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     grid_size = 32
     n = grid_size**2
@@ -86,7 +81,7 @@ def main():
     }
 
     t_start = time.time()
-    x_local, info = amg_solve(
+    x_local, info = jaxamg.solve(
         A_local,
         b_local,
         config=config,
@@ -108,7 +103,7 @@ def main():
 
     if rank == 0:
         print("Validating against single-GPU result...")
-        x_ref, info_ref = amg_solve(
+        x_ref, info_ref = jaxamg.solve(
             poisson_matrix(grid_size),
             rhs_linear(n),
             config=config,
@@ -122,6 +117,9 @@ def main():
         print(f"  First 5 entries (MPI solution): {x_mpi[:5]}")
         print(f"  First 5 entries (single-GPU solution): {x_ref[:5]}")
         print(f"  Relative error: {diff:.2e}")
+
+    comm.Barrier()
+    jaxamg.finalize()
 
 
 if __name__ == "__main__":

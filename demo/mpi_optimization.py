@@ -8,14 +8,12 @@ Usage:
     mpirun -n 3 python demo/mpi_optimization.py
 """
 
-import os
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 from mpi4py import MPI
 
-from jaxamg import amg_solve, cache_mpi_metadata, with_cache
+import jaxamg
 from jaxamg.matrices import tridiagonal_matrix, tridiagonal_matrix_distributed
 
 jax.config.update("jax_enable_x64", True)
@@ -25,10 +23,6 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     nranks = comm.Get_size()
-
-    gpu_ids = [0, 1, 2]
-    gpu_id = gpu_ids[rank]
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     n_global = 64
 
@@ -56,14 +50,14 @@ def main():
     # Cache MPI metadata for JIT-compatible solver usage
     if rank == 0:
         print("Caching MPI metadata for JIT...")
-    mpi_cache = cache_mpi_metadata(
+    mpi_cache = jaxamg.cache_mpi_metadata(
         config, comm, n_global, (row_start, row_end), A_local
     )
 
     # Define loss function
     def loss_local(b_loc):
-        A = with_cache(A_local, mpi=mpi_cache)
-        x_loc, _ = amg_solve(A, b_loc)
+        A = jaxamg.with_cache(A_local, mpi=mpi_cache)
+        x_loc, _ = jaxamg.solve(A, b_loc)
         return jnp.sum(x_loc * x_loc)
 
     # JIT-compiled loss and gradient function
@@ -136,7 +130,7 @@ def main():
             A_global = tridiagonal_matrix(
                 n_global, diagonal_value=4.0, dtype=jnp.float64
             )
-            x_ref, _ = amg_solve(A_global, b_final_global, solver="CG")
+            x_ref, _ = jaxamg.solve(A_global, b_final_global, solver="CG")
             loss_ref = float(jnp.sum(x_ref * x_ref))
 
             print(f"  MPI loss:        {loss_current_global:.6e}")
@@ -146,6 +140,9 @@ def main():
             )
     else:
         comm.gather(np.array(b_current), root=0)
+
+    comm.Barrier()
+    jaxamg.finalize()
 
 
 if __name__ == "__main__":
