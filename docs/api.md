@@ -32,3 +32,15 @@ This page documents the public API of `jaxamg`.
     options:
         show_root_heading: true
         show_source: false
+
+## Runtime Utilities
+
+::: jaxamg.clear_solver_cache
+    options:
+        show_root_heading: true
+        show_source: false
+
+::: jaxamg.finalize
+    options:
+        show_root_heading: true
+        show_source: false
