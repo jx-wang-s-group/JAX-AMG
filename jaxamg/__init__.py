@@ -20,7 +20,6 @@ __all__ = [
     "cache_coloring",
     "cache_mpi_metadata",
     "AMGXStatus",
-    "AMGXStatus",
     "clear_solver_cache",
     "finalize",
 ]
