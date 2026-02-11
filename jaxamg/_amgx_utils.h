@@ -8,16 +8,19 @@
 
 #include <cuda_runtime.h>
 #include <amgx_c.h>
+#include <mpi.h>
 #include <xla/ffi/api/ffi.h>
 #include <cstdio>
 #include <mutex>
 #include <atomic>
 #include <string>
+#include <fstream>
 #include <vector>
 #include <list>
 #include <unordered_map>
 #include <functional>
 #include <utility>
+#include <string_view>
 
 namespace ffi = xla::ffi;
 
@@ -164,6 +167,47 @@ namespace
              config == other.config;
     }
   };
+
+  // FNV-1a hash of byte sequences.
+  inline size_t fnv1a_hash(const void *data, size_t len)
+  {
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    size_t hash = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; ++i)
+    {
+      hash ^= bytes[i];
+      hash *= 1099511628211ULL;
+    }
+    return hash;
+  }
+
+  struct MPICacheKey
+  {
+    // No device pointers: JAX eager calls get new addresses each time, causing
+    // cache thrashing. Value-based keys + structure_hash (FNV-1a of row_ptrs
+    // content) ensure stable hits and correct structural identity for
+    // AMGX_matrix_replace_coefficients on the cache-hit path.
+    int n_local;
+    int n_global;
+    int nnz;
+    int lrank;
+    int mode; // AMGX_Mode (dFFI vs dDDI) to distinguish f32/f64
+    uint64_t comm_ptr;
+    size_t structure_hash;
+    std::string config;
+
+    bool operator==(const MPICacheKey &other) const
+    {
+      return n_local == other.n_local &&
+             n_global == other.n_global &&
+             nnz == other.nnz &&
+             lrank == other.lrank &&
+             mode == other.mode &&
+             comm_ptr == other.comm_ptr &&
+             structure_hash == other.structure_hash &&
+             config == other.config;
+    }
+  };
 } // namespace
 
 namespace std
@@ -183,6 +227,25 @@ namespace std
       return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4);
     }
   };
+
+  template <>
+  struct hash<MPICacheKey>
+  {
+    size_t operator()(const MPICacheKey &k) const
+    {
+      size_t h1 = hash<int>()(k.n_local);
+      size_t h2 = hash<int>()(k.n_global);
+      size_t h3 = hash<int>()(k.nnz);
+      size_t h4 = hash<int>()(k.lrank);
+      size_t h5 = hash<int>()(k.mode);
+      size_t h6 = hash<uint64_t>()(k.comm_ptr);
+      size_t h7 = hash<size_t>()(k.structure_hash);
+      size_t h8 = hash<string>()(k.config);
+
+      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^
+             (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7);
+    }
+  };
 } // namespace std
 
 namespace
@@ -196,6 +259,18 @@ namespace
     AMGX_vector_handle x_vec;
     AMGX_vector_handle b_vec;
     bool owns_resources; // True if isolated (Cache=0), False if shared (Cache>=1)
+  };
+
+  struct CachedMPIResources
+  {
+    AMGX_config_handle cfg = nullptr;
+    AMGX_resources_handle rsrc = nullptr;
+    AMGX_matrix_handle A = nullptr;
+    AMGX_solver_handle solver = nullptr;
+    AMGX_vector_handle x_vec = nullptr;
+    AMGX_vector_handle b_vec = nullptr;
+    void *values_buf = nullptr; // Persistent buffer for replace_coefficients
+    bool owns_resources = false; // True if isolated (Cache=0), False if shared (Cache>=1)
   };
 
   // Global cache instance (heap-allocated to persist until explicit finalization).
@@ -217,6 +292,38 @@ namespace
       return new LRUCache<CacheKey, CachedResources>(capacity);
     }();
     return *cache;
+  }
+
+  LRUCache<MPICacheKey, CachedMPIResources>& GetMPISolverCache()
+  {
+    static auto* cache = []() {
+      size_t capacity = 1;
+      const char* env_val = std::getenv("JAXAMG_CACHE_SIZE");
+      if (env_val) {
+        try {
+          capacity = std::stoul(env_val);
+        } catch (...) {
+          capacity = 1;
+        }
+      }
+
+      return new LRUCache<MPICacheKey, CachedMPIResources>(capacity);
+    }();
+    return *cache;
+  }
+
+  inline AMGX_RC CreateAmgxConfigFromStringOrFile(std::string_view config, AMGX_config_handle *cfg)
+  {
+    std::string config_str(config);
+    std::ifstream file_check(config_str);
+    bool is_file = file_check.good();
+    file_check.close();
+
+    if (is_file)
+    {
+      return AMGX_config_create_from_file(cfg, config_str.c_str());
+    }
+    return AMGX_config_create(cfg, config_str.c_str());
   }
 
   inline void DestroyResources(CachedResources &res)
@@ -247,6 +354,30 @@ namespace
     {
       // Swallow all exceptions during destruction to prevent 'terminate' on exit
       // invalid_argument from CUDA is common during shutdown if context is gone
+    }
+  }
+
+  inline void DestroyMPIResources(CachedMPIResources &res)
+  {
+    try
+    {
+      if (cudaDeviceSynchronize() != cudaSuccess) {
+        return;
+      }
+
+      if (res.solver) AMGX_solver_destroy(res.solver);
+      if (res.b_vec) AMGX_vector_destroy(res.b_vec);
+      if (res.x_vec) AMGX_vector_destroy(res.x_vec);
+      if (res.A) AMGX_matrix_destroy(res.A);
+      // Only destroy resources handle in Isolated Mode (Cache=0).
+      if (res.owns_resources) {
+        if (res.rsrc) AMGX_resources_destroy(res.rsrc);
+      }
+      if (res.cfg) AMGX_config_destroy(res.cfg);
+      if (res.values_buf) cudaFree(res.values_buf);
+    }
+    catch (...)
+    {
     }
   }
 
@@ -285,8 +416,42 @@ namespace
       std::mutex mutex_;
   };
 
+  // Singleton for global MPI AmgX resource management. Shares one
+  // AMGX_resources_handle across all MPI cache entries so multiple
+  // matrix/solver pairs can coexist on the same communicator.
+  class GlobalMPIResources {
+  public:
+      static GlobalMPIResources& Get() {
+          static GlobalMPIResources* instance = new GlobalMPIResources();
+          return *instance;
+      }
+
+      AMGX_resources_handle GetHandle(AMGX_config_handle cfg,
+                                       MPI_Comm *comm, int ndevs, int *devs) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (!handle_) {
+              AMGX_SAFE_CALL_VOID(AMGX_resources_create(&handle_, cfg, comm, ndevs, devs));
+          }
+          return handle_;
+      }
+
+      void Destroy() {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (handle_) {
+              AMGX_SAFE_CALL_VOID(AMGX_resources_destroy(handle_));
+              handle_ = nullptr;
+          }
+      }
+
+  private:
+      GlobalMPIResources() : handle_(nullptr) {}
+      ~GlobalMPIResources() { Destroy(); }
+
+      AMGX_resources_handle handle_;
+      std::mutex mutex_;
+  };
+
   std::once_flag g_amgx_init_flag;
-  std::atomic<bool> g_amgx_finalized{false};
 
   // Custom callback to suppress AmgX library output (banners, version info)
   inline void PrintCallback(const char *msg, int length)
@@ -310,16 +475,12 @@ namespace
 
   inline void AmgxFinalize()
   {
-    bool expected = false;
-    if (g_amgx_finalized.compare_exchange_strong(expected, true)) {
-        // Clear cache and destroy all resources before finalizing AMGX
-        GetSolverCache().clear(DestroyResources);
-
-        // Destroy the global resources handle explicitly
-        GlobalResources::Get().Destroy();
-
-        // AMGX_SAFE_CALL_VOID(AMGX_finalize()); // Disable to avoid SEGFAULT at exit
-    }
+    // Clear caches and destroy global resources. Safe to call multiple times:
+    // clear() on an empty cache is a no-op, Destroy() checks for null.
+    GetSolverCache().clear(DestroyResources);
+    GetMPISolverCache().clear(DestroyMPIResources);
+    GlobalResources::Get().Destroy();
+    GlobalMPIResources::Get().Destroy();
   }
 
   // Check if CUDA-aware MPI should be used (respects MPI4JAX convention)

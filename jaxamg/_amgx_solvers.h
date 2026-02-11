@@ -96,22 +96,7 @@ namespace
       // Use teplated mode
       const AMGX_Mode mode = Mode;
 
-      // Prepare configuration
-      std::string config_str(config);
-
-      // Attempt to open as file to determine if it's a file path
-      std::ifstream file_check(config_str);
-      bool is_file = file_check.good();
-      file_check.close(); // Close the stream before AmgX tries to read
-
-      if (is_file)
-      {
-        AMGX_SAFE_CALL(AMGX_config_create_from_file(&res.cfg, config_str.c_str()));
-      }
-      else
-      {
-        AMGX_SAFE_CALL(AMGX_config_create(&res.cfg, config_str.c_str()));
-      }
+      AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
 
       // Determine allocation strategy based on cache size.
       bool is_isolated = false; // Default to Shared Mode (Mode 1+)
@@ -260,85 +245,117 @@ namespace
     const int n_local = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
     const int nnz = static_cast<int>(values.element_count());
 
-    // Initialize AMGX resources with MPI
-    AMGX_config_handle cfg;
-    AMGX_resources_handle rsrc;
-    AMGX_matrix_handle A;
-    AMGX_vector_handle x_vec, b_vec;
-    AMGX_solver_handle solver;
+    CachedMPIResources res;
 
-    std::string config_str(config);
-    std::ifstream file_check(config_str);
-    bool is_file = file_check.good();
-    file_check.close();
+    // Hash row_ptrs content to fingerprint sparsity structure (small D2H copy).
+    std::vector<int> h_row_ptrs(n_local + 1);
+    cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+    size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_local + 1) * sizeof(int));
 
-    if (is_file)
+    MPICacheKey key = {
+        n_local,
+        nglobal_host,
+        nnz,
+        lrank_host,
+        static_cast<int>(Mode),
+        comm_ptr_val,
+        structure_hash,
+        std::string(config)};
+    bool cache_hit = GetMPISolverCache().get(key, res);
+
+    if (cache_hit)
     {
-      AMGX_SAFE_CALL(AMGX_config_create_from_file(&cfg, config_str.c_str()));
+      // Same structure (guaranteed by structure_hash). Replace values only.
+      cudaMemcpy(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice);
+      AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
+          res.A, n_local, nnz, res.values_buf, nullptr));
+      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
+      std::vector<T> h_x(n_local, static_cast<T>(0));
+      AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
     }
     else
     {
-      AMGX_SAFE_CALL(AMGX_config_create(&cfg, config_str.c_str()));
+      AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
+
+      // Determine allocation strategy based on cache size.
+      bool is_isolated = false;
+      const char* env_val = std::getenv("JAXAMG_CACHE_SIZE");
+      if (env_val) {
+        try {
+          if (std::stoul(env_val) == 0) is_isolated = true;
+        } catch(...) {}
+      }
+
+      if (is_isolated) {
+        res.owns_resources = true;
+        AMGX_SAFE_CALL(AMGX_resources_create(&res.rsrc, res.cfg, mpi_comm, 1, &lrank_host));
+      } else {
+        res.owns_resources = false;
+        res.rsrc = GlobalMPIResources::Get().GetHandle(res.cfg, mpi_comm, 1, &lrank_host);
+      }
+      AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
+      AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, Mode, res.cfg));
+
+      // Persistent buffer for values, registered with AMGX's DistributedManager.
+      if (cudaMalloc(&res.values_buf, nnz * sizeof(T)) != cudaSuccess)
+      {
+        return ffi::Error::Internal("cudaMalloc for values buffer failed");
+      }
+      cudaMemcpy(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice);
+
+      int nrings = 1;
+      AMGX_SAFE_CALL(AMGX_config_get_default_number_of_rings(res.cfg, &nrings));
+
+      AMGX_SAFE_CALL(AMGX_matrix_upload_all_global(
+          res.A, nglobal_host, n_local, nnz, 1, 1,
+          row_ptrs_data, col_indices_data, static_cast<T *>(res.values_buf), nullptr,
+          nrings, nrings, nullptr));
+
+      // Create and initialize vectors (AMGX manages halo space)
+      AMGX_SAFE_CALL(AMGX_vector_create(&res.x_vec, res.rsrc, Mode));
+      AMGX_SAFE_CALL(AMGX_vector_create(&res.b_vec, res.rsrc, Mode));
+      AMGX_SAFE_CALL(AMGX_vector_bind(res.x_vec, res.A));
+      AMGX_SAFE_CALL(AMGX_vector_bind(res.b_vec, res.A));
+
+      std::vector<T> h_x(n_local, static_cast<T>(0));
+      AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
+      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
     }
 
-    AMGX_SAFE_CALL(AMGX_resources_create(&rsrc, cfg, mpi_comm, 1, &lrank_host));
-    AMGX_SAFE_CALL(AMGX_matrix_create(&A, rsrc, Mode));
-    AMGX_SAFE_CALL(AMGX_solver_create(&solver, rsrc, Mode, cfg));
-
-    // Upload distributed matrix with global column indices
-    int nrings = 1;
-    AMGX_config_get_default_number_of_rings(cfg, &nrings);
-
-    AMGX_SAFE_CALL(AMGX_matrix_upload_all_global(
-        A, nglobal_host, n_local, nnz, 1, 1,
-        row_ptrs_data, col_indices_data, values_data, nullptr,
-        nrings, nrings, nullptr));
-
-    // Create and initialize vectors (AMGX manages halo space)
-    AMGX_SAFE_CALL(AMGX_vector_create(&x_vec, rsrc, Mode));
-    AMGX_SAFE_CALL(AMGX_vector_create(&b_vec, rsrc, Mode));
-    AMGX_SAFE_CALL(AMGX_vector_bind(x_vec, A));
-    AMGX_SAFE_CALL(AMGX_vector_bind(b_vec, A));
-
-    std::vector<T> h_x(n_local, 0);
-    AMGX_SAFE_CALL(AMGX_vector_upload(x_vec, n_local, 1, h_x.data()));
-    AMGX_SAFE_CALL(AMGX_vector_upload(b_vec, n_local, 1, b_data));
-
     // Solve
-    AMGX_SAFE_CALL(AMGX_solver_setup(solver, A));
-    AMGX_SAFE_CALL(AMGX_solver_solve(solver, b_vec, x_vec));
+    AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
+    AMGX_SAFE_CALL(AMGX_solver_solve(res.solver, res.b_vec, res.x_vec));
 
     // Retrieve results
     AMGX_SOLVE_STATUS status;
-    AMGX_SAFE_CALL(AMGX_solver_get_status(solver, &status));
+    AMGX_SAFE_CALL(AMGX_solver_get_status(res.solver, &status));
 
     if (status == AMGX_SOLVE_FAILED)
     {
-      AMGX_solver_destroy(solver);
-      AMGX_vector_destroy(b_vec);
-      AMGX_vector_destroy(x_vec);
-      AMGX_matrix_destroy(A);
-      AMGX_resources_destroy(rsrc);
-      AMGX_config_destroy(cfg);
+      if (!cache_hit)
+      {
+        DestroyMPIResources(res);
+      }
       return ffi::Error::Internal("AmgX MPI solve failed");
     }
 
     int iters = 0;
     double residual = 0.0;
-    AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(solver, &iters));
-    AMGX_SAFE_CALL(AMGX_solver_get_iteration_residual(solver, iters, 0, &residual));
+    AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(res.solver, &iters));
+    AMGX_SAFE_CALL(AMGX_solver_get_iteration_residual(res.solver, iters, 0, &residual));
 
     T stats_host[3] = {static_cast<T>(iters), static_cast<T>(residual), static_cast<T>(status)};
     cudaMemcpyAsync(stats_data, stats_host, 3 * sizeof(T), cudaMemcpyHostToDevice, stream);
-    AMGX_SAFE_CALL(AMGX_vector_download(x_vec, x_data));
+    AMGX_SAFE_CALL(AMGX_vector_download(res.x_vec, x_data));
 
-    // Cleanup
-    AMGX_SAFE_CALL(AMGX_solver_destroy(solver));
-    AMGX_SAFE_CALL(AMGX_vector_destroy(b_vec));
-    AMGX_SAFE_CALL(AMGX_vector_destroy(x_vec));
-    AMGX_SAFE_CALL(AMGX_matrix_destroy(A));
-    AMGX_SAFE_CALL(AMGX_resources_destroy(rsrc));
-    AMGX_SAFE_CALL(AMGX_config_destroy(cfg));
+    if (!cache_hit)
+    {
+      GetMPISolverCache().put(key, res, DestroyMPIResources);
+    }
+
+    // Sync AMGX's internal streams before returning to XLA (required for
+    // JIT forward+backward reuse of cached handles).
+    cudaDeviceSynchronize();
 
     return ffi::Error::Success();
   }

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from jax.test_util import check_grads
 
-from jaxamg import AMGXStatus, amg_solve, cache_mpi_metadata, with_cache
+from jaxamg import AMGXStatus, amg_solve, cache_mpi_metadata, finalize, with_cache
 from jaxamg.matrices import (
     poisson_matrix,
     poisson_matrix_distributed,
@@ -28,7 +28,10 @@ def mpi_context():
     rank = comm.Get_rank()
     nranks = comm.Get_size()
 
-    return comm, rank, nranks
+    yield comm, rank, nranks
+
+    comm.Barrier()
+    finalize()
 
 
 @pytest.mark.mpi(min_size=2)
