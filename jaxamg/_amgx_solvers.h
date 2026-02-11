@@ -258,6 +258,11 @@ namespace
     }
     else
     {
+      // On cache miss, evict first (if full) so we never create a new MPI
+      // resources handle while stale distributed resources are still alive.
+      // This avoids communicator setup crashes under small cache capacities.
+      GetMPISolverCache().evict_lru_if_needed(1, DestroyResources);
+
       AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
 
       if (IsIsolatedMode()) {

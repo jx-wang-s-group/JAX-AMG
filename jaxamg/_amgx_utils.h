@@ -143,6 +143,34 @@ namespace
       cache_map_.clear();
     }
 
+    // Evict LRU entries so there is room for `incoming` new entries.
+    // Returns true if any eviction happened.
+    bool evict_lru_if_needed(size_t incoming, std::function<void(Value &)> destructor)
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+
+      if (capacity_ == 0)
+      {
+        return false;
+      }
+
+      bool evicted = false;
+      while (cache_map_.size() + incoming > capacity_ && !lru_list_.empty())
+      {
+        auto last = lru_list_.end();
+        --last;
+        if (destructor)
+        {
+          destructor(last->second);
+        }
+        cache_map_.erase(last->first);
+        lru_list_.pop_back();
+        evicted = true;
+      }
+
+      return evicted;
+    }
+
   private:
     size_t capacity_;
     std::list<std::pair<Key, Value>> lru_list_;
