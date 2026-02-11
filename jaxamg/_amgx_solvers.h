@@ -68,7 +68,7 @@ namespace
     const int nnz = static_cast<int>(values.element_count());
 
     // 3. Check Cache
-    CacheKey key = {row_ptrs_data, col_indices_data, n_rows, nnz, std::string(config)};
+    CacheKey key = {row_ptrs_data, col_indices_data, n_rows, nnz, static_cast<int>(Mode), std::string(config)};
     bool cache_hit = GetSolverCache().get(key, res);
 
     bool reuse_success = false;
@@ -92,38 +92,21 @@ namespace
     if (!cache_hit)
     {
 
-      // Create new resources
-      // Use teplated mode
-      const AMGX_Mode mode = Mode;
-
       AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
 
-      // Determine allocation strategy based on cache size.
-      bool is_isolated = false; // Default to Shared Mode (Mode 1+)
-      const char* env_val = std::getenv("JAXAMG_CACHE_SIZE");
-      if (env_val) {
-        try {
-            unsigned long val = std::stoul(env_val);
-            if (val == 0) is_isolated = true;
-        } catch(...) {
-        }
-      }
-
-      if (is_isolated) {
-         // Mode 0: Isolated Resources
+      if (IsIsolatedMode()) {
          res.owns_resources = true;
          AMGX_SAFE_CALL(AMGX_resources_create_simple(&res.rsrc, res.cfg));
       } else {
-         // Mode 1+: Shared Global Resources
          res.owns_resources = false;
          res.rsrc = GlobalResources::Get().GetHandle(res.cfg);
       }
 
       // Create Matrix and Vectors
-      AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, mode));
-      AMGX_SAFE_CALL(AMGX_vector_create(&res.x_vec, res.rsrc, mode));
-      AMGX_SAFE_CALL(AMGX_vector_create(&res.b_vec, res.rsrc, mode));
-      AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, mode, res.cfg));
+      AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
+      AMGX_SAFE_CALL(AMGX_vector_create(&res.x_vec, res.rsrc, Mode));
+      AMGX_SAFE_CALL(AMGX_vector_create(&res.b_vec, res.rsrc, Mode));
+      AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, Mode, res.cfg));
 
       // Bind Data (No Copies)
       // Upload matrix data (binds device pointers)
@@ -245,7 +228,7 @@ namespace
     const int n_local = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
     const int nnz = static_cast<int>(values.element_count());
 
-    CachedMPIResources res;
+    CachedResources res;
 
     // Hash row_ptrs content to fingerprint sparsity structure (small D2H copy).
     std::vector<int> h_row_ptrs(n_local + 1);
@@ -277,16 +260,7 @@ namespace
     {
       AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
 
-      // Determine allocation strategy based on cache size.
-      bool is_isolated = false;
-      const char* env_val = std::getenv("JAXAMG_CACHE_SIZE");
-      if (env_val) {
-        try {
-          if (std::stoul(env_val) == 0) is_isolated = true;
-        } catch(...) {}
-      }
-
-      if (is_isolated) {
+      if (IsIsolatedMode()) {
         res.owns_resources = true;
         AMGX_SAFE_CALL(AMGX_resources_create(&res.rsrc, res.cfg, mpi_comm, 1, &lrank_host));
       } else {
@@ -334,7 +308,7 @@ namespace
     {
       if (!cache_hit)
       {
-        DestroyMPIResources(res);
+        DestroyResources(res);
       }
       return ffi::Error::Internal("AmgX MPI solve failed");
     }
@@ -350,7 +324,7 @@ namespace
 
     if (!cache_hit)
     {
-      GetMPISolverCache().put(key, res, DestroyMPIResources);
+      GetMPISolverCache().put(key, res, DestroyResources);
     }
 
     // Sync AMGX's internal streams before returning to XLA (required for

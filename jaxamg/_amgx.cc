@@ -139,6 +139,6 @@ PYBIND11_MODULE(_amgx, m)
   m.def("clear_solver_cache", []()
         {
           GetSolverCache().clear(DestroyResources);
-          GetMPISolverCache().clear(DestroyMPIResources);
+          GetMPISolverCache().clear(DestroyResources);
         });
 }

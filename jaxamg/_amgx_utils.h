@@ -156,7 +156,8 @@ namespace
     const void *col_indices;
     int n_rows;
     int nnz;
-    std::string config; // Config string content acts as part of key
+    int mode; // AMGX_Mode (dFFI vs dDDI) to distinguish f32/f64
+    std::string config;
 
     bool operator==(const CacheKey &other) const
     {
@@ -164,6 +165,7 @@ namespace
              col_indices == other.col_indices &&
              n_rows == other.n_rows &&
              nnz == other.nnz &&
+             mode == other.mode &&
              config == other.config;
     }
   };
@@ -217,14 +219,14 @@ namespace std
   {
     size_t operator()(const CacheKey &k) const
     {
-      // Simple hash combination
       size_t h1 = hash<const void *>()(k.row_ptrs);
       size_t h2 = hash<const void *>()(k.col_indices);
       size_t h3 = hash<int>()(k.n_rows);
       size_t h4 = hash<int>()(k.nnz);
-      size_t h5 = hash<string>()(k.config);
+      size_t h5 = hash<int>()(k.mode);
+      size_t h6 = hash<string>()(k.config);
 
-      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4);
+      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
     }
   };
 
@@ -250,18 +252,8 @@ namespace std
 
 namespace
 {
+  // Unified cached resource handle for both non-MPI and MPI solvers.
   struct CachedResources
-  {
-    AMGX_config_handle cfg;
-    AMGX_resources_handle rsrc;
-    AMGX_matrix_handle A;
-    AMGX_solver_handle solver;
-    AMGX_vector_handle x_vec;
-    AMGX_vector_handle b_vec;
-    bool owns_resources; // True if isolated (Cache=0), False if shared (Cache>=1)
-  };
-
-  struct CachedMPIResources
   {
     AMGX_config_handle cfg = nullptr;
     AMGX_resources_handle rsrc = nullptr;
@@ -269,46 +261,37 @@ namespace
     AMGX_solver_handle solver = nullptr;
     AMGX_vector_handle x_vec = nullptr;
     AMGX_vector_handle b_vec = nullptr;
-    void *values_buf = nullptr; // Persistent buffer for replace_coefficients
+    void *values_buf = nullptr; // Persistent buffer for MPI replace_coefficients (null for non-MPI)
     bool owns_resources = false; // True if isolated (Cache=0), False if shared (Cache>=1)
   };
 
-  // Global cache instance (heap-allocated to persist until explicit finalization).
+  // Parse JAXAMG_CACHE_SIZE env var (default: 1).
+  inline size_t GetCacheCapacity()
+  {
+    const char *env_val = std::getenv("JAXAMG_CACHE_SIZE");
+    if (env_val)
+    {
+      try { return std::stoul(env_val); }
+      catch (...) {}
+    }
+    return 1;
+  }
+
+  inline bool IsIsolatedMode()
+  {
+    return GetCacheCapacity() == 0;
+  }
+
+  // Global cache instances (heap-allocated to persist until explicit finalization).
   LRUCache<CacheKey, CachedResources>& GetSolverCache()
   {
-    static auto* cache = []() {
-      // Default to 1 (reuse enabled) for shared mode.
-      size_t capacity = 1;
-      const char* env_val = std::getenv("JAXAMG_CACHE_SIZE");
-      if (env_val) {
-        try {
-            capacity = std::stoul(env_val);
-            // capacity allowed to be 0
-        } catch (...) {
-            capacity = 1; // Fallback
-        }
-      }
-
-      return new LRUCache<CacheKey, CachedResources>(capacity);
-    }();
+    static auto* cache = new LRUCache<CacheKey, CachedResources>(GetCacheCapacity());
     return *cache;
   }
 
-  LRUCache<MPICacheKey, CachedMPIResources>& GetMPISolverCache()
+  LRUCache<MPICacheKey, CachedResources>& GetMPISolverCache()
   {
-    static auto* cache = []() {
-      size_t capacity = 1;
-      const char* env_val = std::getenv("JAXAMG_CACHE_SIZE");
-      if (env_val) {
-        try {
-          capacity = std::stoul(env_val);
-        } catch (...) {
-          capacity = 1;
-        }
-      }
-
-      return new LRUCache<MPICacheKey, CachedMPIResources>(capacity);
-    }();
+    static auto* cache = new LRUCache<MPICacheKey, CachedResources>(GetCacheCapacity());
     return *cache;
   }
 
@@ -335,49 +318,23 @@ namespace
           return;
       }
 
-      // Destroy in reverse order of creation
-      // Always destroy solver to prevent leaks. GlobalResources (Shared Mode) persists memory pools.
+      // Destroy in reverse order of creation.
       if (res.solver) AMGX_solver_destroy(res.solver);
-
       if (res.b_vec) AMGX_vector_destroy(res.b_vec);
       if (res.x_vec) AMGX_vector_destroy(res.x_vec);
       if (res.A) AMGX_matrix_destroy(res.A);
 
-      // Only destroy resources handle in Isolated Mode (Mode 0).
+      // Only destroy resources handle in Isolated Mode (Cache=0).
       if (res.owns_resources) {
           if (res.rsrc) AMGX_resources_destroy(res.rsrc);
       }
 
       if (res.cfg) AMGX_config_destroy(res.cfg);
-    }
-    catch (...)
-    {
-      // Swallow all exceptions during destruction to prevent 'terminate' on exit
-      // invalid_argument from CUDA is common during shutdown if context is gone
-    }
-  }
-
-  inline void DestroyMPIResources(CachedMPIResources &res)
-  {
-    try
-    {
-      if (cudaDeviceSynchronize() != cudaSuccess) {
-        return;
-      }
-
-      if (res.solver) AMGX_solver_destroy(res.solver);
-      if (res.b_vec) AMGX_vector_destroy(res.b_vec);
-      if (res.x_vec) AMGX_vector_destroy(res.x_vec);
-      if (res.A) AMGX_matrix_destroy(res.A);
-      // Only destroy resources handle in Isolated Mode (Cache=0).
-      if (res.owns_resources) {
-        if (res.rsrc) AMGX_resources_destroy(res.rsrc);
-      }
-      if (res.cfg) AMGX_config_destroy(res.cfg);
       if (res.values_buf) cudaFree(res.values_buf);
     }
     catch (...)
     {
+      // Swallow all exceptions during destruction to prevent 'terminate' on exit.
     }
   }
 
@@ -478,7 +435,7 @@ namespace
     // Clear caches and destroy global resources. Safe to call multiple times:
     // clear() on an empty cache is a no-op, Destroy() checks for null.
     GetSolverCache().clear(DestroyResources);
-    GetMPISolverCache().clear(DestroyMPIResources);
+    GetMPISolverCache().clear(DestroyResources);
     GlobalResources::Get().Destroy();
     GlobalMPIResources::Get().Destroy();
   }
