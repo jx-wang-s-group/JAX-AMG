@@ -7,7 +7,7 @@ using the 5-point finite difference stencil.
 
 import jax.numpy as jnp
 
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.matrices import poisson_matrix, rhs_ones
 
 
@@ -24,7 +24,7 @@ def main():
 
     # Solve Ax = b
     print("Solving...")
-    x, _ = amg_solve(A, b, solver="CG")
+    x, _ = jaxamg.solve(A, b, solver="CG")
 
     # Compute residual: ||b - Ax|| / ||b||
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)

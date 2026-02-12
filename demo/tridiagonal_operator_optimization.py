@@ -7,7 +7,7 @@ Use JIT with parameterized tridiagonal operator for end-to-end optimization of t
 import jax
 import jax.numpy as jnp
 
-from jaxamg import amg_solve, cache_coloring, with_cache
+import jaxamg
 from jaxamg.matrices import rhs_ones, tridiagonal_operator
 
 
@@ -19,22 +19,22 @@ def main():
     true_diag = 4.0
     b = rhs_ones(n)
     A_true = tridiagonal_operator(true_diag)
-    x_target, _ = amg_solve(A_true, b)
+    x_target, _ = jaxamg.solve(A_true, b)
 
     # Compute coloring cache
     print("Computing operator coloring...")
     diag_init = 4.5  # Use initial guess
-    coloring_cache = cache_coloring(tridiagonal_operator(diag_init), shape=n)
+    coloring_cache = jaxamg.cache_coloring(tridiagonal_operator(diag_init), shape=n)
     print(f"Graph coloring computed. Number of colors: {coloring_cache[3]}")
 
     # Define loss function
     @jax.jit
     def loss_fn(diag, b, x_true):
         # Create operator with cached coloring
-        A = with_cache(tridiagonal_operator(diag), coloring=coloring_cache)
+        A = jaxamg.with_cache(tridiagonal_operator(diag), coloring=coloring_cache)
 
         # Solve
-        x_pred, _ = amg_solve(A, b)
+        x_pred, _ = jaxamg.solve(A, b)
 
         # Compute loss
         loss = jnp.mean((x_pred - x_true) ** 2)

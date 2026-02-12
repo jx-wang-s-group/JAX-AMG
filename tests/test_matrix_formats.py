@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.matrices import rhs_ones, tridiagonal_matrix
 from jaxamg.utils import to_scipy
 
@@ -27,7 +27,7 @@ class TestMatrixFormats:
         A, b = setup_matrices
 
         A_bcoo = A.to_bcoo()
-        x, _ = amg_solve(A_bcoo, b)
+        x, _ = jaxamg.solve(A_bcoo, b)
 
         np.testing.assert_allclose(b, A @ x, rtol=1e-6)
 
@@ -36,7 +36,7 @@ class TestMatrixFormats:
         A, b = setup_matrices
 
         A_scipy = to_scipy(A, format="csr")
-        x, _ = amg_solve(A_scipy, b)
+        x, _ = jaxamg.solve(A_scipy, b)
 
         np.testing.assert_allclose(b, A @ x, rtol=1e-6)
 
@@ -45,7 +45,7 @@ class TestMatrixFormats:
         A, b = setup_matrices
 
         A_scipy_coo = to_scipy(A, format="coo")
-        x, _ = amg_solve(A_scipy_coo, b)
+        x, _ = jaxamg.solve(A_scipy_coo, b)
 
         np.testing.assert_allclose(b, A @ x, rtol=1e-6)
 
@@ -54,7 +54,7 @@ class TestMatrixFormats:
         A, b = setup_matrices
 
         A_scipy_csc = to_scipy(A, format="csc")
-        x, _ = amg_solve(A_scipy_csc, b)
+        x, _ = jaxamg.solve(A_scipy_csc, b)
 
         np.testing.assert_allclose(b, A @ x, rtol=1e-6)
 
@@ -63,7 +63,7 @@ class TestMatrixFormats:
         A, b = setup_matrices
 
         A_dense = A.todense()
-        x, _ = amg_solve(A_dense, b)
+        x, _ = jaxamg.solve(A_dense, b)
 
         np.testing.assert_allclose(b, A @ x, rtol=1e-6)
 
@@ -72,6 +72,6 @@ class TestMatrixFormats:
         A, b = setup_matrices
 
         A_numpy = np.asarray(A.todense())
-        x, _ = amg_solve(A_numpy, b)
+        x, _ = jaxamg.solve(A_numpy, b)
 
         np.testing.assert_allclose(b, A @ x, rtol=1e-6)

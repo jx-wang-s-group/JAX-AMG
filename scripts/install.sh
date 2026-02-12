@@ -276,4 +276,4 @@ fi
 
 echo
 echo "Quick test:"
-echo "python -c 'from jaxamg import amg_solve; print(\"Ready!\")'"
+echo "python -c 'from jaxamg import solve; print(\"Ready!\")'"

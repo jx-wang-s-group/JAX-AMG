@@ -10,7 +10,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from jax.test_util import check_grads
 
-from jaxamg import amg_solve, cache_coloring, with_cache
+import jaxamg
 from jaxamg.matrices import (
     poisson_operator,
     rhs_ones,
@@ -23,13 +23,13 @@ from jaxamg.utils import to_scipy
 
 def l2_loss(A, b, config={"solver": "CG"}):
     """Compute L(b) = ||A^{-1} b||^2."""
-    x, _ = amg_solve(A, b, config=config)
+    x, _ = jaxamg.solve(A, b, config=config)
     return jnp.sum(x * x)
 
 
 def vdot_loss(A, v, b, config={"solver": "CG"}):
     """Compute L(b) = v^T A^{-1} b."""
-    x, _ = amg_solve(A, b, config=config)
+    x, _ = jaxamg.solve(A, b, config=config)
     return jnp.dot(v, x)
 
 
@@ -54,7 +54,7 @@ class TestGradient:
         grad_jax = jax.grad(loss)(b)
 
         # Compute gradient with SciPy (∂L/∂b = 2 * A^(-T) * x)
-        x, _ = amg_solve(A, b, solver="CG")
+        x, _ = jaxamg.solve(A, b, solver="CG")
         # Convert JAX CSR to scipy for comparison
         A_sp = cast(sp.csr_matrix, to_scipy(A))
         grad_sp = 2.0 * spla.spsolve(A_sp.T.tocsr(), np.asarray(x))
@@ -125,7 +125,7 @@ class TestGradient:
         @jax.jit
         def loss(diagonal_value):
             A = tridiagonal_matrix(n, diagonal_value=diagonal_value)
-            return l2_loss(with_cache(A, is_symmetric=is_symmetric), b)
+            return l2_loss(jaxamg.with_cache(A, is_symmetric=is_symmetric), b)
 
         diagonal_value = 4.0
 
@@ -139,13 +139,13 @@ class TestGradient:
         b = rhs_ones(n)
 
         # Compute coloring cache
-        coloring_cache = cache_coloring(
+        coloring_cache = jaxamg.cache_coloring(
             tridiagonal_operator(diagonal_value=1.0), shape=n
         )
 
         @jax.jit
         def loss(diagonal_value):
-            A = with_cache(
+            A = jaxamg.with_cache(
                 tridiagonal_operator(diagonal_value), coloring=coloring_cache
             )
             return l2_loss(A, b)
@@ -162,11 +162,11 @@ class TestGradient:
         b = rhs_ones(n)
 
         # Compute coloring cache
-        coloring_cache = cache_coloring(poisson_operator(skew=1.0), shape=n)
+        coloring_cache = jaxamg.cache_coloring(poisson_operator(skew=1.0), shape=n)
 
         @jax.jit()
         def loss(skew):
-            A = with_cache(
+            A = jaxamg.with_cache(
                 poisson_operator(skew=skew),
                 coloring=coloring_cache,
                 is_symmetric=is_symmetric,

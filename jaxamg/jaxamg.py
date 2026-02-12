@@ -42,6 +42,18 @@ ffi.register_ffi_target(
 
 
 class AMGXStatus(IntEnum):
+    """High-level AmgX solve status codes returned in `info["status"]` after calling `jaxamg.solve`.
+
+    These values are mapped from the native backend status for quick checks in
+    Python code and in docs.
+
+    Members:
+        - `SUCCESS`: Solve converged successfully.
+        - `FAILED`: Solver failed due to an internal/runtime error.
+        - `DIVERGED`: Iterations diverged.
+        - `NOT_CONVERGED`: Reached stopping criteria without convergence.
+    """
+
     SUCCESS = 0
     FAILED = 1
     DIVERGED = 2
@@ -316,7 +328,7 @@ def _get_solver_primitive_mpi(
     return solve
 
 
-def amg_solve(
+def solve(
     A: MatrixOrOperator,
     b: ArrayLike,
     config: dict | None = None,
@@ -325,31 +337,24 @@ def amg_solve(
     partition_info: tuple[int, int] | None = None,
     **kwargs: Any,
 ) -> tuple[jax.Array, dict]:
-    """
-    Solve Ax=b using AmgX (differentiable).
+    """Solve `Ax=b` using the AmgX backend. See [Examples](examples.md) for usage.
 
-    Single-GPU mode (default):
-        A: Matrix or callable operator A(x).
-           Callables are automatically materialized to CSR.
-        b: RHS vector (float32 or float64).
-        config: Dict of AmgX configuration parameters.
-        **kwargs: Additional configuration parameters passed as keyword arguments.
-                  These override config if present.
-
-    MPI mode (when comm is provided):
-        A: Local portion of matrix with GLOBAL column indices (CSR).
-        b: Local portion of RHS vector.
-        comm: MPI communicator (from mpi4py.MPI.COMM_WORLD).
-        nglobal: Global size of the matrix (total number of rows across all ranks).
-        partition_info: Tuple (row_start, row_end) indicating which rows this rank owns.
-        config: Dict or string of AmgX configuration parameters.
-        **kwargs: Additional configuration parameters.
-
-    If A is attached with MPI cache (via `with_cache`), then comm, nglobal, and partition_info are not needed.
+    Args:
+        A: Matrix or callable operator A(x). All matrices/operators are converted to `jax.experimental.sparse.bcsr` sparse matrices internally. In MPI mode this is the local partition.
+        b: Right-hand-side vector. In MPI mode this is the local RHS partition.
+        config: AmgX configuration dictionary (see [Solver Configuration](config.md) for details). If `None`, JAX-AMG defaults are used.
+        comm: MPI communicator (typically `mpi4py.MPI.COMM_WORLD`). If provided, the solve runs in MPI mode. If not provided, MPI mode can still be used if MPI metadata has already been attached via `with_cache(..., mpi=...)`.
+        nglobal: Global matrix row count for MPI mode. Required when `comm` is
+            provided and MPI metadata is not pre-attached to `A`.
+        partition_info: `(row_start, row_end)` owned by this rank in MPI mode.
+            Required when `comm` is provided and MPI metadata is not pre-attached
+            to `A`.
+        **kwargs: Additional AmgX config parameters. These override values in
+            `config` when both are provided.
 
     Returns:
         x: Solution vector (float32 or float64). In MPI mode, returns local portion.
-        info: Dictionary containing 'iterations', 'residual', and 'status'.
+        info: Dictionary containing `iterations`, `residual`, and `status`.
     """
 
     b = jnp.asarray(b)
@@ -491,7 +496,7 @@ def finalize() -> None:
     """
     Manually finalize AmgX resources.
     This clears the cache and calls AMGX_finalize.
-    Normally called automatically at exit via atexit.
+    Normally only needed to be called manually in MPI mode to avoid shutdown-time resource warnings.
     """
     clear_solver_cache()
     _amgx.finalize()

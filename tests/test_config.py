@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from jaxamg import AMGXStatus, amg_solve
+import jaxamg
 from jaxamg.matrices import rhs_ones, tridiagonal_matrix
 
 
@@ -18,8 +18,8 @@ def test_config_defaults(linear_system):
     """Test that default configuration works."""
     A, b = linear_system
 
-    x, info = amg_solve(A, b)
-    assert info["status"] == AMGXStatus.SUCCESS
+    x, info = jaxamg.solve(A, b)
+    assert info["status"] == jaxamg.AMGXStatus.SUCCESS
 
 
 def test_config_flat_dict(linear_system):
@@ -27,8 +27,8 @@ def test_config_flat_dict(linear_system):
     A, b = linear_system
 
     config = {"solver": "CG", "max_iters": 100, "tolerance": 1e-6}
-    x, info = amg_solve(A, b, config=config)
-    assert info["status"] == AMGXStatus.SUCCESS
+    x, info = jaxamg.solve(A, b, config=config)
+    assert info["status"] == jaxamg.AMGXStatus.SUCCESS
 
 
 def test_config_kwargs_override(linear_system):
@@ -36,14 +36,14 @@ def test_config_kwargs_override(linear_system):
     A, b = linear_system
 
     # Force 1 iteration via kwargs
-    x, info = amg_solve(A, b, max_iters=1)
+    x, info = jaxamg.solve(A, b, max_iters=1)
     assert info["iterations"] == 1
 
     # Verify override of passed config
     # Use CG with no preconditioner to ensure it takes more than 1 iteration
     config = {"max_iters": 100}
     # We pass explicit solver/preconditioner to ensure slow convergence
-    x, info = amg_solve(
+    x, info = jaxamg.solve(
         A,
         b,
         config=config,
@@ -53,7 +53,7 @@ def test_config_kwargs_override(linear_system):
         tolerance=1e-16,
     )
     # CG without preconditioner should not converge in 2 iterations
-    assert info["status"] == AMGXStatus.NOT_CONVERGED
+    assert info["status"] == jaxamg.AMGXStatus.NOT_CONVERGED
     assert info["iterations"] == 2
 
 
@@ -71,8 +71,8 @@ def test_config_nested(linear_system):
             "tolerance": 1e-6,
         },
     }
-    _, info = amg_solve(A, b, config=config)
-    assert info["status"] == AMGXStatus.SUCCESS
+    _, info = jaxamg.solve(A, b, config=config)
+    assert info["status"] == jaxamg.AMGXStatus.SUCCESS
 
     # Check residual tracking injection is successful even if not explicitly requested
     assert np.isfinite(info["residual"])

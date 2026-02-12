@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from jax.test_util import check_grads
 
-from jaxamg import AMGXStatus, amg_solve, cache_mpi_metadata, finalize, with_cache
+import jaxamg
 from jaxamg.matrices import (
     poisson_matrix,
     poisson_matrix_distributed,
@@ -31,7 +31,7 @@ def mpi_context():
     yield comm, rank, nranks
 
     comm.Barrier()
-    finalize()
+    jaxamg.finalize()
 
 
 @pytest.mark.mpi(min_size=2)
@@ -50,7 +50,7 @@ def test_mpi_poisson(mpi_context):
     b_local, _, _ = partition_vector(b_global, rank, nranks)
 
     # Solve the system on each process
-    x_local, info = amg_solve(
+    x_local, info = jaxamg.solve(
         A_local,
         b_local,
         comm=comm,
@@ -64,7 +64,7 @@ def test_mpi_poisson(mpi_context):
     x = gather_solution(x_local, comm, root=0)
 
     # Check if the solve was successful
-    assert info["status"] == AMGXStatus.SUCCESS
+    assert info["status"] == jaxamg.AMGXStatus.SUCCESS
 
     # Check if the solution is correct
     if rank == 0:
@@ -91,7 +91,7 @@ def test_mpi_autodiff_jit(mpi_context, enable_x64):
     dummy_A, row_start, row_end = tridiagonal_matrix_distributed(
         n_global, rank, nranks, 4.0
     )
-    mpi_cache = cache_mpi_metadata(
+    mpi_cache = jaxamg.cache_mpi_metadata(
         config, comm, n_global, (row_start, row_end), dummy_A
     )
 
@@ -102,10 +102,10 @@ def test_mpi_autodiff_jit(mpi_context, enable_x64):
         )
 
         # Attach MPI cache
-        A = with_cache(A, mpi=mpi_cache, is_symmetric=True)
+        A = jaxamg.with_cache(A, mpi=mpi_cache, is_symmetric=True)
 
         # Solve
-        x_local, _ = amg_solve(A, b_local)
+        x_local, _ = jaxamg.solve(A, b_local)
 
         return jnp.sum(x_local**2)
 
@@ -141,7 +141,7 @@ def test_mpi_autodiff_jit(mpi_context, enable_x64):
         A, _, _ = tridiagonal_matrix_distributed(
             n_global, rank, nranks, diagonal_value=diag_val
         )
-        x_local, _ = amg_solve(
+        x_local, _ = jaxamg.solve(
             A,
             b_local,
             comm=comm,

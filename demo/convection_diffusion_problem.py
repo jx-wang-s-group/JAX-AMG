@@ -16,7 +16,7 @@ and compares the numerical solution to the exact solution.
 import jax.numpy as jnp
 import numpy as np
 
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.matrices import convection_diffusion_matrix_2d
 
 
@@ -90,7 +90,7 @@ def main():
 
     # Solve
     print("Solving...")
-    u_pred, info = amg_solve(A, b, config=config)
+    u_pred, info = jaxamg.solve(A, b, config=config)
 
     print(info)
 

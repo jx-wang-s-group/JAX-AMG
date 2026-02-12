@@ -3,7 +3,7 @@
 import jax
 import numpy as np
 
-from jaxamg import AMGXStatus, amg_solve, cache_coloring, with_cache
+import jaxamg
 from jaxamg.matrices import (
     poisson_matrix,
     poisson_operator,
@@ -22,8 +22,8 @@ class TestOperator:
         b = rhs_ones(n)
 
         # Solve with operator and CSR matrix
-        x_op, _ = amg_solve(A_op, b, solver="CG")
-        x_csr, _ = amg_solve(A_csr, b, solver="CG")
+        x_op, _ = jaxamg.solve(A_op, b, solver="CG")
+        x_csr, _ = jaxamg.solve(A_csr, b, solver="CG")
 
         # Check that the solutions are the same
         np.testing.assert_allclose(x_op, x_csr)
@@ -39,21 +39,21 @@ class TestOperator:
         b = rhs_ones(n)
 
         # Compute coloring cache
-        coloring_cache = cache_coloring(A, shape=n)
+        coloring_cache = jaxamg.cache_coloring(A, shape=n)
 
         # Solve with JIT using cached coloring
         @jax.jit
         def solve(diagonal_value, b):
-            A = with_cache(
+            A = jaxamg.with_cache(
                 tridiagonal_operator(diagonal_value), coloring=coloring_cache
             )
-            x, _ = amg_solve(A, b, solver="CG")
+            x, _ = jaxamg.solve(A, b, solver="CG")
             return x
 
         x_jit = solve(diagonal_value, b)
 
         # Solve without JIT for comparison
-        x_nojit, _ = amg_solve(A, b)
+        x_nojit, _ = jaxamg.solve(A, b)
 
         np.testing.assert_allclose(x_jit, x_nojit, rtol=1e-6)
 
@@ -65,8 +65,8 @@ class TestOperator:
         b = rhs_ones(n * n)
 
         # Solve with operator and CSR matrix
-        x_op, _ = amg_solve(A_op, b, solver="CG")
-        x_csr, _ = amg_solve(A_csr, b, solver="CG")
+        x_op, _ = jaxamg.solve(A_op, b, solver="CG")
+        x_csr, _ = jaxamg.solve(A_csr, b, solver="CG")
 
         # Check that the solutions are the same
         np.testing.assert_allclose(x_op, x_csr)
@@ -82,16 +82,16 @@ class TestOperator:
         b = rhs_ones(n * n)
 
         # Solve with CG
-        x, info = amg_solve(A_op, b, solver="CG")
+        x, info = jaxamg.solve(A_op, b, solver="CG")
 
         # Should not converge
-        assert info["status"] == AMGXStatus.NOT_CONVERGED
+        assert info["status"] == jaxamg.AMGXStatus.NOT_CONVERGED
 
         # Solve with BiCGSTAB
-        x, info = amg_solve(A_op, b, solver="BICGSTAB")
+        x, info = jaxamg.solve(A_op, b, solver="BICGSTAB")
 
         # Should converge
-        assert info["status"] == AMGXStatus.SUCCESS
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
 
         # Check that the solution satisfies Ax = b
         np.testing.assert_allclose(A_op(x), b, rtol=1e-5)

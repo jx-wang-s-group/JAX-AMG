@@ -389,7 +389,7 @@ def to_bcsr_matrix(
                 # Inside JIT without cache: Impossible to determine sparsity dynamically.
                 raise ValueError(
                     "Callable operators must be pre-scanned before JIT compilation to determine sparsity.\n"
-                    "Call amg_solve(A, b) once outside of JIT to compute and cache the sparsity pattern."
+                    "Call solve(A, b) once outside of JIT to compute and cache the sparsity pattern."
                 )
 
             # Outside JIT: Compute sparsity and coloring (expensive O(N))

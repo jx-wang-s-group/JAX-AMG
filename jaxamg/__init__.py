@@ -5,16 +5,12 @@ from .cache import (
 )
 from .jaxamg import (
     AMGXStatus,
-    amg_solve,
     clear_solver_cache,
     finalize,
+    solve,
 )
 
-# User-friendly alias
-solve = amg_solve
-
 __all__ = [
-    "amg_solve",
     "solve",
     "with_cache",
     "cache_coloring",

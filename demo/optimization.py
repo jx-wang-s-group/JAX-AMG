@@ -8,7 +8,7 @@ and JIT compilation with the AmgX solver for gradient-based optimization.
 import jax
 import jax.numpy as jnp
 
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.matrices import rhs_linear, rhs_ones, rhs_random, tridiagonal_matrix
 
 
@@ -25,7 +25,7 @@ def main():
     # Define a loss function: L(b) = ||x||² where x = A⁻¹b
     def loss(b):
         """Loss function: sum of squared solution components."""
-        x, _ = amg_solve(A, b, solver="CG")
+        x, _ = jaxamg.solve(A, b, solver="CG")
         return jnp.sum(x * x)
 
     # JIT-compile the loss and gradient functions

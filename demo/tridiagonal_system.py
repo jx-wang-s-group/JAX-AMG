@@ -6,7 +6,7 @@ which arises from discretizing the 1D Laplacian operator.
 
 import jax.numpy as jnp
 
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.matrices import rhs_ones, tridiagonal_matrix
 
 
@@ -22,7 +22,7 @@ def main():
 
     # Solve Ax = b
     print("Solving...")
-    x, _ = amg_solve(A, b, solver="CG")
+    x, _ = jaxamg.solve(A, b, solver="CG")
 
     # Compute residual: ||b - Ax|| / ||b||
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)

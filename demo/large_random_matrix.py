@@ -4,7 +4,7 @@ Demo: Solving a large random sparse linear system.
 
 import time
 
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.matrices import random_matrix, rhs_random
 
 
@@ -31,7 +31,7 @@ def main():
     # Solve
     print("\nSolving...")
     start = time.time()
-    x, info = amg_solve(A, b)
+    x, info = jaxamg.solve(A, b)
     solve_time = time.time() - start
 
     print(f"Solve time: {solve_time:.2f}s")

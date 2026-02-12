@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import scipy.sparse.linalg as spla
 
-from jaxamg import AMGXStatus, amg_solve
+import jaxamg
 from jaxamg.matrices import (
     convection_diffusion_matrix_2d,
     poisson_matrix,
@@ -25,17 +25,17 @@ class TestSolver:
         """Test solving a 1D tridiagonal system against analytical solution."""
         A = tridiagonal_matrix(n)
         b = rhs_ones(n)
-        x, info = amg_solve(A, b, solver="CG", max_iters=100)
+        x, info = jaxamg.solve(A, b, solver="CG", max_iters=100)
 
         # Verify solver status
         if n == 256:
             # CG solver fails to converge for this size within 100 iterations
-            assert info["status"] == AMGXStatus.NOT_CONVERGED
+            assert info["status"] == jaxamg.AMGXStatus.NOT_CONVERGED
         else:
             # CG solver should converge for smaller sizes
-            assert info["status"] == AMGXStatus.SUCCESS
+            assert info["status"] == jaxamg.AMGXStatus.SUCCESS
 
-        if info["status"] == AMGXStatus.SUCCESS:
+        if info["status"] == jaxamg.AMGXStatus.SUCCESS:
             # Verify that Ax = b
             np.testing.assert_allclose(b, A @ x)
 
@@ -50,9 +50,9 @@ class TestSolver:
         n = 32
         A = tridiagonal_matrix(n)
         b = rhs_ones(n)
-        x, info = amg_solve(A, b, solver="CG", max_iters=1)
+        x, info = jaxamg.solve(A, b, solver="CG", max_iters=1)
 
-        assert info["status"] == AMGXStatus.NOT_CONVERGED
+        assert info["status"] == jaxamg.AMGXStatus.NOT_CONVERGED
         assert info["iterations"] == 1
 
     def test_tridiagonal_solve_jit(self):
@@ -64,14 +64,14 @@ class TestSolver:
         # Create JIT-compiled version
         @jax.jit
         def solve_jit(b):
-            x, _ = amg_solve(A, b, solver="CG")
+            x, _ = jaxamg.solve(A, b, solver="CG")
             return x
 
         # Solve with JIT
         x_jit = solve_jit(b)
 
         # Solve without JIT
-        x_nojit, _ = amg_solve(A, b)
+        x_nojit, _ = jaxamg.solve(A, b)
 
         # Compare results
         np.testing.assert_allclose(x_jit, x_nojit, rtol=1e-6)
@@ -85,9 +85,9 @@ class TestSolver:
         n = 8
         A = tridiagonal_matrix(n)
         b = rhs_ones(n).astype(jnp.float64)
-        x, info = amg_solve(A, b, solver="CG")
+        x, info = jaxamg.solve(A, b, solver="CG")
 
-        assert info["status"] == AMGXStatus.SUCCESS
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
         np.testing.assert_allclose(b, A @ x)
 
         # Check that the solution is float64
@@ -109,9 +109,9 @@ class TestSolver:
         A = jsp.BCSR((A.data.astype(jnp.float64), A.indices, A.indptr), shape=A.shape)
 
         b = rhs_ones(n).astype(jnp.float32)
-        x, info = amg_solve(A, b, solver="CG")
+        x, info = jaxamg.solve(A, b, solver="CG")
 
-        assert info["status"] == AMGXStatus.SUCCESS
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
         np.testing.assert_allclose(b, A @ x)
 
         # Check that the solution is float64
@@ -137,7 +137,7 @@ class TestSolver:
         b = jnp.array(A @ x_true)
 
         # Solve
-        x_computed, _ = amg_solve(A, b)
+        x_computed, _ = jaxamg.solve(A, b)
 
         # Compare with true solution
         np.testing.assert_allclose(x_computed, x_true, atol=1e-6)
@@ -150,7 +150,7 @@ class TestSolver:
         b = rhs_ones(n)
 
         # Solve
-        x, _ = amg_solve(A, b)
+        x, _ = jaxamg.solve(A, b)
 
         # Solve with Scipy
         A_sp = to_scipy(A)
@@ -172,13 +172,13 @@ class TestSolver:
         b = rhs_ones(n)
 
         # Solve (with Jacobi preconditioner)
-        x, info = amg_solve(A, b, solver=solver, preconditioner="JACOBI_L1")
+        x, info = jaxamg.solve(A, b, solver=solver, preconditioner="JACOBI_L1")
 
         # CG should not converge, BICGSTAB and GMRES should converge
         if solver == "CG":
-            assert info["status"] == AMGXStatus.NOT_CONVERGED
+            assert info["status"] == jaxamg.AMGXStatus.NOT_CONVERGED
         else:
-            assert info["status"] == AMGXStatus.SUCCESS
+            assert info["status"] == jaxamg.AMGXStatus.SUCCESS
 
             # Check solution
             np.testing.assert_allclose(b, A @ x, rtol=1e-5)
@@ -220,15 +220,15 @@ class TestSolver:
             n, epsilon=epsilon, theta=theta, velocity=velocity
         )
 
-        u, info = amg_solve(A, b, solver=solver)
+        u, info = jaxamg.solve(A, b, solver=solver)
 
         # Verify solver status
         if solver == "CG":
             # CG should not converge
-            assert info["status"] == AMGXStatus.NOT_CONVERGED
+            assert info["status"] == jaxamg.AMGXStatus.NOT_CONVERGED
         else:
             # PBICGSTAB with AMG preconditioner should converge
-            assert info["status"] == AMGXStatus.SUCCESS
+            assert info["status"] == jaxamg.AMGXStatus.SUCCESS
 
             # Verify solution
             np.testing.assert_allclose(A @ u, b, atol=1e-4)

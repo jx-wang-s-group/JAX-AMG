@@ -7,7 +7,7 @@ Use JIT with parameterized Poisson operator for end-to-end optimization of the s
 import jax
 import jax.numpy as jnp
 
-from jaxamg import amg_solve, cache_coloring, with_cache
+import jaxamg
 from jaxamg.matrices import poisson_operator, rhs_ones
 
 
@@ -18,21 +18,21 @@ def main():
     true_skew = 5.0
     b = rhs_ones(n)
     A_true = poisson_operator(true_skew)
-    x_target, info = amg_solve(A_true, b)
+    x_target, info = jaxamg.solve(A_true, b)
 
     # Compute coloring cache
     print("Computing operator coloring...")
     skew_init = 1.0  # Use initial guess
-    coloring_cache = cache_coloring(poisson_operator(skew_init), shape=n)
+    coloring_cache = jaxamg.cache_coloring(poisson_operator(skew_init), shape=n)
     print(f"Graph coloring computed. Number of colors: {coloring_cache[3]}")
 
     # Define loss function
     def loss_fn(skew, b, x_true):
         # Create operator with cached coloring
-        A = with_cache(poisson_operator(skew), coloring=coloring_cache)
+        A = jaxamg.with_cache(poisson_operator(skew), coloring=coloring_cache)
 
         # Solve
-        x_pred, _ = amg_solve(A, b)
+        x_pred, _ = jaxamg.solve(A, b)
 
         # Compute loss
         loss = jnp.mean((x_pred - x_true) ** 2)

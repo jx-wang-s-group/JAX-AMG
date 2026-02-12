@@ -17,7 +17,7 @@ import time
 import jax
 import jax.numpy as jnp
 
-from jaxamg import amg_solve, with_cache
+import jaxamg
 from jaxamg.matrices import poisson3d_matrix, rhs_ones
 
 
@@ -43,7 +43,7 @@ def main():
 
     start = time.time()
     # High precision solve for target
-    x_target, info_target = amg_solve(
+    x_target, info_target = jaxamg.solve(
         A, b_true, solver="CG", max_iters=2000, tolerance=1e-8
     )
     print(f"Status: {info_target['status']}")
@@ -51,8 +51,8 @@ def main():
     # Define loss function and optimization step
     def solve_model(theta):
         b = b0 * theta
-        A_ = with_cache(A, is_symmetric=True)
-        x, _ = amg_solve(A_, b, solver="CG")
+        A_ = jaxamg.with_cache(A, is_symmetric=True)
+        x, _ = jaxamg.solve(A_, b, solver="CG")
         return x
 
     def loss_fn(theta):

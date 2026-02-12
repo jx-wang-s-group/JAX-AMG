@@ -6,7 +6,7 @@ This demonstrates solver's ability to efficiently solve very large sparse linear
 
 import time
 
-from jaxamg import amg_solve
+import jaxamg
 from jaxamg.matrices import poisson3d_matrix, rhs_ones
 
 
@@ -36,7 +36,7 @@ def main():
     # Solve
     print("\nSolving...")
     start = time.time()
-    x, info = amg_solve(A, b, solver="CG", max_iters=2000, tolerance=1e-6)
+    x, info = jaxamg.solve(A, b, solver="CG", max_iters=2000, tolerance=1e-6)
     solve_time = time.time() - start
 
     print(f"Solve time: {solve_time:.2f}s")
