@@ -6,6 +6,8 @@ theme:
   features:
     - navigation.sections
     - navigation.indexes
+    - navigation.top
+    - navigation.tracking
     - content.code.copy
   palette:
     # Palette toggle for light mode
@@ -37,6 +39,8 @@ plugins:
             show_symbol_type_heading: true
 
 markdown_extensions:
+  - admonition
+  - pymdownx.details
   - pymdownx.highlight:
       anchor_linenums: true
       line_spans: __span
