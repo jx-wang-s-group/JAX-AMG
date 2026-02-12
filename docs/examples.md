@@ -11,7 +11,6 @@ The input matrix can be a sparse matrix (from JAX or SciPy) of various types, or
 === "Script"
 
     ```python
-    import jax.numpy as jnp
     import jaxamg
     from jaxamg.matrices import rhs_ones, tridiagonal_matrix
 
@@ -90,13 +89,12 @@ You can supply a custom solver configuration:
 === "Script"
 
     ```python
-    import jax.numpy as jnp
     import jaxamg
-    from jaxamg.matrices import poisson_matrix
+    from jaxamg.matrices import poisson_matrix, rhs_ones
 
     n = 4
     A = poisson_matrix(n, skew=0.5)
-    b = jnp.ones(n * n)
+    b = rhs_ones(n * n)
 
     x, info = jaxamg.solve(
         A,
