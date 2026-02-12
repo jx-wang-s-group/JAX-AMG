@@ -30,7 +30,7 @@ def with_cache(
     Attach cached metadata (coloring, MPI info, or symmetry) to a matrix or operator.
 
     This cache allows using matrices/operators inside JIT-compiled functions
-    without recomputing metadata or passing it as separate arguments.
+    without recomputing metadata or passing it as separate arguments. See [Caching Guide](caching.md) for more details.
 
     Args:
         A: A matrix or operator.
@@ -82,14 +82,17 @@ def cache_mpi_metadata(
     """
     Pre-compute and cache MPI metadata for JIT-compatible solver usage.
 
-    This function performs all non-traceable MPI operations outside the JIT boundary:
-    - Computes static MPI communication metadata (recvcounts, displs)
-    - Prepares MPI communicator pointer and local rank
-    - Prepares config string
-    - Computes max nnz across all ranks
-
     The cached metadata can be reused across multiple JIT-compiled function calls
     with different matrices or operators (same structure).
+
+    Note:
+        This function performs all non-traceable MPI operations outside the JIT boundary:
+
+        - Computes static MPI communication metadata (recvcounts, displs)
+        - Prepares MPI communicator pointer and local rank
+        - Prepares config string
+        - Computes max nnz across all ranks
+
 
     Args:
         config: AmgX configuration dict or string
@@ -99,14 +102,18 @@ def cache_mpi_metadata(
         A: Matrix or operator to compute max nnz for buffer sizing
 
     Returns:
-        Dict containing MPI metadata:
-        - 'recvcounts_tuple': Tuple of row counts per rank
-        - 'displs_tuple': Tuple of displacement offsets
-        - 'comm_ptr': MPI communicator pointer
-        - 'lrank': Local GPU rank
-        - 'nglobal': Global matrix size
-        - 'config_str': Prepared configuration string
-        - 'max_nnz': Maximum nnz across all ranks
+        A dictionary containing MPI metadata.
+
+    Note:
+        The returned dictionary includes the following keys:
+
+        - `recvcounts_tuple`: Tuple of row counts per rank
+        - `displs_tuple`: Tuple of displacement offsets
+        - `comm_ptr`: MPI communicator pointer
+        - `lrank`: Local GPU rank
+        - `nglobal`: Global matrix size
+        - `config_str`: Prepared configuration string
+        - `max_nnz`: Maximum nnz across all ranks
     """
     from mpi4py import MPI
 
@@ -193,20 +200,11 @@ def cache_coloring(
     operator, enabling efficient use inside JIT-compiled functions.
 
     Args:
-        operator: A callable operator A(x) that returns A @ x.
+        operator: A callable operator A(x) that returns `A @ x`.
         shape: Shape of the operator (n, m) or int size (for n×n matrix).
 
     Returns:
         Cached coloring information that can be reattached with `with_cache(..., coloring=...)`.
-
-    Example:
-        >>> A = tridiagonal_operator(diagonal_value=2.0)
-        >>> cache = cache_coloring(A, shape=100)
-        >>>
-        >>> @jax.jit
-        >>> def solve(diag, b):
-        >>>     A = with_cache(tridiagonal_operator(diag), coloring=cache)
-        >>>     return amg_solve(A, b)
     """
     if isinstance(shape, int):
         shape = (shape, shape)

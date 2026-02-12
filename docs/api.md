@@ -1,13 +1,14 @@
 # API Reference
 
-This page documents the public API of `jaxamg`.
+This page documents the public API of JAX-AMG.
 
 ## Solver
 
-::: jaxamg.amg_solve
+::: jaxamg.solve
     options:
         show_root_heading: true
         show_source: false
+        heading_level: 3
 
 ## Status Codes
 
@@ -15,6 +16,7 @@ This page documents the public API of `jaxamg`.
     options:
         show_root_heading: true
         show_source: false
+        heading_level: 3
 
 ## Caching
 
@@ -22,16 +24,19 @@ This page documents the public API of `jaxamg`.
     options:
         show_root_heading: true
         show_source: false
+        heading_level: 3
 
 ::: jaxamg.cache_coloring
     options:
         show_root_heading: true
         show_source: false
+        heading_level: 3
 
 ::: jaxamg.cache_mpi_metadata
     options:
         show_root_heading: true
         show_source: false
+        heading_level: 3
 
 ## Runtime Utilities
 
@@ -39,8 +44,10 @@ This page documents the public API of `jaxamg`.
     options:
         show_root_heading: true
         show_source: false
+        heading_level: 3
 
 ::: jaxamg.finalize
     options:
         show_root_heading: true
         show_source: false
+        heading_level: 3

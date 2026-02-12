@@ -34,8 +34,23 @@ plugins:
           paths: [.]
           options:
             docstring_style: google
+            show_symbol_type_heading: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
 
 nav:
   - Home: index.md
+  - Installation: install.md
+  - Examples: examples.md
+  - Solver Configuration: config.md
+  - MPI: mpi.md
   - Caching: caching.md
+  - Environment Variables: environ.md
   - API Reference: api.md

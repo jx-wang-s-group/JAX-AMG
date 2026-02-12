@@ -1,13 +1,13 @@
 # JAX-AMG
 
-**JAX-AMG** provides JAX bindings for the NVIDIA AmgX sparse linear solver, enabling high-performance linear solving on GPUs with automatic differentiation support.
+**JAX-AMG** brings the power of NVIDIA's [AmgX](https://developer.nvidia.com/amgx) library to the JAX ecosystem, providing high-performance, GPU-accelerated sparse linear solvers with full support for automatic differentiation.
 
 ## Features
 
-- **High Performance**: Leverages NVIDIA AmgX for state-of-the-art algebraic multigrid solvers.
-- **JAX Integration**: Fully compatible with JAX transformations (`jit`, `grad`, `vmap`).
-- **Automatic Differentiation**: Compute gradients through the linear solve using implicit differentiation.
-- **MPI Support**: Distributed solving across multiple GPUs and nodes.
+- **GPU-Accelerated Solvers**: Leverages NVIDIA AmgX for a broad range of GPU-accelerated sparse linear solvers, including algebraic multigrid (AMG), Krylov methods, and various variants, with flexible configuraiton options for solvers, smoothers, and preconditioners.
+- **Automatic Differentiation**: Supports adjoint-based gradient computation and integrates seamlessly with JAX for end-to-end differentiable workflows.
+- **JIT Compilation**: Built as a native JAX primitive, fully compatible with Just-in-Time compilation (`jax.jit`) for efficient, low-overhead execution.
+- **MPI Support**: Enables distributed linear solves across multiple GPUs, with GPU-aware MPI support.
 
 ## Dependencies
 
@@ -40,16 +40,5 @@ print(f"Iterations: {info['iterations']}")
 print(f"Residual: {info['residual']}")
 ```
 
-## Environment Variables
+Refer to [Examples](examples.md) for additional usage examples.
 
-| Variable | When Needed | Description |
-|----------|------------|------------|
-| `AMGX_ROOT` | Installation | Path to AmgX source directory (auto-detected if not set) |
-| `AMGX_BUILD` | Installation | Path to AmgX build dir (defaults to `$AMGX_ROOT/build`) |
-| `CUDA_HOME` | Installation | Path to CUDA toolkit (auto-detected if not set) |
-| `MPI_HOME` | Installation | Path to custom MPI installation (optional) |
-| `JAXAMG_ENABLE_MPI` | Installation | Force MPI linkage (optional, usually auto-detected) |
-| `LD_LIBRARY_PATH` | Runtime | Need to include AmgX and CUDA library paths |
-| `JAXAMG_CACHE_SIZE` | Runtime | Native AmgX resource cache size: `0` disables resource caching (isolated mode), `>0` (default is `1`) enables caching for performance improvement |
-| `OMPI_MCA_opal_cuda_support` | Runtime | Set to `true` for GPU-aware MPI (when using OpenMPI) |
-| `MPI4JAX_USE_CUDA_MPI` | Runtime | Set to `1` for GPU-aware MPI (for mpi4jax) |
