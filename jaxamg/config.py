@@ -1,6 +1,4 @@
 import json
-import os
-import tempfile
 from typing import Any
 
 
@@ -8,7 +6,8 @@ def _format_config(config: dict | None) -> str:
     """
     Format configuration for AmgX.
 
-    Serializes the config dictionary to a temporary JSON file and returns its path.
+    Serializes the config dictionary to a canonical JSON string.
+    The stable serialization is used as the solver cache key in C++.
     """
     if config is None:
         return ""
@@ -18,16 +17,8 @@ def _format_config(config: dict | None) -> str:
             "Config must be a dictionary. String configuration is no longer supported."
         )
 
-    # Serialize to temp JSON file
-    fd, path = tempfile.mkstemp(suffix=".json", text=True)
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(config, f, indent=2)
-        return path
-    except:
-        os.close(fd)
-        os.unlink(path)
-        raise
+    # Canonical JSON to guarantee deterministic cache keys for identical configs.
+    return json.dumps(config, sort_keys=True, separators=(",", ":"))
 
 
 def prepare_config(user_config: dict | None = None, **kwargs: Any) -> str:
