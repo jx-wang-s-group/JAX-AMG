@@ -185,6 +185,7 @@ namespace
     int n_rows;
     int nnz;
     int mode; // AMGX_Mode (dFFI vs dDDI) to distinguish f32/f64
+    bool transpose_solve;
     std::string config;
 
     bool operator==(const CacheKey &other) const
@@ -194,6 +195,7 @@ namespace
              n_rows == other.n_rows &&
              nnz == other.nnz &&
              mode == other.mode &&
+             transpose_solve == other.transpose_solve &&
              config == other.config;
     }
   };
@@ -222,6 +224,7 @@ namespace
     int nnz;
     int lrank;
     int mode; // AMGX_Mode (dFFI vs dDDI) to distinguish f32/f64
+    bool transpose_solve;
     uint64_t comm_ptr;
     size_t structure_hash;
     std::string config;
@@ -233,6 +236,7 @@ namespace
              nnz == other.nnz &&
              lrank == other.lrank &&
              mode == other.mode &&
+             transpose_solve == other.transpose_solve &&
              comm_ptr == other.comm_ptr &&
              structure_hash == other.structure_hash &&
              config == other.config;
@@ -252,9 +256,11 @@ namespace std
       size_t h3 = hash<int>()(k.n_rows);
       size_t h4 = hash<int>()(k.nnz);
       size_t h5 = hash<int>()(k.mode);
-      size_t h6 = hash<string>()(k.config);
+      size_t h6 = hash<bool>()(k.transpose_solve);
+      size_t h7 = hash<string>()(k.config);
 
-      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
+      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5) ^
+             (h7 << 6);
     }
   };
 
@@ -268,12 +274,13 @@ namespace std
       size_t h3 = hash<int>()(k.nnz);
       size_t h4 = hash<int>()(k.lrank);
       size_t h5 = hash<int>()(k.mode);
-      size_t h6 = hash<uint64_t>()(k.comm_ptr);
-      size_t h7 = hash<size_t>()(k.structure_hash);
-      size_t h8 = hash<string>()(k.config);
+      size_t h6 = hash<bool>()(k.transpose_solve);
+      size_t h7 = hash<uint64_t>()(k.comm_ptr);
+      size_t h8 = hash<size_t>()(k.structure_hash);
+      size_t h9 = hash<string>()(k.config);
 
       return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^
-             (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7);
+             (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7) ^ (h9 << 8);
     }
   };
 } // namespace std
@@ -290,6 +297,9 @@ namespace
     AMGX_vector_handle x_vec = nullptr;
     AMGX_vector_handle b_vec = nullptr;
     void *values_buf = nullptr; // Persistent buffer for MPI replace_coefficients (null for non-MPI)
+    void *transpose_row_ptrs = nullptr; // Cached transpose row ptrs (single-GPU transpose_solve mode)
+    void *transpose_col_indices = nullptr; // Cached transpose column indices (single-GPU transpose_solve mode)
+    void *transpose_values = nullptr; // Cached transpose values (single-GPU transpose_solve mode)
     bool owns_resources = false; // True if isolated (Cache=0), False if shared (Cache>=1)
   };
 
@@ -359,6 +369,9 @@ namespace
 
       if (res.cfg) AMGX_config_destroy(res.cfg);
       if (res.values_buf) cudaFree(res.values_buf);
+      if (res.transpose_row_ptrs) cudaFree(res.transpose_row_ptrs);
+      if (res.transpose_col_indices) cudaFree(res.transpose_col_indices);
+      if (res.transpose_values) cudaFree(res.transpose_values);
     }
     catch (...)
     {

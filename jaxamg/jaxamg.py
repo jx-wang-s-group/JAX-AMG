@@ -72,6 +72,7 @@ def _amgx_solve_impl(
     values: ArrayLike,
     b: ArrayLike,
     config_str: str = "",
+    transpose_solve: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX solver (non-differentiable)."""
 
@@ -92,7 +93,14 @@ def _amgx_solve_impl(
         input_layouts=[None, None, None, None],
         output_layouts=None,
     )
-    results = call(row_ptrs, col_indices, values, b, config=config_str)
+    results = call(
+        row_ptrs,
+        col_indices,
+        values,
+        b,
+        config=config_str,
+        transpose_solve=np.int32(transpose_solve),
+    )
 
     return cast(tuple, results)
 
@@ -106,6 +114,7 @@ def _amgx_solve_mpi_impl(
     comm_ptr: ArrayLike,
     lrank: ArrayLike,
     config_str: str = "",
+    transpose_solve: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX MPI solver (non-differentiable)."""
 
@@ -127,7 +136,15 @@ def _amgx_solve_mpi_impl(
         output_layouts=None,
     )
     results = call(
-        row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, config=config_str
+        row_ptrs,
+        col_indices,
+        values,
+        b,
+        nglobal,
+        comm_ptr,
+        lrank,
+        config=config_str,
+        transpose_solve=np.int32(transpose_solve),
     )
 
     return cast(tuple, results)
@@ -167,8 +184,19 @@ def _get_solver_primitive(config_str: str, is_symmetric: bool = False) -> Callab
         if is_symmetric:
             adj_b, _ = solver(A, g_x)
         else:
-            A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
-            adj_b, _ = solver(A_T, g_x)
+            # Use backend transposed solve and keep compatibility fallback.
+            try:
+                adj_b, _ = _amgx_solve_impl(
+                    A.indptr,
+                    A.indices,
+                    A.data,
+                    g_x,
+                    config_str=config_str,
+                    transpose_solve=True,
+                )
+            except Exception:
+                A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
+                adj_b, _ = solver(A_T, g_x)
 
         n = A.shape[0]
         row_lengths = A.indptr[1:] - A.indptr[:-1]

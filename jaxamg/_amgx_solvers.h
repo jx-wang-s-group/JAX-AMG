@@ -7,13 +7,16 @@
 #define JAXAMG_AMGX_SOLVERS_H_
 
 #include <cuda_runtime.h>
+#include <cusparse.h>
 #include <amgx_c.h>
 #include <xla/ffi/api/ffi.h>
 #include <mpi.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <fstream>
 #include <algorithm>
+#include <type_traits>
 
 #include "_amgx_utils.h"
 
@@ -21,6 +24,92 @@ namespace ffi = xla::ffi;
 
 namespace
 {
+
+  template <typename T>
+  inline const char *CsrTransposeDevice(cudaStream_t stream,
+                                        int n_rows,
+                                        int nnz,
+                                        const int *row_ptrs,
+                                        const int *col_indices,
+                                        const T *values,
+                                        int *row_ptrs_t,
+                                        int *col_indices_t,
+                                        T *values_t)
+  {
+    cusparseHandle_t handle = nullptr;
+    if (cusparseCreate(&handle) != CUSPARSE_STATUS_SUCCESS)
+    {
+      return "cusparseCreate failed";
+    }
+    if (cusparseSetStream(handle, stream) != CUSPARSE_STATUS_SUCCESS)
+    {
+      cusparseDestroy(handle);
+      return "cusparseSetStream failed";
+    }
+
+    cudaDataType dtype = std::is_same<T, double>::value ? CUDA_R_64F : CUDA_R_32F;
+    size_t buffer_size = 0;
+    cusparseStatus_t status = cusparseCsr2cscEx2_bufferSize(
+        handle,
+        n_rows,
+        n_rows,
+        nnz,
+        values,
+        row_ptrs,
+        col_indices,
+        values_t,
+        row_ptrs_t,
+        col_indices_t,
+        dtype,
+        CUSPARSE_ACTION_NUMERIC,
+        CUSPARSE_INDEX_BASE_ZERO,
+        CUSPARSE_CSR2CSC_ALG1,
+        &buffer_size);
+    if (status != CUSPARSE_STATUS_SUCCESS)
+    {
+      cusparseDestroy(handle);
+      return "cusparseCsr2cscEx2_bufferSize failed";
+    }
+
+    void *workspace = nullptr;
+    if (buffer_size > 0 && cudaMalloc(&workspace, buffer_size) != cudaSuccess)
+    {
+      cusparseDestroy(handle);
+      return "cudaMalloc failed for cusparse transpose workspace";
+    }
+
+    status = cusparseCsr2cscEx2(
+        handle,
+        n_rows,
+        n_rows,
+        nnz,
+        values,
+        row_ptrs,
+        col_indices,
+        values_t,
+        row_ptrs_t,
+        col_indices_t,
+        dtype,
+        CUSPARSE_ACTION_NUMERIC,
+        CUSPARSE_INDEX_BASE_ZERO,
+        CUSPARSE_CSR2CSC_ALG1,
+        workspace);
+
+    cudaFree(workspace);
+    cusparseDestroy(handle);
+
+    if (status != CUSPARSE_STATUS_SUCCESS)
+    {
+      return "cusparseCsr2cscEx2 failed";
+    }
+
+    if (cudaStreamSynchronize(stream) != cudaSuccess)
+    {
+      return "cudaStreamSynchronize failed after csr transpose";
+    }
+
+    return nullptr;
+  }
 
   /*
    * AmgxSolveInternal: Templated core implementation of the XLA FFI handler.
@@ -34,7 +123,8 @@ namespace
                                ffi::Buffer<DType> b,
                                ffi::ResultBuffer<DType> x,
                                ffi::ResultBuffer<DType> stats,
-                               std::string_view config)
+                               std::string_view config,
+                               int32_t transpose_solve)
   {
     EnsureAmgxInitialized();
 
@@ -68,7 +158,7 @@ namespace
     const int nnz = static_cast<int>(values.element_count());
 
     // 3. Check Cache
-    CacheKey key = {row_ptrs_data, col_indices_data, n_rows, nnz, static_cast<int>(Mode), std::string(config)};
+    CacheKey key = {row_ptrs_data, col_indices_data, n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, std::string(config)};
     bool cache_hit = GetSolverCache().get(key, res);
 
     bool reuse_success = false;
@@ -76,9 +166,36 @@ namespace
     if (cache_hit)
     {
       // REUSE RESOURCES
-      // Update matrix values
+      // Update matrix values.
       // Note: AMGX_matrix_replace_coefficients signature: (mtx, n_rows, nnz, values, diag)
-      AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(res.A, n_rows, (int)values.element_count(), values_data, nullptr));
+      if (transpose_solve != 0)
+      {
+        if (!res.transpose_row_ptrs || !res.transpose_col_indices || !res.transpose_values)
+        {
+          return ffi::Error::Internal("transpose_solve cache entry missing transpose buffers");
+        }
+        const char *transpose_err = CsrTransposeDevice<T>(
+            stream,
+            n_rows,
+            nnz,
+            row_ptrs_data,
+            col_indices_data,
+            values_data,
+            static_cast<int *>(res.transpose_row_ptrs),
+            static_cast<int *>(res.transpose_col_indices),
+            static_cast<T *>(res.transpose_values));
+        if (transpose_err != nullptr)
+        {
+          return ffi::Error::Internal(transpose_err);
+        }
+        AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
+            res.A, n_rows, (int)values.element_count(), static_cast<T *>(res.transpose_values), nullptr));
+      }
+      else
+      {
+        AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
+            res.A, n_rows, (int)values.element_count(), values_data, nullptr));
+      }
 
       // Upload new RHS
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
@@ -110,9 +227,70 @@ namespace
 
       // Bind Data (No Copies)
       // Upload matrix data (binds device pointers)
+      if (transpose_solve != 0)
+      {
+        if (cudaMalloc(&res.transpose_row_ptrs, (n_rows + 1) * sizeof(int)) != cudaSuccess)
+        {
+          DestroyResources(res);
+          return ffi::Error::Internal("cudaMalloc failed for transpose row_ptrs");
+        }
+        if (cudaMalloc(&res.transpose_col_indices, nnz * sizeof(int)) != cudaSuccess)
+        {
+          cudaFree(res.transpose_row_ptrs);
+          res.transpose_row_ptrs = nullptr;
+          DestroyResources(res);
+          return ffi::Error::Internal("cudaMalloc failed for transpose col_indices");
+        }
+        if (cudaMalloc(&res.transpose_values, nnz * sizeof(T)) != cudaSuccess)
+        {
+          cudaFree(res.transpose_row_ptrs);
+          cudaFree(res.transpose_col_indices);
+          res.transpose_row_ptrs = nullptr;
+          res.transpose_col_indices = nullptr;
+          DestroyResources(res);
+          return ffi::Error::Internal("cudaMalloc failed for transpose values");
+        }
 
-      AMGX_SAFE_CALL(AMGX_matrix_upload_all(res.A, n_rows, (int)values.element_count(), 1, 1,
-                                            row_ptrs_data, col_indices_data, values_data, nullptr));
+        const char *transpose_err = CsrTransposeDevice<T>(
+            stream,
+            n_rows,
+            nnz,
+            row_ptrs_data,
+            col_indices_data,
+            values_data,
+            static_cast<int *>(res.transpose_row_ptrs),
+            static_cast<int *>(res.transpose_col_indices),
+            static_cast<T *>(res.transpose_values));
+        if (transpose_err != nullptr)
+        {
+          DestroyResources(res);
+          return ffi::Error::Internal(transpose_err);
+        }
+
+        AMGX_SAFE_CALL(AMGX_matrix_upload_all(
+            res.A,
+            n_rows,
+            (int)values.element_count(),
+            1,
+            1,
+            static_cast<int *>(res.transpose_row_ptrs),
+            static_cast<int *>(res.transpose_col_indices),
+            static_cast<T *>(res.transpose_values),
+            nullptr));
+      }
+      else
+      {
+        AMGX_SAFE_CALL(AMGX_matrix_upload_all(
+            res.A,
+            n_rows,
+            (int)values.element_count(),
+            1,
+            1,
+            row_ptrs_data,
+            col_indices_data,
+            values_data,
+            nullptr));
+      }
 
       // Bind RHS vector
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
@@ -180,8 +358,15 @@ namespace
                                   ffi::Buffer<ffi::DataType::S32> lrank_buf,
                                   ffi::ResultBuffer<DType> x,
                                   ffi::ResultBuffer<DType> stats,
-                                  std::string_view config)
+                                  std::string_view config,
+                                  int32_t transpose_solve)
   {
+    if (transpose_solve != 0)
+    {
+      return ffi::Error::Internal(
+          "transpose_solve is not supported in the MPI FFI path");
+    }
+
     EnsureAmgxInitialized();
 
     // Setup execution context
@@ -241,6 +426,7 @@ namespace
         nnz,
         lrank_host,
         static_cast<int>(Mode),
+        false,
         comm_ptr_val,
         structure_hash,
         std::string(config)};
@@ -347,9 +533,11 @@ namespace
                            ffi::Buffer<ffi::DataType::F32> b,
                            ffi::ResultBuffer<ffi::DataType::F32> x,
                            ffi::ResultBuffer<ffi::DataType::F32> stats,
-                           std::string_view config)
+                           std::string_view config,
+                           int32_t transpose_solve)
   {
-    return AmgxSolveInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(stream, row_ptrs, col_indices, values, b, x, stats, config);
+    return AmgxSolveInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
+        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve);
   }
 
   // Double implementation
@@ -360,9 +548,11 @@ namespace
                                  ffi::Buffer<ffi::DataType::F64> b,
                                  ffi::ResultBuffer<ffi::DataType::F64> x,
                                  ffi::ResultBuffer<ffi::DataType::F64> stats,
-                                 std::string_view config)
+                                 std::string_view config,
+                                 int32_t transpose_solve)
   {
-    return AmgxSolveInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(stream, row_ptrs, col_indices, values, b, x, stats, config);
+    return AmgxSolveInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
+        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve);
   }
 
   // MPI Float implementation
@@ -376,9 +566,11 @@ namespace
                               ffi::Buffer<ffi::DataType::S32> lrank,
                               ffi::ResultBuffer<ffi::DataType::F32> x,
                               ffi::ResultBuffer<ffi::DataType::F32> stats,
-                              std::string_view config)
+                              std::string_view config,
+                              int32_t transpose_solve)
   {
-    return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config);
+    return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
+        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve);
   }
 
   // MPI Double implementation
@@ -392,9 +584,11 @@ namespace
                                     ffi::Buffer<ffi::DataType::S32> lrank,
                                     ffi::ResultBuffer<ffi::DataType::F64> x,
                                     ffi::ResultBuffer<ffi::DataType::F64> stats,
-                                    std::string_view config)
+                                    std::string_view config,
+                                    int32_t transpose_solve)
   {
-    return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config);
+    return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
+        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve);
   }
 
   // -------------------------------------------------------------------------

@@ -42,6 +42,7 @@ namespace
           .Ret<ffi::Buffer<ffi::F32>>()             // x
           .Ret<ffi::Buffer<ffi::F32>>()             // stats
           .Attr<std::string_view>("config")         // config string
+          .Attr<int32_t>("transpose_solve")         // transpose flag
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -56,6 +57,7 @@ namespace
           .Ret<ffi::Buffer<ffi::F64>>()             // x
           .Ret<ffi::Buffer<ffi::F64>>()             // stats
           .Attr<std::string_view>("config")         // config string
+          .Attr<int32_t>("transpose_solve")         // transpose flag
   );
 
   // Register MPI handlers
@@ -74,6 +76,7 @@ namespace
           .Ret<ffi::Buffer<ffi::F32>>()             // x (local)
           .Ret<ffi::Buffer<ffi::F32>>()             // stats
           .Attr<std::string_view>("config")         // config string
+          .Attr<int32_t>("transpose_solve")         // transpose flag
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -91,6 +94,7 @@ namespace
           .Ret<ffi::Buffer<ffi::F64>>()             // x (local)
           .Ret<ffi::Buffer<ffi::F64>>()             // stats
           .Attr<std::string_view>("config")         // config string
+          .Attr<int32_t>("transpose_solve")         // transpose flag
   );
 
   XLA_FFI_DEFINE_HANDLER(

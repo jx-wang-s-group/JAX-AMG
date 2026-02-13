@@ -8,6 +8,8 @@ import pytest
 import scipy.sparse.linalg as spla
 
 import jaxamg
+from jaxamg import config as amgx_config
+from jaxamg.jaxamg import _amgx_solve_impl
 from jaxamg.matrices import (
     convection_diffusion_matrix_2d,
     poisson_matrix,
@@ -233,3 +235,42 @@ class TestSolver:
             # Verify solution
             np.testing.assert_allclose(A @ u, b, atol=1e-4)
             np.testing.assert_allclose(u, u_exact_flat, atol=0.1)
+
+    def test_transpose_solve(self):
+        """Test backend transpose solve against explicit A^T construction."""
+        grid_size = 8
+        A = poisson_matrix(grid_size, skew=0.7)
+        n = grid_size**2
+
+        # Use a deterministic RHS for A^T lambda = g_x
+        key = jax.random.PRNGKey(0)
+        g_x = jax.random.normal(key, (n,), dtype=jnp.float32)
+
+        # Build config string exactly as production solve path does
+        config_str = amgx_config.prepare_config(
+            {"solver": "PBICGSTAB", "preconditioner": "JACOBI_L1", "tolerance": 1e-6}
+        )
+
+        # Solve transpose directly in backend
+        lam_backend, info_backend = _amgx_solve_impl(
+            A.indptr,
+            A.indices,
+            A.data,
+            g_x,
+            config_str=config_str,
+            transpose_solve=True,
+        )
+
+        # Explicitly materialize A^T then solve
+        A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
+        lam_explicit, info_explicit = _amgx_solve_impl(
+            A_T.indptr,
+            A_T.indices,
+            A_T.data,
+            g_x,
+            config_str=config_str,
+            transpose_solve=False,
+        )
+
+        assert info_backend[2] == info_explicit[2] == jaxamg.AMGXStatus.SUCCESS
+        np.testing.assert_allclose(lam_backend, lam_explicit)

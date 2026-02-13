@@ -182,7 +182,7 @@ def get_build_config() -> dict:
         str(Path(cuda_home) / "lib64"),
     ]
 
-    libraries = ["amgxsh", "cudart"]
+    libraries = ["amgxsh", "cudart", "cusparse"]
 
     # Check if AmgX was built with MPI by inspecting for undefined MPI symbols
     def amgx_requires_mpi() -> bool:
