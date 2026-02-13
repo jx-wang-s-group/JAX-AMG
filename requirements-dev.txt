@@ -12,3 +12,7 @@ black
 mypy
 ruff
 pre-commit
+
+# Documentation
+mkdocs-material
+mkdocstrings-python
