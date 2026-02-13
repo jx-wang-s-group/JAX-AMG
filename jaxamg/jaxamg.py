@@ -336,8 +336,15 @@ def _get_solver_primitive_mpi(
 
             (adj_b, _), _ = solve(A_T, g_x, recvcounts, displs)
 
-        # Gather x across all ranks for gradient computation
-        x_global = allgather(x, recvcounts, displs, comm_ptr_arr)
+        # Gather x across all ranks for gradient computation.
+        # Create a data dependency on adj_b so that XLA cannot reorder the
+        # allgather collective before the backward solve.  Without this,
+        # uneven partitions (different JIT programs per rank) can cause XLA
+        # to schedule the two MPI collectives in different orders on
+        # different ranks, leading to a deadlock.
+        x_global = allgather(
+            x + jnp.zeros_like(x) * adj_b[0], recvcounts, displs, comm_ptr_arr
+        )
 
         # Compute ∂L/∂A: ∂L/∂A_ij = -adj_b[i] * x[j]
         n_local = A.shape[0]
