@@ -130,7 +130,6 @@ def _mpi4jax_alltoallv_transpose(
         max_nnz: Maximum nnz across all ranks for buffer sizing (must be precalculated)
     """
     import mpi4jax
-    from mpi4py import MPI
 
     rank = comm.Get_rank()
     size = comm.Get_size()
@@ -168,25 +167,22 @@ def _mpi4jax_alltoallv_transpose(
     dest_ranks_sorted = dest_ranks[sort_order]
 
     # --- Step 4: Count elements per destination ---
-    # Use one_hot + sum instead of bincount (not available in JAX)
-    one_hot = jax.nn.one_hot(dest_ranks_sorted, size, dtype=jnp.int32)
-    send_counts = jnp.sum(one_hot, axis=0)
+    # Use bincount (much lighter than one_hot for large nnz)
+    send_counts = jnp.bincount(dest_ranks_sorted, length=size).astype(jnp.int32)
 
     # --- Step 5: Exchange counts and compute buffer sizes ---
-    recv_counts = mpi4jax.alltoall(send_counts.reshape(size, 1), comm=comm).flatten()
-    local_max = jnp.maximum(jnp.max(send_counts), jnp.max(recv_counts))
-    local_max = jnp.maximum(local_max, 1)  # At least 1 to avoid empty arrays
-    mpi4jax.allreduce(local_max, op=MPI.MAX, comm=comm)  # Sync buffer size
+    recv_counts = mpi4jax.alltoall(send_counts, comm=comm)
 
     # --- Step 6: Build padded send buffers ---
-    # Compute position for each element within its destination's buffer
-    dest_mask = dest_ranks_sorted[:, None] == jnp.arange(size)  # (nnz, size)
-    cumsum_per_dest = jnp.cumsum(
-        dest_mask.astype(jnp.int32), axis=0
-    )  # Running count per dest
-    positions = (
-        jnp.sum(cumsum_per_dest * dest_mask.astype(jnp.int32), axis=1) - 1
-    )  # Position for each element
+    # Since dest_ranks_sorted is sorted by destination rank, positions can be
+    # computed via segment offsets (avoids O(nnz*nranks) one-hot masks).
+    send_displs = jnp.concatenate(
+        [
+            jnp.array([0], dtype=jnp.int32),
+            jnp.cumsum(send_counts[:-1]).astype(jnp.int32),
+        ]
+    )
+    positions = jnp.arange(nnz, dtype=jnp.int32) - send_displs[dest_ranks_sorted]
 
     # Use precalculated max_nnz for buffer sizing
     # This ensures all ranks use the same buffer size for alltoall
@@ -290,37 +286,23 @@ def _mpi4jax_alltoallv_transpose(
     c_sorted = at_cols[sort_idx]
     v_sorted = recv_data_flat[sort_idx]
 
-    # Build indptr using segment_sum equivalent
-    # Count elements per row
-    row_one_hot = jax.nn.one_hot(r_sorted, n_local, dtype=jnp.int32)
-    row_counts_at = jnp.sum(row_one_hot, axis=0)
+    # Build indptr from row counts
+    row_counts_at = jnp.bincount(r_sorted, length=n_local).astype(jnp.int32)
 
     out_indptr = jnp.zeros(n_local + 1, dtype=indptr.dtype)
     out_indptr = out_indptr.at[1:].set(jnp.cumsum(row_counts_at).astype(jnp.int32))
 
-    # Output data and indices (already sorted)
+    # Output data and indices (already sorted). For square matrices with
+    # fixed sparsity, transpose preserves nnz, so no padding/truncation needed.
     out_data = v_sorted
     out_indices = c_sorted
-
-    # Ensure output has same nnz as input for shape compatibility
-    # Pad or truncate to match original nnz
-    target_nnz = nnz
-    actual_nnz = out_data.shape[0]
-
-    # Pad if needed (transpose may have different nnz, but for square matrices it's the same)
-    out_data_padded = jnp.zeros(target_nnz, dtype=data.dtype)
-    out_indices_padded = jnp.zeros(target_nnz, dtype=jnp.int32)
-    out_data_padded = out_data_padded.at[:actual_nnz].set(out_data[:target_nnz])
-    out_indices_padded = out_indices_padded.at[:actual_nnz].set(
-        out_indices[:target_nnz]
-    )
-    out_indptr = out_indptr.at[-1].set(target_nnz)
+    out_indptr = out_indptr.at[-1].set(nnz)
 
     # Convert output indices to int64
     with temp_enable_x64():
-        out_indices_int64 = out_indices_padded.astype(jnp.int64)
+        out_indices_int64 = out_indices.astype(jnp.int64)
 
-    return out_data_padded, out_indices_int64, out_indptr
+    return out_data, out_indices_int64, out_indptr
 
 
 def partition_csr_matrix(
