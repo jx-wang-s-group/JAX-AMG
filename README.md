@@ -12,7 +12,7 @@
 ## Prerequisites
 
 - Python 3.10+
-- JAX 0.9.0+ with CUDA support
+- JAX 0.4.35+ with CUDA support
 - AmgX 2.5.0+
 - CUDA Toolkit 12.0+
 
