@@ -246,6 +246,7 @@ cd "$PROJECT_ROOT"
 pip install -e ".$PIP_EXTRAS"
 
 # Step 6: Verify installation
+export LD_LIBRARY_PATH=$AMGX_BUILD:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 echo
 print_info "Verifying installation..."
 python3 -c "import jaxamg; print('JAX-AMG imported successfully')" || {
