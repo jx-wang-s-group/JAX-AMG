@@ -7,6 +7,7 @@ from .jaxamg import (
     AMGXStatus,
     clear_solver_cache,
     finalize,
+    get_solver_cache_info,
     solve,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "cache_mpi_metadata",
     "AMGXStatus",
     "clear_solver_cache",
+    "get_solver_cache_info",
     "finalize",
 ]

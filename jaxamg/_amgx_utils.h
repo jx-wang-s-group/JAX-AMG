@@ -66,6 +66,29 @@ namespace
   public:
     explicit LRUCache(size_t capacity) : capacity_(capacity) {}
 
+    size_t size() const
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      return cache_map_.size();
+    }
+
+    size_t capacity() const
+    {
+      return capacity_;
+    }
+
+    std::vector<Key> snapshot_keys() const
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      std::vector<Key> keys;
+      keys.reserve(lru_list_.size());
+      for (const auto &pair : lru_list_)
+      {
+        keys.push_back(pair.first);
+      }
+      return keys;
+    }
+
     bool get(const Key &key, Value &value)
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -175,7 +198,7 @@ namespace
     size_t capacity_;
     std::list<std::pair<Key, Value>> lru_list_;
     std::unordered_map<Key, typename std::list<std::pair<Key, Value>>::iterator> cache_map_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
   };
 
   struct CacheKey

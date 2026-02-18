@@ -29,6 +29,19 @@ namespace ffi = xla::ffi;
 
 namespace
 {
+  inline const char *ModeToString(int mode)
+  {
+    switch (mode)
+    {
+    case AMGX_mode_dFFI:
+      return "float32";
+    case AMGX_mode_dDDI:
+      return "float64";
+    default:
+      return "unknown";
+    }
+  }
+
   // Register XLA FFI Handler (single-GPU)
   XLA_FFI_DEFINE_HANDLER(
       AmgxSolve,
@@ -144,5 +157,51 @@ PYBIND11_MODULE(_amgx, m)
         {
           GetSolverCache().clear(DestroyResources);
           GetMPISolverCache().clear(DestroyResources);
+        });
+  m.def("get_solver_cache_info", []()
+        {
+          auto single_keys = GetSolverCache().snapshot_keys();
+          auto mpi_keys = GetMPISolverCache().snapshot_keys();
+
+          py::list single_entries;
+          for (const auto &k : single_keys) {
+            py::dict entry;
+            entry["n_rows"] = py::int_(k.n_rows);
+            entry["nnz"] = py::int_(k.nnz);
+            entry["mode"] = py::str(ModeToString(k.mode));
+            entry["transpose_solve"] = py::bool_(k.transpose_solve);
+            entry["config"] = py::str(k.config);
+            single_entries.append(entry);
+          }
+
+          py::list mpi_entries;
+          for (const auto &k : mpi_keys) {
+            py::dict entry;
+            entry["n_local"] = py::int_(k.n_local);
+            entry["n_global"] = py::int_(k.n_global);
+            entry["nnz"] = py::int_(k.nnz);
+            entry["lrank"] = py::int_(k.lrank);
+            entry["mode"] = py::str(ModeToString(k.mode));
+            entry["transpose_solve"] = py::bool_(k.transpose_solve);
+            entry["structure_hash"] = py::int_(k.structure_hash);
+            entry["config"] = py::str(k.config);
+            mpi_entries.append(entry);
+          }
+
+          py::dict single_gpu;
+          single_gpu["size"] = py::int_(GetSolverCache().size());
+          single_gpu["capacity"] = py::int_(GetSolverCache().capacity());
+          single_gpu["entries"] = single_entries;
+
+          py::dict mpi;
+          mpi["size"] = py::int_(GetMPISolverCache().size());
+          mpi["capacity"] = py::int_(GetMPISolverCache().capacity());
+          mpi["entries"] = mpi_entries;
+
+          py::dict info;
+          info["single_gpu"] = single_gpu;
+          info["mpi"] = mpi;
+          info["isolated_mode"] = py::bool_(IsIsolatedMode());
+          return info;
         });
 }

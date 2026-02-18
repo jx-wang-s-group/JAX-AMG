@@ -133,8 +133,7 @@ def main():
             break
 
     if rank == 0:
-        print()
-        print(f"Final diag: {diag_init:.4f}, True diag: {true_diag:.4f}")
+        print(f"\nFinal diag: {diag_init:.4f}, True diag: {true_diag:.4f}")
 
     comm.Barrier()
     jaxamg.finalize()

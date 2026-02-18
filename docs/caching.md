@@ -77,6 +77,16 @@ change across repeated solves. The wall-time savings from skipping the expensive
 phase often outweigh the small increase in iterations that may result from a slightly
 stale internal state.
 
+
+## Cache inspection
+
+Use `jaxamg.get_solver_cache_info()` for inspecting current solver cache state, which includes:
+
+
+- Current `size`/`capacity` for both native caches (`single_gpu`, `mpi`)
+- Per-entry summaries (dimensions, mode, config, hashes)
+- `isolated_mode` flag
+
 ## Clearing caches and cleanup
 
 ```python

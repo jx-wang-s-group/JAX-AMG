@@ -1,4 +1,5 @@
 import functools
+import json
 from collections.abc import Callable
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, cast
@@ -525,6 +526,30 @@ def clear_solver_cache() -> None:
     This releases all cached AmgX resources (matrices, solvers, vectors).
     """
     _amgx.clear_solver_cache()
+
+
+def get_solver_cache_info() -> dict[str, Any]:
+    """
+    Inspect the internal C++ AmgX solver caches.
+
+    Returns:
+        A dictionary with cache size/capacity and entry summaries
+        for single-GPU and MPI caches, plus whether isolated mode
+        (`JAXAMG_CACHE_SIZE=0`) is active.
+    """
+    solver_info = _amgx.get_solver_cache_info()
+
+    # Convert config strings to JSON
+    solver_info["single_gpu"]["entries"] = [
+        {**entry, "config": json.loads(entry["config"])}
+        for entry in solver_info["single_gpu"]["entries"]
+    ]
+    solver_info["mpi"]["entries"] = [
+        {**entry, "config": json.loads(entry["config"])}
+        for entry in solver_info["mpi"]["entries"]
+    ]
+
+    return solver_info
 
 
 def finalize() -> None:
