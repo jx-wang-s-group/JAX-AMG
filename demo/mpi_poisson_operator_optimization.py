@@ -113,6 +113,10 @@ def main():
         print("-" * 50)
 
     for epoch in range(200):
+        # Force solver rebuild
+        if epoch % 20 == 0:
+            jaxamg.clear_solver_cache()
+
         # Compute local loss and gradient
         l_loc = loss_local(skew_init, b_local, x_target_local)
         g_loc = grad_fn(skew_init, b_local, x_target_local)

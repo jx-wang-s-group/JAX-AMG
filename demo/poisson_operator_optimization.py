@@ -44,6 +44,10 @@ def main():
     grad_fn = jax.jit(jax.grad(loss_fn))
 
     for epoch in range(200):
+        # Force solver rebuild
+        if epoch % 10 == 0:
+            jaxamg.clear_solver_cache()
+
         l = loss_fn(skew_init, b, x_target)
         g = grad_fn(skew_init, b, x_target)
 

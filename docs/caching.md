@@ -59,12 +59,23 @@ Behavior (two modes):
 - `0`: isolated mode (no resource caching)
     - Create/destroy native resources every call.
     - Best for debugging behavior and cache isolation.
-- Positve values (default: `1`): cache-enabled mode
+- Positive values (default: `1`): cache-enabled mode
     - Reuses native resources through an LRU cache for improved performance.
-    - Larger values enables multi-entry reuse when alternating among multiple matrix
+    - Larger values enable multi-entry reuse when alternating among multiple matrix
     structures/configs, including cases where the forward pass uses `A` and the
     gradient/backward pass uses a structurally different `A^T`.
 
+### Solver setup reuse
+
+When the cache hits (same sparsity structure and config as a previous solve), only the
+matrix values are updated via `AMGX_matrix_replace_coefficients`. The internal solver
+state built by `AMGX_solver_setup` during the first solve is **reused as-is** — setup
+is not called again.
+
+This is a common approach when the sparsity pattern stays fixed but coefficient values
+change across repeated solves. The wall-time savings from skipping the expensive setup
+phase often outweigh the small increase in iterations that may result from a slightly
+stale internal state.
 
 ## Clearing caches and cleanup
 
@@ -75,7 +86,26 @@ jaxamg.clear_solver_cache()  # Clears C++ AmgX handle cache
 jaxamg.finalize()            # Clears caches/resources and tears down native state
 ```
 
-Notes:
+### When to call `clear_solver_cache()`
+
+Because solver setup state is reused on cache hit, force a rebuild when reuse quality
+starts to degrade (for example, iteration counts grow noticeably or residual reduction
+stalls).
+
+For workloads with frequent large coefficient updates (including many optimization
+workflows), a simple heuristic is to rebuild every `N` steps:
+
+```python
+for step in range(num_steps):
+    if step % 10 == 0:
+        jaxamg.clear_solver_cache()
+    x, info = jaxamg.solve(A, b)
+```
+
+In many workloads with fixed sparsity and gradually changing coefficients, clearing the
+cache is not necessary and setup reuse remains effective throughout the run.
+
+### Notes
 
 - `clear_solver_cache()` targets native C++ AmgX resources.
 - Metadata attached via `with_cache(...)` remains on Python objects until those objects are replaced or discarded.

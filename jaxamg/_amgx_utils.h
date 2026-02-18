@@ -362,12 +362,13 @@ namespace
       if (res.x_vec) AMGX_vector_destroy(res.x_vec);
       if (res.A) AMGX_matrix_destroy(res.A);
 
-      // Only destroy resources handle in Isolated Mode (Cache=0).
       if (res.owns_resources) {
           if (res.rsrc) AMGX_resources_destroy(res.rsrc);
+          if (res.cfg) AMGX_config_destroy(res.cfg);
       }
-
-      if (res.cfg) AMGX_config_destroy(res.cfg);
+      // In shared mode (owns_resources == false), the founding config is
+      // owned by Global{MPI}Resources and destroyed in its Destroy().
+      // Non-founding configs are tiny and cleaned up at process exit.
       if (res.values_buf) cudaFree(res.values_buf);
       if (res.transpose_row_ptrs) cudaFree(res.transpose_row_ptrs);
       if (res.transpose_col_indices) cudaFree(res.transpose_col_indices);
@@ -380,6 +381,8 @@ namespace
   }
 
   // Singleton for global AmgX resource management.
+  // Owns the founding AMGX_config_handle that the resources were created with,
+  // because the resources handle internally references it.
   class GlobalResources {
   public:
       static GlobalResources& Get() {
@@ -390,10 +393,8 @@ namespace
       AMGX_resources_handle GetHandle(AMGX_config_handle cfg) {
           std::lock_guard<std::mutex> lock(mutex_);
           if (!handle_) {
-              // Create resources with the provided config.
-              // Note: We assume the first config providing resources settings
-              // is sufficient for the application's lifetime.
               AMGX_SAFE_CALL_VOID(AMGX_resources_create_simple(&handle_, cfg));
+              cfg_ = cfg;
           }
           return handle_;
       }
@@ -404,19 +405,25 @@ namespace
               AMGX_SAFE_CALL_VOID(AMGX_resources_destroy(handle_));
               handle_ = nullptr;
           }
+          if (cfg_) {
+              AMGX_SAFE_CALL_VOID(AMGX_config_destroy(cfg_));
+              cfg_ = nullptr;
+          }
       }
 
   private:
-      GlobalResources() : handle_(nullptr) {}
+      GlobalResources() : handle_(nullptr), cfg_(nullptr) {}
       ~GlobalResources() { Destroy(); }
 
       AMGX_resources_handle handle_;
+      AMGX_config_handle cfg_;
       std::mutex mutex_;
   };
 
   // Singleton for global MPI AmgX resource management. Shares one
   // AMGX_resources_handle across all MPI cache entries so multiple
   // matrix/solver pairs can coexist on the same communicator.
+  // Owns the founding config handle (same reason as GlobalResources).
   class GlobalMPIResources {
   public:
       static GlobalMPIResources& Get() {
@@ -429,6 +436,7 @@ namespace
           std::lock_guard<std::mutex> lock(mutex_);
           if (!handle_) {
               AMGX_SAFE_CALL_VOID(AMGX_resources_create(&handle_, cfg, comm, ndevs, devs));
+              cfg_ = cfg;
           }
           return handle_;
       }
@@ -439,13 +447,18 @@ namespace
               AMGX_SAFE_CALL_VOID(AMGX_resources_destroy(handle_));
               handle_ = nullptr;
           }
+          if (cfg_) {
+              AMGX_SAFE_CALL_VOID(AMGX_config_destroy(cfg_));
+              cfg_ = nullptr;
+          }
       }
 
   private:
-      GlobalMPIResources() : handle_(nullptr) {}
+      GlobalMPIResources() : handle_(nullptr), cfg_(nullptr) {}
       ~GlobalMPIResources() { Destroy(); }
 
       AMGX_resources_handle handle_;
+      AMGX_config_handle cfg_;
       std::mutex mutex_;
   };
 

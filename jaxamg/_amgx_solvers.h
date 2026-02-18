@@ -297,10 +297,13 @@ namespace
 
       // Initialize solution vector to zero
       AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
+
+      // Setup solver once for this structure; reused on subsequent cache hits.
+      // Call jaxamg.clear_solver_cache() to force a rebuild.
+      AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
     }
 
     // 5. Solve System
-    AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
     AMGX_SAFE_CALL(AMGX_solver_solve(res.solver, res.b_vec, res.x_vec));
 
     // 6. Retrieve Results & Statistics
@@ -485,10 +488,13 @@ namespace
       std::vector<T> h_x(n_local, static_cast<T>(0));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
+
+      // Setup solver once for this structure; reused on subsequent cache hits.
+      // Call jaxamg.clear_solver_cache() to force a rebuild.
+      AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
     }
 
     // Solve
-    AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
     AMGX_SAFE_CALL(AMGX_solver_solve(res.solver, res.b_vec, res.x_vec));
 
     // Retrieve results
