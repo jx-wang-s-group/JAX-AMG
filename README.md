@@ -28,14 +28,13 @@
 A simple tridiagonal system can be solved as:
 
 ```python
-import jax.numpy as jnp
 import jaxamg
-from jaxamg.matrices import tridiagonal_matrix
+from jaxamg.matrices import tridiagonal_matrix, rhs_ones
 
 # Create a simple tridiagonal system
 n = 100
 A = tridiagonal_matrix(n, diagonal_value=2.0)
-b = jnp.ones(n, dtype=jnp.float32)
+b = rhs_ones(n)
 
 # Solve Ax = b
 x, info = jaxamg.solve(A, b)
