@@ -30,21 +30,31 @@ If you do not provide a config, JAX-AMG uses:
     "solver": "PBICGSTAB",
     "preconditioner": {
         "solver": "AMG",
-        "smoother": {"solver": "JACOBI_L1", "relaxation_factor": 0.8},
+        "algorithm": "CLASSICAL",
+        "selector": "PMIS",
+        "interpolator": "D2",
+        "smoother": "BLOCK_JACOBI",
         "presweeps": 1,
         "postsweeps": 1,
-        "coarse_solver": "NOSOLVER",
-        "max_levels": 50,
+        "coarse_solver": "DENSE_LU_SOLVER",
+        "strength_threshold": 0.5,
+        "max_levels": 100,
         "cycle": "V",
     },
+    "convergence": "RELATIVE_INI",
     "tolerance": 1e-6,
     "max_iters": 1000,
-    "print_solve_stats": 1,
     "norm": "L2",
 }
 ```
 
-JAX-AMG also enables residual tracking internally (`monitor_residual=1`, `store_res_history=1`) so `info["residual"]` is available.
+User-supplied keys are merged into these defaults, so you only need
+to specify what you want to change.  For example,
+`config={"preconditioner": {"solver": "AMG"}}` inherits all the Classical AMG
+settings above.
+
+JAX-AMG also enables residual tracking internally (`monitor_residual=1`,
+`store_res_history=1`) so `info["residual"]` is always available.
 
 ### MPI config
 
@@ -64,7 +74,7 @@ config = {
 
 JAX-AMG supports both flat (simple) and nested config dict:
 
-- **Flat config** (simple dict with top-level keys like `solver`, `tolerance`), for example:
+- **Flat config** (simple dict with top-level keys like `solver`, `tolerance`).
 ```python
 config = {
     "solver": "CG",
@@ -73,7 +83,8 @@ config = {
     "max_iters": 200,
 }
 ```
-- **Nested config** (`config_version: 2` with `solver: {...}` scope), for example:
+
+- **Nested config** (`config_version: 2` with `solver: {...}` scope).
 ```python
 config = {
     "config_version": 2,
@@ -89,10 +100,6 @@ config = {
 }
 ```
 
-For nested configs, JAX-AMG forwards your structure directly to AmgX and does not inject flat defaults into nested scopes.
-
-### MPI config
-
 ## Common configuration keys
 
 These are commonly used and work in JAX-AMG:
@@ -103,25 +110,40 @@ These are commonly used and work in JAX-AMG:
 | `preconditioner` | `str` or `dict` | Optional preconditioner solver (simple or nested). |
 | `tolerance` | `float` | Convergence tolerance. |
 | `max_iters` | `int` | Max solver iterations. |
+| `convergence` | `str` | Convergence criterion (see below). |
 | `norm` | `str` | Residual norm type, commonly `L2`. |
-| `monitor_residual` | `0/1` | Enable residual monitoring. |
-| `store_res_history` | `0/1` | Store residual history. |
-| `print_solve_stats` | `0/1` | Print per-solve stats from AmgX. |
-| `obtain_timings` | `0/1` | Collect setup/solve timings in AmgX. |
+| `monitor_residual` | `0` or `1` | Enable residual monitoring. |
+| `store_res_history` | `0` or `1` | Store residual history. |
+| `print_solve_stats` | `0` or `1` | Print per-solve stats from AmgX. |
+| `obtain_timings` | `0` or `1` | Collect setup/solve timings in AmgX. |
 | `communicator` | `str` | MPI communication mode (`MPI` or `MPI_DIRECT`). |
 
-AMG-specific keys (inside AMG solver/preconditioner scopes):
+### Convergence criteria
+
+| Value | Meaning |
+|---|---|
+| `ABSOLUTE` | Absolute residual threshold check. |
+| `RELATIVE_INI_CORE` | Core variant of `RELATIVE_INI` (same criterion family, different internal residual handling). |
+| `RELATIVE_MAX_CORE` | Core variant of `RELATIVE_MAX` (same criterion family, different internal residual handling). |
+| `RELATIVE_INI` | True relative residual ‖r_k‖ / ‖r_0‖. Computes the explicit residual at every iteration (default). |
+| `RELATIVE_MAX` | Max-norm relative residual. |
+| `COMBINED_REL_INI_ABS` | Combined relative-initial and absolute criterion. |
+
+### AMG-specific keys
+
+These go inside the AMG solver/preconditioner scope:
 
 | Key | Meaning |
 |---|---|
-| `algorithm` | AMG algorithm family (for example `AGGREGATION`). |
-| `smoother` | Smoother solver, e.g. `JACOBI_L1`, `MULTICOLOR_DILU`. |
-| `presweeps`, `postsweeps` | Number of smoothing sweeps. |
-| `coarse_solver` | Coarse-level solver, e.g. `DENSE_LU_SOLVER`, `NOSOLVER`. |
-| `max_levels` | Maximum multigrid levels. |
-| `cycle` | Cycle type (`V`, `W`, `F`, `CG`, `CGF`). |
-| `selector` | Aggregation selector (e.g. `SIZE_2`, `SIZE_4`, `SIZE_8`, `MULTI_PAIRWISE`). |
-| `interpolator` | Interpolation strategy (commonly `D2` in sample configs). |
+| `algorithm` | AMG algorithm: `CLASSICAL` (default) or `AGGREGATION`. |
+| `selector` | Coarsening selector. Classical: `PMIS` (default), `HMIS`. Aggregation: `SIZE_2`, `SIZE_4`, `SIZE_8`, `MULTI_PAIRWISE`. |
+| `interpolator` | Interpolation strategy, e.g. `D2` (default for Classical). |
+| `smoother` | Smoother solver, e.g. `BLOCK_JACOBI` (default), `JACOBI_L1`, `MULTICOLOR_GS`, `MULTICOLOR_DILU`. |
+| `presweeps`, `postsweeps` | Number of smoothing sweeps (default: 1). |
+| `coarse_solver` | Coarse-level solver: `DENSE_LU_SOLVER` (default) or `NOSOLVER`. |
+| `strength_threshold` | Strength of connection threshold for coarsening (default: 0.5). |
+| `max_levels` | Maximum multigrid levels (default: 100). |
+| `cycle` | Cycle type: `V` (default), `W`, `F`, `CG`, `CGF`. |
 
 
 ## Supported Solvers and Preconditioners
@@ -145,7 +167,7 @@ AmgX supports a broader set of solvers, preconditioners, and smoothers:
 | `GS` | Gauss-Seidel preconditioner/smoother. |
 | `MULTICOLOR_GS` | Parallelized Gauss-Seidel using graph coloring. |
 | `MULTICOLOR_ILU` | Parallelized incomplete LU factorization (ILU) with graph coloring. |
-| `MULTICOLOR_DILU` | Parallelized diagonal ILU varian with graph coloring. |
+| `MULTICOLOR_DILU` | Parallelized diagonal ILU variant with graph coloring. |
 | `CHEBYSHEV` | Chebyshev iterative method. |
 | `CHEBYSHEV_POLY` | Polynomial Chebyshev method. |
 | `CF_JACOBI` | C/F-point Jacobi variant for AMG. |
