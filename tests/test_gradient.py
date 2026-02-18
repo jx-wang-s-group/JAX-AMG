@@ -60,7 +60,7 @@ class TestGradient:
         grad_sp = 2.0 * spla.spsolve(A_sp.T.tocsr(), np.asarray(x))
 
         # Comparison with SciPy solution
-        np.testing.assert_allclose(grad_jax, grad_sp, rtol=1e-6)
+        np.testing.assert_allclose(grad_jax, grad_sp, atol=1e-6)
 
         # Comparison with finite differences
         check_grads(loss, (b,), order=1, modes=["rev"])
@@ -92,7 +92,7 @@ class TestGradient:
         grad_sp = spla.spsolve(A_sp.T.tocsr(), np.asarray(v))
 
         # Comparison with SciPy solution
-        np.testing.assert_allclose(grad_jax, grad_sp, rtol=1e-5)
+        np.testing.assert_allclose(grad_jax, grad_sp, atol=1e-6)
 
         # Comparison with finite differences
         check_grads(loss, (b,), order=1, modes=["rev"])

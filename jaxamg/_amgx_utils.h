@@ -203,22 +203,20 @@ namespace
 
   struct CacheKey
   {
-    const void *row_ptrs;
-    const void *col_indices;
     int n_rows;
     int nnz;
-    int mode; // AMGX_Mode (dFFI vs dDDI) to distinguish f32/f64
+    int mode; // AMGX_Mode (dFFI vs dDDI)
     bool transpose_solve;
+    size_t structure_hash; // FNV-1a of row_ptrs content
     std::string config;
 
     bool operator==(const CacheKey &other) const
     {
-      return row_ptrs == other.row_ptrs &&
-             col_indices == other.col_indices &&
-             n_rows == other.n_rows &&
+      return n_rows == other.n_rows &&
              nnz == other.nnz &&
              mode == other.mode &&
              transpose_solve == other.transpose_solve &&
+             structure_hash == other.structure_hash &&
              config == other.config;
     }
   };
@@ -246,7 +244,7 @@ namespace
     int n_global;
     int nnz;
     int lrank;
-    int mode; // AMGX_Mode (dFFI vs dDDI) to distinguish f32/f64
+    int mode; // AMGX_Mode (dFFI vs dDDI)
     bool transpose_solve;
     uint64_t comm_ptr;
     size_t structure_hash;
@@ -274,16 +272,14 @@ namespace std
   {
     size_t operator()(const CacheKey &k) const
     {
-      size_t h1 = hash<const void *>()(k.row_ptrs);
-      size_t h2 = hash<const void *>()(k.col_indices);
-      size_t h3 = hash<int>()(k.n_rows);
-      size_t h4 = hash<int>()(k.nnz);
-      size_t h5 = hash<int>()(k.mode);
-      size_t h6 = hash<bool>()(k.transpose_solve);
-      size_t h7 = hash<string>()(k.config);
+      size_t h1 = hash<int>()(k.n_rows);
+      size_t h2 = hash<int>()(k.nnz);
+      size_t h3 = hash<int>()(k.mode);
+      size_t h4 = hash<bool>()(k.transpose_solve);
+      size_t h5 = hash<size_t>()(k.structure_hash);
+      size_t h6 = hash<string>()(k.config);
 
-      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5) ^
-             (h7 << 6);
+      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
     }
   };
 
@@ -310,7 +306,6 @@ namespace std
 
 namespace
 {
-  // Unified cached resource handle for both non-MPI and MPI solvers.
   struct CachedResources
   {
     AMGX_config_handle cfg = nullptr;
@@ -319,11 +314,11 @@ namespace
     AMGX_solver_handle solver = nullptr;
     AMGX_vector_handle x_vec = nullptr;
     AMGX_vector_handle b_vec = nullptr;
-    void *values_buf = nullptr; // Persistent buffer for MPI replace_coefficients (null for non-MPI)
-    void *transpose_row_ptrs = nullptr; // Cached transpose row ptrs (single-GPU transpose_solve mode)
-    void *transpose_col_indices = nullptr; // Cached transpose column indices (single-GPU transpose_solve mode)
-    void *transpose_values = nullptr; // Cached transpose values (single-GPU transpose_solve mode)
-    bool owns_resources = false; // True if isolated (Cache=0), False if shared (Cache>=1)
+    void *values_buf = nullptr;            // MPI replace_coefficients buffer (null for non-MPI)
+    void *transpose_row_ptrs = nullptr;    // transpose_solve mode only
+    void *transpose_col_indices = nullptr; // transpose_solve mode only
+    void *transpose_values = nullptr;      // transpose_solve mode only
+    bool owns_resources = false;           // true if isolated (JAXAMG_CACHE_SIZE=0)
   };
 
   // Parse JAXAMG_CACHE_SIZE env var (default: 1).

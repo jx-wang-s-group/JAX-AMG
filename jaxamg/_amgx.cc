@@ -170,6 +170,7 @@ PYBIND11_MODULE(_amgx, m)
             entry["nnz"] = py::int_(k.nnz);
             entry["mode"] = py::str(ModeToString(k.mode));
             entry["transpose_solve"] = py::bool_(k.transpose_solve);
+            entry["structure_hash"] = py::int_(k.structure_hash);
             entry["config"] = py::str(k.config);
             single_entries.append(entry);
           }

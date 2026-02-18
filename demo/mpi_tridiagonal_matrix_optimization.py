@@ -66,7 +66,6 @@ def main():
         "solver": "PCG",
         "preconditioner": {"solver": "JACOBI_L1"},
         "communicator": "MPI_DIRECT",
-        "min_rows_latency_hiding": 0,
         "obtain_timings": 1,
         "print_solve_stats": 1,
     }

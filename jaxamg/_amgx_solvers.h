@@ -132,7 +132,7 @@ namespace
     cudaStreamSynchronize(stream);
 
     CachedResources res;
-    // 1. Setup execution context
+    // Setup execution context
     int device;
     if (cudaGetDevice(&device) != cudaSuccess)
     {
@@ -144,7 +144,6 @@ namespace
       return ffi::Error::Internal("cudaSetDevice failed");
     }
 
-    // 2. Prepare data pointers
     // Cast to raw pointers to avoid host transfers.
     int *row_ptrs_data = const_cast<int *>(row_ptrs.typed_data());
     int *col_indices_data = const_cast<int *>(col_indices.typed_data());
@@ -153,21 +152,40 @@ namespace
     T *x_data = x->typed_data();
     T *stats_data = stats->typed_data();
 
-    // Dimensions
     const int n_rows = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
     const int nnz = static_cast<int>(values.element_count());
 
-    // 3. Check Cache
-    CacheKey key = {row_ptrs_data, col_indices_data, n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, std::string(config)};
+    // Cache the last key to skip the structure hash D2H on repeated calls.
+    static CacheKey last_key = {};
+    static bool last_key_valid = false;
+
+    size_t structure_hash = 0;
+    bool fast_path = false;
+
+    if (last_key_valid &&
+        last_key.n_rows == n_rows &&
+        last_key.nnz == nnz &&
+        last_key.mode == static_cast<int>(Mode) &&
+        last_key.transpose_solve == (transpose_solve != 0) &&
+        last_key.config == std::string(config))
+    {
+      structure_hash = last_key.structure_hash;
+      fast_path = true;
+    }
+    else
+    {
+      std::vector<int> h_row_ptrs(n_rows + 1);
+      cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+      structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_rows + 1) * sizeof(int));
+    }
+
+    CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, structure_hash, std::string(config)};
     bool cache_hit = GetSolverCache().get(key, res);
 
     bool reuse_success = false;
 
     if (cache_hit)
     {
-      // REUSE RESOURCES
-      // Update matrix values.
-      // Note: AMGX_matrix_replace_coefficients signature: (mtx, n_rows, nnz, values, diag)
       if (transpose_solve != 0)
       {
         if (!res.transpose_row_ptrs || !res.transpose_col_indices || !res.transpose_values)
@@ -197,14 +215,14 @@ namespace
             res.A, n_rows, (int)values.element_count(), values_data, nullptr));
       }
 
-      // Upload new RHS
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
-
-      // Reset X to zero
       AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
 
       reuse_success = true;
     }
+
+    last_key = key;
+    last_key_valid = true;
 
     if (!cache_hit)
     {
@@ -219,14 +237,11 @@ namespace
          res.rsrc = GlobalResources::Get().GetHandle(res.cfg);
       }
 
-      // Create Matrix and Vectors
       AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_vector_create(&res.x_vec, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_vector_create(&res.b_vec, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, Mode, res.cfg));
 
-      // Bind Data (No Copies)
-      // Upload matrix data (binds device pointers)
       if (transpose_solve != 0)
       {
         if (cudaMalloc(&res.transpose_row_ptrs, (n_rows + 1) * sizeof(int)) != cudaSuccess)
@@ -292,21 +307,15 @@ namespace
             nullptr));
       }
 
-      // Bind RHS vector
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
-
-      // Initialize solution vector to zero
       AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
-
-      // Setup solver once for this structure; reused on subsequent cache hits.
-      // Call jaxamg.clear_solver_cache() to force a rebuild.
       AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
     }
 
-    // 5. Solve System
+    // Solve System
     AMGX_SAFE_CALL(AMGX_solver_solve(res.solver, res.b_vec, res.x_vec));
 
-    // 6. Retrieve Results & Statistics
+    // Retrieve Results & Statistics
     AMGX_SOLVE_STATUS status;
     AMGX_SAFE_CALL(AMGX_solver_get_status(res.solver, &status));
 
@@ -320,17 +329,17 @@ namespace
 
     AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(res.solver, &iters));
 
-    // Retrieve residual at the final iteration
-    AMGX_SAFE_CALL(AMGX_solver_get_iteration_residual(res.solver, iters, 0, &residual));
+    AMGX_RC res_rc = AMGX_solver_get_iteration_residual(res.solver, iters, 0, &residual);
+    if (res_rc != AMGX_RC_OK) {
+      residual = -1.0;
+    }
 
-    // Transfer stats to output buffer [iters, residual, status]
     T stats_host[3] = {
         static_cast<T>(iters),
         static_cast<T>(residual),
         static_cast<T>(status)};
     cudaMemcpyAsync(stats_data, stats_host, 3 * sizeof(T), cudaMemcpyHostToDevice, stream);
 
-    // Download solution (copies from AmgX internal buffer to JAX output buffer)
     AMGX_SAFE_CALL(AMGX_vector_download(res.x_vec, x_data));
 
     // 7. Store in Cache (if new)
@@ -338,8 +347,6 @@ namespace
     {
        GetSolverCache().put(key, res, DestroyResources);
     }
-    // Do NOT destroy resources here! They are now owned by the cache.
-    // Cleanup happens only on eviction via DestroyResources.
 
     return ffi::Error::Success();
   }
@@ -372,7 +379,6 @@ namespace
 
     EnsureAmgxInitialized();
 
-    // Setup execution context
     int device;
     if (cudaGetDevice(&device) != cudaSuccess)
     {
@@ -384,27 +390,20 @@ namespace
       return ffi::Error::Internal("cudaSetDevice failed");
     }
 
-    // Synchronize stream to ensure inputs are ready
     cudaStreamSynchronize(stream);
-
-    // Get MPI parameters
     int nglobal_host;
-    int comm_ptr_parts[2]; // [low, high] for 64-bit reconstruction
+    int comm_ptr_parts[2];
     int lrank_host;
 
     cudaMemcpy(&nglobal_host, nglobal_buf.typed_data(), sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(comm_ptr_parts, comm_ptr_buf.typed_data(), 2 * sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&lrank_host, lrank_buf.typed_data(), sizeof(int), cudaMemcpyDeviceToHost);
 
-    // Reconstruct 64-bit pointer from two 32-bit parts
+    // Reconstruct 64-bit MPI_Comm* from two 32-bit halves (passed via JAX S32 buffers)
     uint64_t comm_ptr_val = (static_cast<uint64_t>(static_cast<uint32_t>(comm_ptr_parts[1])) << 32) |
                             static_cast<uint64_t>(static_cast<uint32_t>(comm_ptr_parts[0]));
-
-    // MPI._addressof() returns the address of the MPI_Comm object
-    // We need to pass this address to AMGX (which expects MPI_Comm*)
     MPI_Comm *mpi_comm = reinterpret_cast<MPI_Comm *>(comm_ptr_val);
 
-    // 3. Prepare data pointers
     int *row_ptrs_data = const_cast<int *>(row_ptrs.typed_data());
     int64_t *col_indices_data = const_cast<int64_t *>(col_indices.typed_data());
     T *values_data = const_cast<T *>(values.typed_data());
@@ -412,16 +411,33 @@ namespace
     T *x_data = x->typed_data();
     T *stats_data = stats->typed_data();
 
-    // Dimensions
     const int n_local = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
     const int nnz = static_cast<int>(values.element_count());
 
     CachedResources res;
 
-    // Hash row_ptrs content to fingerprint sparsity structure (small D2H copy).
-    std::vector<int> h_row_ptrs(n_local + 1);
-    cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost);
-    size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_local + 1) * sizeof(int));
+    static MPICacheKey mpi_last_key = {};
+    static bool mpi_last_key_valid = false;
+
+    size_t structure_hash = 0;
+
+    if (mpi_last_key_valid &&
+        mpi_last_key.n_local == n_local &&
+        mpi_last_key.n_global == nglobal_host &&
+        mpi_last_key.nnz == nnz &&
+        mpi_last_key.lrank == lrank_host &&
+        mpi_last_key.mode == static_cast<int>(Mode) &&
+        mpi_last_key.comm_ptr == comm_ptr_val &&
+        mpi_last_key.config == std::string(config))
+    {
+      structure_hash = mpi_last_key.structure_hash;
+    }
+    else
+    {
+      std::vector<int> h_row_ptrs(n_local + 1);
+      cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+      structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_local + 1) * sizeof(int));
+    }
 
     MPICacheKey key = {
         n_local,
@@ -437,15 +453,19 @@ namespace
 
     if (cache_hit)
     {
-      // Same structure (guaranteed by structure_hash). Replace values only.
       cudaMemcpy(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice);
       AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
           res.A, n_local, nnz, res.values_buf, nullptr));
+
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
       std::vector<T> h_x(n_local, static_cast<T>(0));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
     }
-    else
+
+    mpi_last_key = key;
+    mpi_last_key_valid = true;
+
+    if (!cache_hit)
     {
       // On cache miss, evict first (if full) so we never create a new MPI
       // resources handle while stale distributed resources are still alive.
@@ -464,7 +484,6 @@ namespace
       AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, Mode, res.cfg));
 
-      // Persistent buffer for values, registered with AMGX's DistributedManager.
       if (cudaMalloc(&res.values_buf, nnz * sizeof(T)) != cudaSuccess)
       {
         return ffi::Error::Internal("cudaMalloc for values buffer failed");
@@ -479,7 +498,6 @@ namespace
           row_ptrs_data, col_indices_data, static_cast<T *>(res.values_buf), nullptr,
           nrings, nrings, nullptr));
 
-      // Create and initialize vectors (AMGX manages halo space)
       AMGX_SAFE_CALL(AMGX_vector_create(&res.x_vec, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_vector_create(&res.b_vec, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_vector_bind(res.x_vec, res.A));
@@ -489,15 +507,10 @@ namespace
       AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
 
-      // Setup solver once for this structure; reused on subsequent cache hits.
-      // Call jaxamg.clear_solver_cache() to force a rebuild.
       AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
     }
 
-    // Solve
     AMGX_SAFE_CALL(AMGX_solver_solve(res.solver, res.b_vec, res.x_vec));
-
-    // Retrieve results
     AMGX_SOLVE_STATUS status;
     AMGX_SAFE_CALL(AMGX_solver_get_status(res.solver, &status));
 
@@ -513,7 +526,11 @@ namespace
     int iters = 0;
     double residual = 0.0;
     AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(res.solver, &iters));
-    AMGX_SAFE_CALL(AMGX_solver_get_iteration_residual(res.solver, iters, 0, &residual));
+
+    AMGX_RC res_rc = AMGX_solver_get_iteration_residual(res.solver, iters, 0, &residual);
+    if (res_rc != AMGX_RC_OK) {
+      residual = -1.0;
+    }
 
     T stats_host[3] = {static_cast<T>(iters), static_cast<T>(residual), static_cast<T>(status)};
     cudaMemcpyAsync(stats_data, stats_host, 3 * sizeof(T), cudaMemcpyHostToDevice, stream);
@@ -524,8 +541,7 @@ namespace
       GetMPISolverCache().put(key, res, DestroyResources);
     }
 
-    // Sync AMGX's internal streams before returning to XLA (required for
-    // JIT forward+backward reuse of cached handles).
+    // Required for JIT forward+backward reuse of cached handles.
     cudaDeviceSynchronize();
 
     return ffi::Error::Success();
@@ -609,17 +625,13 @@ namespace
                                    ffi::Buffer<ffi::DataType::S32> comm_ptr_buf,
                                    ffi::ResultBuffer<DType> recvbuf)
   {
-    // Synchronize stream to ensure inputs are ready
     cudaStreamSynchronize(stream);
 
-    // Get MPI Communicator
     int comm_ptr_parts[2];
     cudaMemcpy(comm_ptr_parts, comm_ptr_buf.typed_data(), 2 * sizeof(int), cudaMemcpyDeviceToHost);
     uint64_t comm_ptr_val = (static_cast<uint64_t>(static_cast<uint32_t>(comm_ptr_parts[1])) << 32) |
                             static_cast<uint64_t>(static_cast<uint32_t>(comm_ptr_parts[0]));
     MPI_Comm *mpi_comm = reinterpret_cast<MPI_Comm *>(comm_ptr_val);
-
-    // Get Counts and Displacements (must be on host for MPI call)
     size_t nranks = recvcounts.element_count();
     std::vector<int> counts_h(nranks);
     std::vector<int> displs_h(nranks);
