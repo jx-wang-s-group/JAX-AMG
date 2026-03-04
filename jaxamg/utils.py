@@ -3,6 +3,7 @@ Helper functions for BCSR matrix operations.
 """
 
 import contextlib
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from typing import cast
@@ -461,7 +462,9 @@ def to_bcsr_matrix(
     )
 
 
-def format_amgx_stats(stats_str: str, filepath: str, rank: int | None = None) -> None:
+def format_amgx_stats(
+    stats_str: str, filepath: str | os.PathLike, rank: int | None = None
+) -> None:
     """Parse raw AmgX captured output and write a formatted stats file.
 
     Segments output into AMG Grid Statistics and Solver/Coarse Solver Iterations.

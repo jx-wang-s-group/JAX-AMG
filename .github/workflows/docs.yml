@@ -22,7 +22,7 @@ jobs:
           pip install -r requirements-dev.txt
       - name: Build documentation
         run: |
-          mkdocs build
+          zensical build
       - name: Upload documentation
         uses: actions/upload-pages-artifact@v3
         with:

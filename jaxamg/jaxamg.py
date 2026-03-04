@@ -1,5 +1,6 @@
 import functools
 import json
+import os
 from collections.abc import Callable
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, cast
@@ -379,7 +380,7 @@ def _get_solver_primitive_mpi(
 
 def _format_and_save_stats(
     stats_str: str,
-    save_stats_file: str,
+    save_stats_file: str | os.PathLike,
     comm: "Comm | None" = None,
     mpi_cache: dict | None = None,
 ) -> None:
@@ -401,7 +402,7 @@ def solve(
     comm: "Comm | None" = None,
     nglobal: int | None = None,
     partition_info: tuple[int, int] | None = None,
-    save_stats_file: str | None = None,
+    save_stats_file: str | os.PathLike | None = None,
     **kwargs: Any,
 ) -> tuple[jax.Array, dict]:
     """Solve `Ax=b` using the AmgX backend. See [Examples](examples.md) for usage.
@@ -411,13 +412,10 @@ def solve(
         b: Right-hand-side vector. In MPI mode this is the local RHS partition.
         config: AmgX configuration dictionary (see [Solver Configuration](config.md) for details). If `None`, JAX-AMG defaults are used.
         comm: MPI communicator (typically `mpi4py.MPI.COMM_WORLD`). If provided, the solve runs in MPI mode. If not provided, MPI mode can still be used if MPI metadata has already been attached via `with_cache(..., mpi=...)`.
-        nglobal: Global matrix row count for MPI mode. Required when `comm` is
-            provided and MPI metadata is not pre-attached to `A`.
-        partition_info: `(row_start, row_end)` owned by this rank in MPI mode.
-            Required when `comm` is provided and MPI metadata is not pre-attached
-            to `A`.
-        **kwargs: Additional AmgX config parameters. These override values in
-            `config` when both are provided.
+        nglobal: Global matrix row count for MPI mode. Required when `comm` is provided and MPI metadata is not pre-attached to `A`.
+        partition_info: `(row_start, row_end)` owned by this rank in MPI mode.  Required when `comm` is provided and MPI metadata is not pre-attached to `A`.
+        save_stats_file: Optional file path to save detailed AmgX solver statistics.  If None, no file is created.
+        **kwargs: Additional AmgX config parameters. These override values in `config` when both are provided.
 
     Returns:
         x: Solution vector (float32 or float64). In MPI mode, returns local portion.

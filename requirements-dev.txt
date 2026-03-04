@@ -14,5 +14,5 @@ ruff
 pre-commit
 
 # Documentation
-mkdocs-material
+zensical
 mkdocstrings-python

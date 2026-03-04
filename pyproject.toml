@@ -30,7 +30,7 @@ dev = [
     "mypy",
     "ruff",
     "pre-commit",
-    "mkdocs-material",
+    "zensical",
     "mkdocstrings[python]",
 ]
 all = [

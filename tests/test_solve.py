@@ -284,7 +284,7 @@ class TestSolver:
         stats_file = tmp_path / "test_stats.txt"
 
         # Solve with AMG to generate both solver iterations and grid stats
-        x, info = jaxamg.solve(A, b, save_stats_file=str(stats_file))
+        x, info = jaxamg.solve(A, b, save_stats_file=stats_file)
 
         assert stats_file.exists()
 
