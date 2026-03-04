@@ -75,12 +75,18 @@ def prepare_config(user_config: dict | None = None, **kwargs: Any) -> str:
         "algorithm": "CLASSICAL",
         "selector": "PMIS",
         "interpolator": "D2",
-        "smoother": "BLOCK_JACOBI",
+        "smoother": {
+            "solver": "BLOCK_JACOBI",
+            "relaxation_factor": 0.9,
+        },
         "presweeps": 1,
         "postsweeps": 1,
-        "coarse_solver": "DENSE_LU_SOLVER",
-        "strength_threshold": 0.5,
         "max_levels": 100,
+        "strength_threshold": 0.5,
+        "dense_lu_num_rows": 1,
+        "aggressive_levels": 0,
+        "coarse_solver": "DENSE_LU_SOLVER",
+        "max_iters": 1,
         "cycle": "V",
     }
 
