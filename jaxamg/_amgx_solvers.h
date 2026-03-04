@@ -124,7 +124,8 @@ namespace
                                ffi::ResultBuffer<DType> x,
                                ffi::ResultBuffer<DType> stats,
                                std::string_view config,
-                               int32_t transpose_solve)
+                               int32_t transpose_solve,
+                               int32_t return_stats)
   {
     EnsureAmgxInitialized();
 
@@ -223,6 +224,8 @@ namespace
 
     last_key = key;
     last_key_valid = true;
+
+    StatsCaptureGuard capture_guard(return_stats != 0);
 
     if (!cache_hit)
     {
@@ -369,7 +372,8 @@ namespace
                                   ffi::ResultBuffer<DType> x,
                                   ffi::ResultBuffer<DType> stats,
                                   std::string_view config,
-                                  int32_t transpose_solve)
+                                  int32_t transpose_solve,
+                                  int32_t return_stats)
   {
     if (transpose_solve != 0)
     {
@@ -465,6 +469,8 @@ namespace
     mpi_last_key = key;
     mpi_last_key_valid = true;
 
+    StatsCaptureGuard capture_guard(return_stats != 0);
+
     if (!cache_hit)
     {
       // On cache miss, evict first (if full) so we never create a new MPI
@@ -556,10 +562,11 @@ namespace
                            ffi::ResultBuffer<ffi::DataType::F32> x,
                            ffi::ResultBuffer<ffi::DataType::F32> stats,
                            std::string_view config,
-                           int32_t transpose_solve)
+                           int32_t transpose_solve,
+                           int32_t return_stats)
   {
     return AmgxSolveInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve);
+        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats);
   }
 
   // Double implementation
@@ -571,10 +578,11 @@ namespace
                                  ffi::ResultBuffer<ffi::DataType::F64> x,
                                  ffi::ResultBuffer<ffi::DataType::F64> stats,
                                  std::string_view config,
-                                 int32_t transpose_solve)
+                                 int32_t transpose_solve,
+                                 int32_t return_stats)
   {
     return AmgxSolveInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve);
+        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats);
   }
 
   // MPI Float implementation
@@ -589,10 +597,11 @@ namespace
                               ffi::ResultBuffer<ffi::DataType::F32> x,
                               ffi::ResultBuffer<ffi::DataType::F32> stats,
                               std::string_view config,
-                              int32_t transpose_solve)
+                              int32_t transpose_solve,
+                              int32_t return_stats)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve);
+        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats);
   }
 
   // MPI Double implementation
@@ -607,10 +616,11 @@ namespace
                                     ffi::ResultBuffer<ffi::DataType::F64> x,
                                     ffi::ResultBuffer<ffi::DataType::F64> stats,
                                     std::string_view config,
-                                    int32_t transpose_solve)
+                                    int32_t transpose_solve,
+                                    int32_t return_stats)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve);
+        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats);
   }
 
   // -------------------------------------------------------------------------

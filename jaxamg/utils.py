@@ -459,3 +459,120 @@ def to_bcsr_matrix(
     return _ensure_bcsr_properties(
         A_bcsr, target_dtype, use_int64_indices=use_int64_indices
     )
+
+
+def format_amgx_stats(stats_str: str, filepath: str, rank: int | None = None) -> None:
+    """Parse raw AmgX captured output and write a formatted stats file.
+
+    Segments output into AMG Grid Statistics and Solver/Coarse Solver Iterations.
+    In MPI mode pass ``rank``; only rank 0 writes the file.
+    """
+    if rank is not None and rank != 0:
+        return
+
+    import re as _re
+
+    filename = filepath
+    lines = stats_str.splitlines()
+
+    # Segment raw lines into "grid" and "table" blocks.
+    blocks: list[tuple[str, list[str]]] = []
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if s.startswith("AMG Grid:"):
+            block: list[str] = []
+            while i < len(lines) and not (
+                lines[i].strip().startswith("iter") and "residual" in lines[i]
+            ):
+                block.append(lines[i])
+                i += 1
+            blocks.append(("grid", block))
+        elif s.startswith("iter") and "residual" in s:
+            block = []
+            in_summary = False
+            while i < len(lines):
+                s = lines[i].strip()
+                if in_summary and (
+                    not s or s.startswith("iter") or s.startswith("AMG Grid")
+                ):
+                    break
+                if s.startswith("---"):
+                    in_summary = True
+                if s:
+                    block.append(lines[i])
+                i += 1
+            blocks.append(("table", block))
+        else:
+            i += 1
+
+    def _fmt_table(tb_lines: list[str], indent: str = "  ") -> list[str]:
+        result = [
+            indent + f"{'Iter':>6}  {'Mem (GB)':>13}  {'Residual':>15}  {'Rate':>8}",
+            indent + "-" * 50,
+        ]
+        in_summary = False
+        saw_first_sep = False
+        for line in tb_lines:
+            s = line.strip()
+            if not s or (s.startswith("iter") and "residual" in s):
+                continue
+            if s.startswith("---"):
+                if not saw_first_sep:
+                    saw_first_sep = True
+                else:
+                    result.append(indent + "-" * 50)
+                    in_summary = True
+                continue
+            if in_summary:
+                if ":" in s:
+                    key, _, val = s.partition(":")
+                    result.append(indent + f"  {key.strip():<30}: {val.strip()}")
+                else:
+                    result.append(indent + "  " + s)
+            else:
+                if not saw_first_sep:
+                    continue
+                parts = s.split()
+                label = parts[0]
+                mem = parts[1] if len(parts) > 1 else ""
+                resid = parts[2] if len(parts) > 2 else ""
+                rate = parts[3] if len(parts) > 3 else ""
+                result.append(indent + f"{label:>6}  {mem:>13}  {resid:>15}  {rate:>8}")
+        return result
+
+    out_lines: list[str] = []
+
+    grid_blocks = [b for t, b in blocks if t == "grid"]
+    if grid_blocks:
+        out_lines += ["=" * 60, "  AMG GRID STATISTICS", "=" * 60]
+        for gb in grid_blocks:
+            for line in gb:
+                s = line.strip()
+                if not s or s.startswith("AMG Grid:"):
+                    continue
+                m = _re.match(
+                    r"^\s*(\d+)\(([DC])\)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)", line
+                )
+                if m:
+                    lvl, t, rows, nnz, parts, sprsty, mem = m.groups()
+                    out_lines.append(
+                        f"  {lvl+'('+t+')':>5}  {rows:>12}  {nnz:>16}  {parts:>5}  {sprsty:>9}  {mem:>12}"
+                    )
+                elif s.startswith("LVL"):
+                    out_lines.append(
+                        f"  {'LVL':>5}  {'ROWS':>12}  {'NNZ':>16}  {'PARTS':>5}  {'SPRSTY':>9}  {'Mem (GB)':>12}"
+                    )
+                else:
+                    out_lines.append("  " + s)
+        out_lines.append("")
+
+    table_blocks = [b for t, b in blocks if t == "table"]
+    if table_blocks:
+        tb = table_blocks[0]
+        out_lines += ["=" * 60, "  SOLVER ITERATIONS", "=" * 60]
+        out_lines.extend(_fmt_table(tb))
+        out_lines.append("")
+
+    with open(filename, "w") as f:
+        f.write("\n".join(out_lines) + "\n")

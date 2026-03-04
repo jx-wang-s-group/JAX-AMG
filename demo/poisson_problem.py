@@ -24,7 +24,7 @@ def main():
 
     # Solve Ax = b
     print("Solving...")
-    x, _ = jaxamg.solve(A, b, solver="CG")
+    x, _ = jaxamg.solve(A, b, solver="CG", save_stats_file="stats_poisson.txt")
 
     # Compute residual: ||b - Ax|| / ||b||
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)

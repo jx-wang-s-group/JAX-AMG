@@ -74,6 +74,7 @@ def _amgx_solve_impl(
     b: ArrayLike,
     config_str: str = "",
     transpose_solve: bool = False,
+    return_stats: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX solver (non-differentiable)."""
 
@@ -101,6 +102,7 @@ def _amgx_solve_impl(
         b,
         config=config_str,
         transpose_solve=np.int32(transpose_solve),
+        return_stats=np.int32(return_stats),
     )
 
     return cast(tuple, results)
@@ -116,6 +118,7 @@ def _amgx_solve_mpi_impl(
     lrank: ArrayLike,
     config_str: str = "",
     transpose_solve: bool = False,
+    return_stats: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX MPI solver (non-differentiable)."""
 
@@ -146,13 +149,16 @@ def _amgx_solve_mpi_impl(
         lrank,
         config=config_str,
         transpose_solve=np.int32(transpose_solve),
+        return_stats=np.int32(return_stats),
     )
 
     return cast(tuple, results)
 
 
 @functools.lru_cache(maxsize=32)
-def _get_solver_primitive(config_str: str, is_symmetric: bool = False) -> Callable:
+def _get_solver_primitive(
+    config_str: str, is_symmetric: bool = False, return_stats: bool = False
+) -> Callable:
     """
     Returns a JAX custom_vjp primitive for AmgX solve with a specific configuration.
     Cached to avoid recompilation for identical configurations.
@@ -161,7 +167,12 @@ def _get_solver_primitive(config_str: str, is_symmetric: bool = False) -> Callab
     @jax.custom_vjp
     def solve(A: jsp.BCSR, b: jax.Array) -> tuple[jax.Array, jax.Array]:
         x, info = _amgx_solve_impl(
-            A.indptr, A.indices, A.data, b, config_str=config_str
+            A.indptr,
+            A.indices,
+            A.data,
+            b,
+            config_str=config_str,
+            return_stats=return_stats,
         )
         return x, info
 
@@ -179,7 +190,7 @@ def _get_solver_primitive(config_str: str, is_symmetric: bool = False) -> Callab
         A, x = residuals
 
         # Solve A^T λ = g_x
-        solver = _get_solver_primitive(config_str, is_symmetric)
+        solver = _get_solver_primitive(config_str, is_symmetric, return_stats=False)
 
         # Check if matrix is symmetric
         if is_symmetric:
@@ -224,6 +235,7 @@ def _get_solver_primitive_mpi(
     is_symmetric: bool = False,
     recvcounts_tuple: tuple[int, ...] | None = None,
     max_nnz: int | None = None,
+    return_stats: bool = False,
 ) -> Callable:
     """
     Create cached JAX custom_vjp primitive for MPI AmgX solve.
@@ -283,6 +295,7 @@ def _get_solver_primitive_mpi(
             comm_ptr_arr,
             lrank_arr,
             config_str=config_str,
+            return_stats=return_stats,
         )
 
         return (x, info), comm_ptr_arr
@@ -364,6 +377,23 @@ def _get_solver_primitive_mpi(
     return solve
 
 
+def _format_and_save_stats(
+    stats_str: str,
+    save_stats_file: str,
+    comm: "Comm | None" = None,
+    mpi_cache: dict | None = None,
+) -> None:
+    """Resolve MPI rank and save formatted AmgX statistics to a file."""
+    rank: int | None = None
+    if comm is not None:
+        rank = comm.Get_rank()
+    elif mpi_cache is not None and "lrank" in mpi_cache:
+        rank = mpi_cache["lrank"]
+    format_amgx_stats(stats_str, save_stats_file, rank=rank)
+    if rank is None or rank == 0:
+        print(f"Stats saved to {save_stats_file}")
+
+
 def solve(
     A: MatrixOrOperator,
     b: ArrayLike,
@@ -371,6 +401,7 @@ def solve(
     comm: "Comm | None" = None,
     nglobal: int | None = None,
     partition_info: tuple[int, int] | None = None,
+    save_stats_file: str | None = None,
     **kwargs: Any,
 ) -> tuple[jax.Array, dict]:
     """Solve `Ax=b` using the AmgX backend. See [Examples](examples.md) for usage.
@@ -402,14 +433,16 @@ def solve(
             "Please ensure you have a CUDA-enabled GPU and JAX is installed with CUDA support."
         )
 
-    # Check if MPI cache is attached to A (via with_cache)
+    # MPI cache may be pre-attached to A via `with_cache`
     mpi_cache = getattr(A, "_mpi_cache", None)
 
     # Prepare configuration string/file (skip if using mpi_cache which already has config_str)
     if mpi_cache is not None:
         config_str = mpi_cache["config_str"]
     else:
-        config_str = amgx_config.prepare_config(config, **kwargs)
+        config_str = amgx_config.prepare_config(
+            config, save_stats=(save_stats_file is not None), **kwargs
+        )
 
     # Detect desired precision
     target_dtype = get_preferred_dtype(A, b)
@@ -446,6 +479,7 @@ def solve(
                 is_symmetric=is_symmetric,
                 recvcounts_tuple=recvcounts_tuple,
                 max_nnz=max_nnz,
+                return_stats=1 if save_stats_file else 0,
             )
             recvcounts = jnp.array(recvcounts_tuple, dtype=jnp.int32)
             displs = jnp.array(mpi_cache["displs_tuple"], dtype=jnp.int32)
@@ -462,9 +496,7 @@ def solve(
 
             # Get MPI rank and compute local GPU assignment
             rank = comm.Get_rank()
-            gpu_count = jax.device_count()
-            lrank = rank % gpu_count
-
+            lrank = rank % jax.device_count()
             # Get MPI communicator pointer
             comm_ptr = MPI._addressof(comm)
 
@@ -481,9 +513,7 @@ def solve(
             recvcounts_tuple = tuple(recvcounts_val.tolist())
 
             # Compute max nnz across all ranks for buffer sizing
-            local_nnz = len(A_csr.data)
-            all_nnz = comm.allgather(local_nnz)
-            max_nnz = max(all_nnz)
+            max_nnz = max(comm.allgather(len(A_csr.data)))
 
             solver = _get_solver_primitive_mpi(
                 config_str,
@@ -493,31 +523,40 @@ def solve(
                 is_symmetric=is_symmetric,
                 recvcounts_tuple=recvcounts_tuple,
                 max_nnz=max_nnz,
+                return_stats=1 if save_stats_file else 0,
             )
             (x, info), _ = solver(A_csr, b, recvcounts, displs)
 
     else:
         # Single-GPU mode: use int32 indices
         A_csr = to_bcsr_matrix(A, b)
-
         # Get cached primitive for this configuration
-        solver = _get_solver_primitive(config_str, is_symmetric=is_symmetric)
+        solver = _get_solver_primitive(
+            config_str,
+            is_symmetric=is_symmetric,
+            return_stats=1 if save_stats_file else 0,
+        )
 
         x, info = solver(A_csr, b)
 
-    # Convert JAX array stats to python dict (same for both modes)
     try:
-        iter_val = int(info[0])
-        res_val = float(info[1])
-        status_val = AMGXStatus(int(info[2]))
+        info_dict = {
+            "iterations": int(info[0]),
+            "residual": float(info[1]),
+            "status": AMGXStatus(int(info[2])),
+        }
+        if save_stats_file is not None:
+            try:
+                stats_str = _amgx.get_stats_string()
+                _format_and_save_stats(
+                    stats_str, save_stats_file, comm=comm, mpi_cache=mpi_cache
+                )
+            except AttributeError:
+                pass
+        return x, info_dict
     except Exception:
-        # Inside JIT or symbolic execution: return raw arrays/tracers
-        iter_val = info[0]
-        res_val = info[1]
-        status_val = info[2]
-
-    info = {"iterations": iter_val, "residual": res_val, "status": status_val}
-    return x, info
+        # Inside JIT: info elements are tracers; return them as-is.
+        return x, {"iterations": info[0], "residual": info[1], "status": info[2]}
 
 
 def clear_solver_cache() -> None:

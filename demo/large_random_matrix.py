@@ -31,7 +31,12 @@ def main():
     # Solve
     print("\nSolving...")
     start = time.time()
-    x, info = jaxamg.solve(A, b)
+    x, info = jaxamg.solve(
+        A,
+        b,
+        config={"preconditioner": {"coarse_solver": "CG"}},
+        save_stats_file="stats_large_random_matrix.txt",
+    )
     solve_time = time.time() - start
 
     print(f"Solve time: {solve_time:.2f}s")

@@ -57,7 +57,9 @@ def _format_config(config: dict | None) -> str:
     return json.dumps(config, sort_keys=True, separators=(",", ":"))
 
 
-def prepare_config(user_config: dict | None = None, **kwargs: Any) -> str:
+def prepare_config(
+    user_config: dict | None = None, save_stats: bool = False, **kwargs: Any
+) -> str:
     """
     Prepare the final configuration string for AmgX.
 
@@ -97,6 +99,7 @@ def prepare_config(user_config: dict | None = None, **kwargs: Any) -> str:
         "tolerance": 1e-6,
         "max_iters": 1000,
         "norm": "L2",
+        "exact_coarse_solve": 1,
     }
 
     is_nested = False
@@ -129,6 +132,16 @@ def prepare_config(user_config: dict | None = None, **kwargs: Any) -> str:
 
     target_dict["store_res_history"] = 1
     target_dict["monitor_residual"] = 1
+    if save_stats:
+        target_dict["print_solve_stats"] = 1
+
+        # Inject AMG grid stats into any AMG block
+        def _inject_amg_stats(d: dict) -> None:
+            if isinstance(d, dict) and d.get("solver") == "AMG":
+                d["print_grid_stats"] = 1
+
+        _inject_amg_stats(target_dict)
+        _inject_amg_stats(target_dict.get("preconditioner", {}))
 
     # Wrap flat configs into AMGX's config_version 2 nested format.
     if "config_version" not in merged_config:

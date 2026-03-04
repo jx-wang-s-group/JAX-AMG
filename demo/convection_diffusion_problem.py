@@ -90,7 +90,9 @@ def main():
 
     # Solve
     print("Solving...")
-    u_pred, info = jaxamg.solve(A, b, config=config)
+    u_pred, info = jaxamg.solve(
+        A, b, config=config, save_stats_file="stats_convection_diffusion.txt"
+    )
 
     print(info)
 

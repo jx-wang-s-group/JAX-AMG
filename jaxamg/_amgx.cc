@@ -27,6 +27,10 @@
 namespace py = pybind11;
 namespace ffi = xla::ffi;
 
+// Global variables for capturing solver output
+std::string g_stats_string = "";
+bool g_capture_stats = false;
+
 namespace
 {
   inline const char *ModeToString(int mode)
@@ -56,6 +60,7 @@ namespace
           .Ret<ffi::Buffer<ffi::F32>>()             // stats
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
+          .Attr<int32_t>("return_stats")            // return stats flag
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -71,6 +76,7 @@ namespace
           .Ret<ffi::Buffer<ffi::F64>>()             // stats
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
+          .Attr<int32_t>("return_stats")            // return stats flag
   );
 
   // Register MPI handlers
@@ -90,6 +96,7 @@ namespace
           .Ret<ffi::Buffer<ffi::F32>>()             // stats
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
+          .Attr<int32_t>("return_stats")            // return stats flag
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -108,6 +115,7 @@ namespace
           .Ret<ffi::Buffer<ffi::F64>>()             // stats
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
+          .Attr<int32_t>("return_stats")            // return stats flag
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -153,6 +161,7 @@ PYBIND11_MODULE(_amgx, m)
 
   m.def("initialize", &EnsureAmgxInitialized);
   m.def("finalize", &AmgxFinalize);
+  m.def("get_stats_string", []() -> std::string { return g_stats_string; });
   m.def("clear_solver_cache", []()
         {
           GetSolverCache().clear(DestroyResources);

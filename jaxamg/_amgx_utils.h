@@ -24,6 +24,10 @@
 
 namespace ffi = xla::ffi;
 
+// Forward declarations for global stats capture variables (defined in _amgx.cc)
+extern std::string g_stats_string;
+extern bool g_capture_stats;
+
 // Undefine existing macro from amgx_c.h to allow custom error handling
 #ifdef AMGX_SAFE_CALL
 #undef AMGX_SAFE_CALL
@@ -485,9 +489,24 @@ namespace
   // Custom callback to suppress AmgX library output (banners, version info)
   inline void PrintCallback(const char *msg, int length)
   {
-    // No-op: Output is fully suppressed to keep stdout clean for the user.
-    return;
+    if (::g_capture_stats) {
+        ::g_stats_string.append(msg, length);
+    }
   }
+
+  struct StatsCaptureGuard {
+      bool old_val;
+      StatsCaptureGuard(bool capture) {
+          old_val = ::g_capture_stats;
+          ::g_capture_stats = capture;
+          if (capture) {
+              ::g_stats_string.clear();
+          }
+      }
+      ~StatsCaptureGuard() {
+          ::g_capture_stats = old_val;
+      }
+  };
 
   inline void EnsureAmgxInitialized()
   {

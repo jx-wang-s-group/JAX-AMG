@@ -274,3 +274,21 @@ class TestSolver:
 
         assert info_backend[2] == info_explicit[2] == jaxamg.AMGXStatus.SUCCESS
         np.testing.assert_allclose(lam_backend, lam_explicit)
+
+    def test_save_stats_file(self, tmp_path):
+        """Test that jaxamg.solve generates a stats file correctly."""
+        n = 32
+        A = tridiagonal_matrix(n)
+        b = rhs_ones(n)
+
+        stats_file = tmp_path / "test_stats.txt"
+
+        # Solve with AMG to generate both solver iterations and grid stats
+        x, info = jaxamg.solve(A, b, save_stats_file=str(stats_file))
+
+        assert stats_file.exists()
+
+        content = stats_file.read_text()
+        # Verify both AMG grid stats and solver iterations are present
+        assert "AMG GRID STATISTICS" in content
+        assert "SOLVER ITERATIONS" in content

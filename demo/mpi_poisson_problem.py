@@ -72,6 +72,7 @@ def main():
         comm=comm,
         nglobal=n,
         partition_info=(row_start, row_end),
+        save_stats_file="stats_mpi_poisson.txt",
     )
     solve_time = time.time() - t_start
 
@@ -88,9 +89,7 @@ def main():
     if rank == 0:
         print("Validating against single-GPU result...")
         x_ref, info_ref = jaxamg.solve(
-            poisson_matrix(grid_size),
-            rhs_linear(n),
-            config=config,
+            poisson_matrix(grid_size), rhs_linear(n), config=config
         )
 
         x_mpi = jnp.asarray(x_mpi)

@@ -57,7 +57,7 @@ def test_mpi_poisson(mpi_context):
         nglobal=n,
         partition_info=(row_start, row_end),
         solver="PCG",
-        preconditioner={"solver": "MULTICOLOR_DILU"},
+        preconditioner={"solver": "MULTICOLOR_DILU", "max_iters": 100},
     )
 
     # Gather the solution to the root process
