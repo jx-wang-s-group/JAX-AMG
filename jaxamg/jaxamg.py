@@ -95,6 +95,7 @@ def _amgx_solve_impl(
         out_spec,
         input_layouts=[None, None, None, None],
         output_layouts=None,
+        vmap_method="sequential",
     )
     results = call(
         row_ptrs,
@@ -139,6 +140,7 @@ def _amgx_solve_mpi_impl(
         out_spec,
         input_layouts=[None, None, None, None, None, None, None],
         output_layouts=None,
+        vmap_method="sequential",
     )
     results = call(
         row_ptrs,

@@ -8,7 +8,7 @@ This page collects common JAX-AMG usage patterns. For complete runnable scripts,
 
 The input matrix can be a sparse matrix (from JAX or SciPy) of various types, or a dense matrix. Internally, all formats are converted to a `jax.experimental.sparse.BCSR` sparse matrix.
 
-=== "Script"
+=== "Python"
 
     ```python
     import jaxamg
@@ -54,7 +54,7 @@ You can also solve using a callable operator instead of an explicit matrix.
 
 Note: The solve still requires an internal matrix representation, so this is not fully matrix-free backend execution.
 
-=== "Script"
+=== "Python"
 
     ```python
     import jaxamg
@@ -86,7 +86,7 @@ Note: The solve still requires an internal matrix representation, so this is not
 
 You can supply a custom solver configuration:
 
-=== "Script"
+=== "Python"
 
     ```python
     import jaxamg
@@ -135,7 +135,7 @@ See [Solver Configuration](config.md) for full details.
 
 ### Optimization via auto differentiation
 
-=== "Script"
+=== "Python"
 
     ```python
     import jax
@@ -234,7 +234,7 @@ See [Solver Configuration](config.md) for full details.
 
 For parameterized operators, compute coloring once and reuse it during optimization.
 
-=== "Script"
+=== "Python"
 
     ```python
     import jax
@@ -365,6 +365,43 @@ For parameterized operators, compute coloring once and reuse it during optimizat
     Converged!
     ```
 
+### Batched solves with `vmap`
+
+JAX-AMG natively supports batched solves using `jax.vmap`. This allows you to efficiently solve a system with multiple right-hand sides.
+
+=== "Python"
+
+    ```python
+    import jax
+    import jax.numpy as jnp
+    import jaxamg
+    from jaxamg.matrices import poisson_matrix, rhs_random
+
+    grid_size = 32
+    A = poisson_matrix(grid_size)
+    n = grid_size**2
+
+    batch_size = 5
+    seeds = jnp.arange(batch_size)
+    b_batched = jax.vmap(rhs_random, in_axes=(None, 0))(n, seeds)
+
+    def solve_fn(matrix, rhs):
+        return jaxamg.solve(matrix, rhs, solver="CG")
+
+    vmap_solve = jax.vmap(solve_fn, in_axes=(None, 0))
+    x_batched, infos = vmap_solve(A, b_batched)
+
+    print(f"Batch Solution Shape: {x_batched.shape}")
+    print(f"Batch Residuals: {infos['residual']}")
+    ```
+
+=== "Result"
+
+    ```text
+    Batch Solution Shape: (5, 1024)
+    Batch Residuals: [2.8950488e-05 2.5211844e-05 2.8009201e-05 3.0575200e-05 2.9501451e-05]
+    ```
+
 ## MPI distributed mode
 
 Launch scripts with MPI:
@@ -375,7 +412,7 @@ mpirun -n <num_procs> python your_script.py
 
 ### Solving a distributed matrix system
 
-=== "Script"
+=== "Python"
 
     ```python
     from mpi4py import MPI
@@ -428,7 +465,7 @@ mpirun -n <num_procs> python your_script.py
 
 Each rank computes local loss/gradient, then uses MPI reductions to form global metrics.
 
-=== "Script"
+=== "Python"
 
     ```python
     import jax

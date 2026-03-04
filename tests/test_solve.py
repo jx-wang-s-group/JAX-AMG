@@ -292,3 +292,32 @@ class TestSolver:
         # Verify both AMG grid stats and solver iterations are present
         assert "AMG GRID STATISTICS" in content
         assert "SOLVER ITERATIONS" in content
+
+    def test_vmap_solve(self):
+        """Test that jax.vmap works out-of-the-box for jaxamg.solve via sequential FFI."""
+        n = 32
+        batch_size = 5
+        A = tridiagonal_matrix(n)
+
+        # Create a batch of RHS vectors
+        # Shape: (batch_size, n)
+        b_batched = jax.random.normal(jax.random.PRNGKey(0), (batch_size, n))
+
+        # Vmap over the 0th axis of b_batched: we pass A as unscanned (None)
+        # solve signature: solve(A, b, ...)
+        vmap_solve = jax.vmap(jaxamg.solve, in_axes=(None, 0))
+
+        x_batched, info_batched = vmap_solve(A, b_batched)
+
+        assert x_batched.shape == (batch_size, n)
+
+        # Verify mathematically by comparing against numpy/scipy sequential loops
+        import jax.numpy.linalg as jla
+
+        A_dense = A.todense()
+
+        for i in range(batch_size):
+            x_expected = jla.solve(A_dense, b_batched[i])
+            np.testing.assert_allclose(x_batched[i], x_expected, rtol=1e-4, atol=1e-5)
+            # Verify status array is broadcasted and successful
+            assert info_batched["status"][i] == jaxamg.AMGXStatus.SUCCESS
