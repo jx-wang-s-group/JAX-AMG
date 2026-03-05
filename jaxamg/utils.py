@@ -457,9 +457,17 @@ def to_bcsr_matrix(
         )
 
     # 3. Standardize properties
-    return _ensure_bcsr_properties(
+    A_bcsr = _ensure_bcsr_properties(
         A_bcsr, target_dtype, use_int64_indices=use_int64_indices
     )
+
+    if A_bcsr.n_batch > 0:
+        raise ValueError(
+            f"jaxamg.solve does not support batched BCSR matrices (n_batch > 0). "
+            f"Input matrix has n_batch={A_bcsr.n_batch}. Use jax.vmap for batched solves."
+        )
+
+    return A_bcsr
 
 
 def format_amgx_stats(

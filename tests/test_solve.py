@@ -321,3 +321,46 @@ class TestSolver:
             np.testing.assert_allclose(x_batched[i], x_expected, rtol=1e-4, atol=1e-5)
             # Verify status array is broadcasted and successful
             assert info_batched["status"][i] == jaxamg.AMGXStatus.SUCCESS
+
+    def test_vmap_batched_solve(self):
+        """Test that jax.vmap works with batched matrices."""
+        n = 8
+        A = tridiagonal_matrix(n)
+        b = rhs_ones(n)
+
+        A_batched = jsp.BCSR(
+            (
+                jnp.stack([A.data, A.data]),
+                jnp.stack([A.indices, A.indices]),
+                jnp.stack([A.indptr, A.indptr]),
+            ),
+            shape=(2, n, n),
+        )
+        b_batched = jnp.stack([b, b])
+
+        # Vmap over the 0th axis of A_batched and b_batched
+        vmap_solve = jax.vmap(jaxamg.solve, in_axes=(0, 0))
+
+        # This should NOT raise ValueError because inside vmap A is not batched
+        x_batched, _ = vmap_solve(A_batched, b_batched)
+
+        assert x_batched.shape == (2, n)
+
+    def test_batched_matrix_error(self):
+        """Test that passing a batched matrix directly raises ValueError."""
+        n = 8
+        A = tridiagonal_matrix(n)
+        b = rhs_ones(n)
+
+        # Create a batched version by stacking
+        A_batched = jsp.BCSR(
+            (
+                jnp.stack([A.data, A.data]),
+                jnp.stack([A.indices, A.indices]),
+                jnp.stack([A.indptr, A.indptr]),
+            ),
+            shape=(2, n, n),
+        )
+
+        with pytest.raises(ValueError, match="does not support batched BCSR matrices"):
+            jaxamg.solve(A_batched, b)
