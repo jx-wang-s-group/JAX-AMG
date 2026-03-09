@@ -371,7 +371,12 @@ def tridiagonal_matrix_distributed(
 
 
 def poisson_matrix_distributed(
-    nx: int, ny: int, rank: int, nranks: int, dtype: DTypeLike | None = None
+    nx: int,
+    ny: int,
+    rank: int,
+    nranks: int,
+    skew: float = 0.0,
+    dtype: DTypeLike | None = None,
 ) -> tuple[jsp.BCSR, int, int]:
     """Create distributed 2D Poisson matrix with 5-point stencil for MPI.
 
@@ -380,6 +385,7 @@ def poisson_matrix_distributed(
         ny: Grid size in y-direction
         rank: MPI rank (0-indexed)
         nranks: Total number of MPI ranks
+        skew: Skew-symmetric coefficient (default 0.0)
         dtype: Data type for matrix values
 
     Returns:
@@ -408,25 +414,25 @@ def poisson_matrix_distributed(
         if ix > 0:
             rows.append(local_i)
             cols.append(global_i - 1)
-            vals.append(-1.0)
+            vals.append(-1.0 - skew / 2.0)
 
         # Right neighbor
         if ix < nx - 1:
             rows.append(local_i)
             cols.append(global_i + 1)
-            vals.append(-1.0)
+            vals.append(-1.0 + skew / 2.0)
 
         # Bottom neighbor
         if iy > 0:
             rows.append(local_i)
             cols.append(global_i - nx)
-            vals.append(-1.0)
+            vals.append(-1.0 - skew / 2.0)
 
         # Top neighbor
         if iy < ny - 1:
             rows.append(local_i)
             cols.append(global_i + nx)
-            vals.append(-1.0)
+            vals.append(-1.0 + skew / 2.0)
 
     # Convert JAX dtype to NumPy dtype
     np_dtype: type = np.float32 if dtype == jnp.float32 else np.float64

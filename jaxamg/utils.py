@@ -20,6 +20,17 @@ Matrix = ArrayLike | jsp.JAXSparse | sp.spmatrix
 MatrixOrOperator = Matrix | Callable
 
 
+def deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into a copy of *base*."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 @contextlib.contextmanager
 def temp_enable_x64():
     """Context manager to temporarily enable x64 mode."""

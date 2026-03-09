@@ -1,16 +1,71 @@
 import json
-from typing import Any
+from collections.abc import Callable
+from typing import Any, cast
+
+from .utils import deep_merge
+
+_AMG_DEFAULTS = {
+    "solver": "AMG",
+    "algorithm": "CLASSICAL",
+    "selector": "PMIS",
+    "interpolator": "D2",
+    "smoother": {
+        "solver": "BLOCK_JACOBI",
+        "relaxation_factor": 0.9,
+    },
+    "presweeps": 1,
+    "postsweeps": 1,
+    "max_levels": 100,
+    "strength_threshold": 0.5,
+    "dense_lu_num_rows": 1,
+    "aggressive_levels": 0,
+    "coarse_solver": "DENSE_LU_SOLVER",
+    "max_iters": 1,
+    "cycle": "V",
+}
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge *override* into a copy of *base*."""
-    result = base.copy()
-    for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = value
-    return result
+def _is_nested_config(config: dict | None) -> bool:
+    """Return whether *config* already uses AMGX's nested config structure."""
+    if not config:
+        return False
+    return "config_version" in config or isinstance(config.get("solver"), dict)
+
+
+def _prepare_solver_config_dict(
+    user_config: dict | None,
+    solver_defaults: dict,
+    *,
+    kwargs: dict[str, Any] | None = None,
+    solver_merger: Callable[[dict, dict], dict] | None = None,
+) -> dict:
+    """Normalize flat or nested solver config input into a nested config dict."""
+    if user_config is not None and not isinstance(user_config, dict):
+        raise TypeError(
+            f"Config must be a dictionary, got {type(user_config).__name__}."
+        )
+
+    kwargs = kwargs or {}
+
+    if solver_merger is None:
+        solver_merger = lambda solver_config, defaults: deep_merge(  # noqa: E731
+            defaults, solver_config
+        )
+
+    if _is_nested_config(user_config):
+        merged_config = cast(dict[str, Any], user_config).copy()
+        solver_block = merged_config.get("solver", {})
+        if not isinstance(solver_block, dict):
+            raise TypeError("Nested config must contain a dictionary at key 'solver'.")
+        merged_solver = solver_merger(solver_block, solver_defaults)
+        merged_solver = deep_merge(merged_solver, kwargs)
+        merged_config["config_version"] = merged_config.get("config_version", 2)
+        merged_config["solver"] = merged_solver
+        return merged_config
+
+    merged_solver = solver_merger(user_config or {}, solver_defaults)
+    merged_solver = deep_merge(merged_solver, kwargs)
+    return {"config_version": 2, "solver": merged_solver}
 
 
 def _merge_solver_with_defaults(
@@ -28,12 +83,12 @@ def _merge_solver_with_defaults(
     if user_precond_solver != "AMG":
         merged["preconditioner"] = {}
 
-    merged = _deep_merge(merged, solver_config)
+    merged = deep_merge(merged, solver_config)
 
     # If AMG is selected, ensure missing AMG sub-settings are filled by defaults.
     precond = merged.get("preconditioner", {})
     if isinstance(precond, dict) and precond.get("solver") == "AMG":
-        merged["preconditioner"] = _deep_merge(amg_defaults, precond)
+        merged["preconditioner"] = deep_merge(amg_defaults, precond)
 
     return merged
 
@@ -67,30 +122,8 @@ def prepare_config(
     injects residual tracking settings, and wraps the result in AMGX's
     ``config_version: 2`` nested JSON format.
     """
-    if user_config is not None and not isinstance(user_config, dict):
-        raise TypeError(
-            f"Config must be a dictionary, got {type(user_config).__name__}."
-        )
-
-    amg_defaults = {
-        "solver": "AMG",
-        "algorithm": "CLASSICAL",
-        "selector": "PMIS",
-        "interpolator": "D2",
-        "smoother": {
-            "solver": "BLOCK_JACOBI",
-            "relaxation_factor": 0.9,
-        },
-        "presweeps": 1,
-        "postsweeps": 1,
-        "max_levels": 100,
-        "strength_threshold": 0.5,
-        "dense_lu_num_rows": 1,
-        "aggressive_levels": 0,
-        "coarse_solver": "DENSE_LU_SOLVER",
-        "max_iters": 1,
-        "cycle": "V",
-    }
+    # Clean copy of AMG defaults
+    amg_defaults = deep_merge({}, _AMG_DEFAULTS)
 
     defaults = {
         "solver": "PBICGSTAB",
@@ -102,28 +135,14 @@ def prepare_config(
         "exact_coarse_solve": 1,
     }
 
-    is_nested = False
-    if user_config:
-        if "config_version" in user_config:
-            is_nested = True
-        elif isinstance(user_config.get("solver"), dict):
-            is_nested = True
-
-    if user_config and is_nested:
-        merged_config = user_config.copy()
-        solver_block = merged_config.get("solver", {})
-        if not isinstance(solver_block, dict):
-            raise TypeError("Nested config must contain a dictionary at key 'solver'.")
-        merged_solver = _merge_solver_with_defaults(
-            solver_block, defaults, amg_defaults
-        )
-        merged_solver = _deep_merge(merged_solver, kwargs)
-        merged_config["solver"] = merged_solver
-    else:
-        merged_config = _merge_solver_with_defaults(
-            user_config or {}, defaults, amg_defaults
-        )
-        merged_config = _deep_merge(merged_config, kwargs)
+    merged_config = _prepare_solver_config_dict(
+        user_config,
+        defaults,
+        kwargs=kwargs,
+        solver_merger=lambda solver_config, solver_defaults: _merge_solver_with_defaults(
+            solver_config, solver_defaults, amg_defaults
+        ),
+    )
 
     # Inject residual tracking into the correct solver scope.
     target_dict = merged_config
@@ -142,12 +161,5 @@ def prepare_config(
 
         _inject_amg_stats(target_dict)
         _inject_amg_stats(target_dict.get("preconditioner", {}))
-
-    # Wrap flat configs into AMGX's config_version 2 nested format.
-    if "config_version" not in merged_config:
-        merged_config = {
-            "config_version": 2,
-            "solver": merged_config,
-        }
 
     return _format_config(merged_config)

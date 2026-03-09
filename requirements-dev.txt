@@ -16,3 +16,6 @@ pre-commit
 # Documentation
 zensical
 mkdocstrings-python
+
+# Optional solver integrations used in demos/tests
+lineax

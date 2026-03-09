@@ -10,6 +10,7 @@ from .jaxamg import (
     get_solver_cache_info,
     solve,
 )
+from .preconditioners import make_preconditioner
 
 __all__ = [
     "solve",
@@ -17,6 +18,7 @@ __all__ = [
     "cache_coloring",
     "cache_mpi_metadata",
     "AMGXStatus",
+    "make_preconditioner",
     "clear_solver_cache",
     "get_solver_cache_info",
     "finalize",

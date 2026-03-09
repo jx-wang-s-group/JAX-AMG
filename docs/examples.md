@@ -133,6 +133,87 @@ You can supply a custom solver configuration:
 
 See [Solver Configuration](config.md) for full details.
 
+### Using JAX-AMG as a preconditioner for native JAX solvers
+
+You can also use JAX-AMG only for the preconditioner application, while a native JAX Krylov method owns the outer iterations.
+
+=== "Python"
+
+    ```python
+    import jax.numpy as jnp
+    from jax.scipy.sparse.linalg import cg
+
+    import jaxamg
+    from jaxamg.matrices import poisson_matrix, rhs_ones
+
+    n = 32
+    A = poisson_matrix(n)
+    b = rhs_ones(n * n)
+    M = jaxamg.make_preconditioner(A)
+
+    x, _ = cg(A, b, M=M, tol=1e-6)
+
+    residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)
+
+    print(f"Solution: {x}")
+    print(f"Residual: {residual:.3e}")
+    ```
+
+=== "Result"
+
+    ```text
+    Solution: [2.0437262 3.587453  4.8288155 ... 4.8288164 3.5874531 2.0437262]
+    Residual: 1.867e-05
+    ```
+
+### Using JAX-AMG as a preconditioner for Lineax
+
+If you use [Lineax](https://docs.kidger.site/lineax/), you can also wrap the callable returned by `jaxamg.make_preconditioner(...)` as a `lineax.FunctionLinearOperator` and pass it through Lineax's `options={"preconditioner": ...}` interface.
+
+=== "Python"
+
+    ```python
+    import jax
+    import jax.numpy as jnp
+    import lineax as lx
+
+    import jaxamg
+    from jaxamg.matrices import poisson_matrix, rhs_ones
+
+    jax.config.update("jax_enable_x64", True)
+
+    n = 32
+    A = poisson_matrix(n, skew=2.0)
+    b = rhs_ones(n * n)
+
+    operator = lx.FunctionLinearOperator(
+        lambda x: A @ x,
+        input_structure=jax.ShapeDtypeStruct(b.shape, b.dtype),
+    )
+    M = lx.FunctionLinearOperator(
+        jaxamg.make_preconditioner(A),
+        input_structure=jax.ShapeDtypeStruct(b.shape, b.dtype),
+    )
+
+    solution = lx.linear_solve(
+        operator,
+        b,
+        solver=lx.BiCGStab(rtol=1e-6, atol=1e-6, max_steps=100),
+        options={"preconditioner": M},
+    )
+    residual = jnp.linalg.norm(b - A @ solution.value) / jnp.linalg.norm(b)
+
+    print(f"Solution: {solution.value}")
+    print(f"Residual: {residual:.3e}")
+    ```
+
+=== "Result"
+
+    ```text
+    Solution: [ 0.25        0.375       0.4375     ... 13.88522106 14.16045232 14.41045187]
+    Residual: 2.636e-07
+    ```
+
 ### Optimization via auto differentiation
 
 === "Python"

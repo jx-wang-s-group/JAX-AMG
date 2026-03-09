@@ -38,6 +38,14 @@ This page documents the public API of JAX-AMG.
         show_source: false
         heading_level: 3
 
+## Preconditioner
+
+::: jaxamg.make_preconditioner
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
 ## Runtime Utilities
 
 ::: jaxamg.clear_solver_cache
