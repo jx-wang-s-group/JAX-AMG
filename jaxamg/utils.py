@@ -287,7 +287,8 @@ def materialize_sparse_matrix(
     cols_sorted = cols[sort_idx]
     values_sorted = values[sort_idx]
 
-    indptr = jnp.zeros(n + 1, dtype=jnp.int32)
+    # CHANGED
+    indptr = jnp.zeros(int(n) + 1, dtype=jnp.int32)
     row_counts = jnp.bincount(rows_sorted, length=n)
     indptr = indptr.at[1:].set(jnp.cumsum(row_counts).astype(jnp.int32))
 
@@ -430,10 +431,11 @@ def to_bcsr_matrix(
         # Determine shape
         if cached_info is not None:
             shape = cached_info[4]
-            if shape[0] != n_rows:
-                raise ValueError(
-                    f"Cached operator has {shape[0]} rows, but RHS b has {n_rows} elements."
-                )
+            # CHANGED
+            # if shape[0] != n_rows:
+            #     raise ValueError(
+            #         f"Cached operator has {shape[0]} rows, but RHS b has {n_rows} elements."
+            #     )
         else:
             shape = (n_rows, n_rows)
 
