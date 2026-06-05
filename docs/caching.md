@@ -67,15 +67,18 @@ Behavior (two modes):
 
 ### Solver setup reuse
 
-When the cache hits (same sparsity structure and config as a previous solve), only the
-matrix values are updated via `AMGX_matrix_replace_coefficients`. The internal solver
-state built by `AMGX_solver_setup` during the first solve is **reused as-is** — setup
-is not called again.
+When the cache hits (same sparsity structure and config as a previous solve), the
+matrix values are updated via `AMGX_matrix_replace_coefficients` and the solver setup
+is repeated against the new values via `AMGX_solver_resetup`. `resetup` reuses the
+cached AmgX solver/matrix objects, device allocations, and fine-level matrix
+coloring established during the first solve, avoiding the resource-creation and
+matrix-upload overhead of a cold start. The AMG hierarchy itself is rebuilt against
+the new values by default; deeper reuse can be enabled via the
+`structure_reuse_levels` AmgX config parameter.
 
-This is a common approach when the sparsity pattern stays fixed but coefficient values
-change across repeated solves. The wall-time savings from skipping the expensive setup
-phase often outweigh the small increase in iterations that may result from a slightly
-stale internal state.
+This setup-reuse path is substantially cheaper than a cold start while remaining
+correct for any change in coefficient values, making cache reuse safe for workloads
+where coefficients change between solves (including optimization and time-stepping).
 
 
 ## Cache inspection
@@ -98,22 +101,24 @@ jaxamg.finalize()            # Clears caches/resources and tears down native sta
 
 ### When to call `clear_solver_cache()`
 
-Because solver setup state is reused on cache hit, force a rebuild when reuse quality
-starts to degrade (for example, iteration counts grow noticeably or residual reduction
-stalls).
+In typical workloads — including optimization with changing coefficients — calling
+`clear_solver_cache()` is **not** required. Cache hits automatically refresh the
+solver against current values via `AMGX_solver_resetup`, so correctness is maintained
+without any user intervention.
 
-For workloads with frequent large coefficient updates (including many optimization
-workflows), a simple heuristic is to rebuild every `N` steps:
+Reasons you might still want to call it explicitly:
 
-```python
-for step in range(num_steps):
-    if step % 10 == 0:
-        jaxamg.clear_solver_cache()
-    x, info = jaxamg.solve(A, b)
-```
+- Free GPU memory between unrelated solve series (e.g. before moving on to a problem
+  with a different shape or configuration).
+- Force a fresh `AMGX_solver_setup` if `structure_reuse_levels > 0` is set in the
+  AmgX config and the reused coarsening becomes a poor fit for the new values
+  (not relevant with the default config, where `resetup` already rebuilds the
+  hierarchy).
+- Debugging or reproducing first-solve behavior.
 
-In many workloads with fixed sparsity and gradually changing coefficients, clearing the
-cache is not necessary and setup reuse remains effective throughout the run.
+Sparsity-pattern changes do **not** require an explicit clear: the cache key
+includes a structural hash, so a different sparsity pattern produces a cache miss
+and triggers a full setup automatically.
 
 ### Notes
 

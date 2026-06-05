@@ -17,7 +17,7 @@ from jaxamg.matrices import rhs_random, tridiagonal_matrix
 
 
 def main():
-    n = 100000000
+    n = 10000000
     max_iters = 100
     tolerance = 1e-6
 
@@ -173,6 +173,89 @@ def main():
     print(
         f"JAX     (BiCGSTAB):  warmup time: {warmup_time:6.2f}s, compute time: {compute_time:.2f}s, grad norm: {jnp.linalg.norm(grad):.2e}"
     )
+
+    print("\nComparing full optimization performance...")
+
+    lr = 1e-4
+    n_epochs = 20
+
+    # JAX-AMG (CG)
+    def loss_fn(b):
+        x, _ = jaxamg.solve(
+            A,
+            b,
+            config={
+                "solver": "CG",
+                "tolerance": tolerance,
+                "max_iters": max_iters,
+                "convergence": "RELATIVE_MAX",
+            },
+        )
+        return jnp.sum(x**2)
+
+    grad_fn = jax.jit(jax.grad(loss_fn))
+
+    b_opt = b
+    t_start = time.time()
+    for _ in range(n_epochs):
+        g = grad_fn(b_opt)
+        b_opt = b_opt - lr * g
+    opt_time = time.time() - t_start
+    print(f"JAX-AMG (CG):        opt time: {opt_time:.2f}s ({n_epochs} epochs)")
+
+    # JAX-AMG (BiCGSTAB)
+    def loss_fn(b):
+        x, _ = jaxamg.solve(
+            A,
+            b,
+            config={
+                "solver": "BICGSTAB",
+                "tolerance": tolerance,
+                "max_iters": max_iters,
+                "convergence": "RELATIVE_MAX",
+            },
+        )
+        return jnp.sum(x**2)
+
+    grad_fn = jax.jit(jax.grad(loss_fn))
+
+    b_opt = b
+    t_start = time.time()
+    for _ in range(n_epochs):
+        g = grad_fn(b_opt)
+        b_opt = b_opt - lr * g
+    opt_time = time.time() - t_start
+    print(f"JAX-AMG (BiCGSTAB):  opt time: {opt_time:.2f}s ({n_epochs} epochs)")
+
+    # JAX (CG)
+    def loss_fn(b):
+        x, _ = cg(A, b, tol=tolerance, maxiter=max_iters)
+        return jnp.sum(x**2)
+
+    grad_fn = jax.jit(jax.grad(loss_fn))
+
+    b_opt = b
+    t_start = time.time()
+    for _ in range(n_epochs):
+        g = grad_fn(b_opt)
+        b_opt = b_opt - lr * g
+    opt_time = time.time() - t_start
+    print(f"JAX     (CG):        opt time: {opt_time:.2f}s ({n_epochs} epochs)")
+
+    # JAX (BiCGSTAB)
+    def loss_fn(b):
+        x, _ = bicgstab(A, b, tol=tolerance, maxiter=max_iters)
+        return jnp.sum(x**2)
+
+    grad_fn = jax.jit(jax.grad(loss_fn))
+
+    b_opt = b
+    t_start = time.time()
+    for _ in range(n_epochs):
+        g = grad_fn(b_opt)
+        b_opt = b_opt - lr * g
+    opt_time = time.time() - t_start
+    print(f"JAX     (BiCGSTAB):  opt time: {opt_time:.2f}s ({n_epochs} epochs)")
 
 
 if __name__ == "__main__":

@@ -117,15 +117,15 @@ namespace
    */
   template <typename T, ffi::DataType DType, AMGX_Mode Mode>
   inline ffi::Error AmgxSolveInternal(cudaStream_t stream,
-                               ffi::Buffer<ffi::DataType::S32> row_ptrs,
-                               ffi::Buffer<ffi::DataType::S32> col_indices,
-                               ffi::Buffer<DType> values,
-                               ffi::Buffer<DType> b,
-                               ffi::ResultBuffer<DType> x,
-                               ffi::ResultBuffer<DType> stats,
-                               std::string_view config,
-                               int32_t transpose_solve,
-                               int32_t return_stats)
+                                      ffi::Buffer<ffi::DataType::S32> row_ptrs,
+                                      ffi::Buffer<ffi::DataType::S32> col_indices,
+                                      ffi::Buffer<DType> values,
+                                      ffi::Buffer<DType> b,
+                                      ffi::ResultBuffer<DType> x,
+                                      ffi::ResultBuffer<DType> stats,
+                                      std::string_view config,
+                                      int32_t transpose_solve,
+                                      int32_t return_stats)
   {
     EnsureAmgxInitialized();
 
@@ -216,6 +216,7 @@ namespace
             res.A, n_rows, (int)values.element_count(), values_data, nullptr));
       }
 
+      AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
       AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
 
@@ -232,12 +233,15 @@ namespace
 
       AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
 
-      if (IsIsolatedMode()) {
-         res.owns_resources = true;
-         AMGX_SAFE_CALL(AMGX_resources_create_simple(&res.rsrc, res.cfg));
-      } else {
-         res.owns_resources = false;
-         res.rsrc = GlobalResources::Get().GetHandle(res.cfg);
+      if (IsIsolatedMode())
+      {
+        res.owns_resources = true;
+        AMGX_SAFE_CALL(AMGX_resources_create_simple(&res.rsrc, res.cfg));
+      }
+      else
+      {
+        res.owns_resources = false;
+        res.rsrc = GlobalResources::Get().GetHandle(res.cfg);
       }
 
       AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
@@ -333,7 +337,8 @@ namespace
     AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(res.solver, &iters));
 
     AMGX_RC res_rc = AMGX_solver_get_iteration_residual(res.solver, iters, 0, &residual);
-    if (res_rc != AMGX_RC_OK) {
+    if (res_rc != AMGX_RC_OK)
+    {
       residual = -1.0;
     }
 
@@ -348,12 +353,11 @@ namespace
     // 7. Store in Cache (if new)
     if (!cache_hit)
     {
-       GetSolverCache().put(key, res, DestroyResources);
+      GetSolverCache().put(key, res, DestroyResources);
     }
 
     return ffi::Error::Success();
   }
-
 
   /*
    * AmgxSolveMPIInternal: MPI-aware templated core implementation.
@@ -362,18 +366,18 @@ namespace
    */
   template <typename T, ffi::DataType DType, AMGX_Mode Mode>
   inline ffi::Error AmgxSolveMPIInternal(cudaStream_t stream,
-                                  ffi::Buffer<ffi::DataType::S32> row_ptrs,
-                                  ffi::Buffer<ffi::DataType::S64> col_indices,
-                                  ffi::Buffer<DType> values,
-                                  ffi::Buffer<DType> b,
-                                  ffi::Buffer<ffi::DataType::S32> nglobal_buf,
-                                  ffi::Buffer<ffi::DataType::S32> comm_ptr_buf,
-                                  ffi::Buffer<ffi::DataType::S32> lrank_buf,
-                                  ffi::ResultBuffer<DType> x,
-                                  ffi::ResultBuffer<DType> stats,
-                                  std::string_view config,
-                                  int32_t transpose_solve,
-                                  int32_t return_stats)
+                                         ffi::Buffer<ffi::DataType::S32> row_ptrs,
+                                         ffi::Buffer<ffi::DataType::S64> col_indices,
+                                         ffi::Buffer<DType> values,
+                                         ffi::Buffer<DType> b,
+                                         ffi::Buffer<ffi::DataType::S32> nglobal_buf,
+                                         ffi::Buffer<ffi::DataType::S32> comm_ptr_buf,
+                                         ffi::Buffer<ffi::DataType::S32> lrank_buf,
+                                         ffi::ResultBuffer<DType> x,
+                                         ffi::ResultBuffer<DType> stats,
+                                         std::string_view config,
+                                         int32_t transpose_solve,
+                                         int32_t return_stats)
   {
     if (transpose_solve != 0)
     {
@@ -461,6 +465,7 @@ namespace
       AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
           res.A, n_local, nnz, res.values_buf, nullptr));
 
+      AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
       std::vector<T> h_x(n_local, static_cast<T>(0));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
@@ -480,10 +485,13 @@ namespace
 
       AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
 
-      if (IsIsolatedMode()) {
+      if (IsIsolatedMode())
+      {
         res.owns_resources = true;
         AMGX_SAFE_CALL(AMGX_resources_create(&res.rsrc, res.cfg, mpi_comm, 1, &lrank_host));
-      } else {
+      }
+      else
+      {
         res.owns_resources = false;
         res.rsrc = GlobalMPIResources::Get().GetHandle(res.cfg, mpi_comm, 1, &lrank_host);
       }
@@ -534,7 +542,8 @@ namespace
     AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(res.solver, &iters));
 
     AMGX_RC res_rc = AMGX_solver_get_iteration_residual(res.solver, iters, 0, &residual);
-    if (res_rc != AMGX_RC_OK) {
+    if (res_rc != AMGX_RC_OK)
+    {
       residual = -1.0;
     }
 
@@ -555,15 +564,15 @@ namespace
 
   // Float implementation (single-GPU)
   inline ffi::Error AmgxSolveImpl(cudaStream_t stream,
-                           ffi::Buffer<ffi::DataType::S32> row_ptrs,
-                           ffi::Buffer<ffi::DataType::S32> col_indices,
-                           ffi::Buffer<ffi::DataType::F32> values,
-                           ffi::Buffer<ffi::DataType::F32> b,
-                           ffi::ResultBuffer<ffi::DataType::F32> x,
-                           ffi::ResultBuffer<ffi::DataType::F32> stats,
-                           std::string_view config,
-                           int32_t transpose_solve,
-                           int32_t return_stats)
+                                  ffi::Buffer<ffi::DataType::S32> row_ptrs,
+                                  ffi::Buffer<ffi::DataType::S32> col_indices,
+                                  ffi::Buffer<ffi::DataType::F32> values,
+                                  ffi::Buffer<ffi::DataType::F32> b,
+                                  ffi::ResultBuffer<ffi::DataType::F32> x,
+                                  ffi::ResultBuffer<ffi::DataType::F32> stats,
+                                  std::string_view config,
+                                  int32_t transpose_solve,
+                                  int32_t return_stats)
   {
     return AmgxSolveInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
         stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats);
@@ -571,15 +580,15 @@ namespace
 
   // Double implementation
   inline ffi::Error AmgxSolveImplDouble(cudaStream_t stream,
-                                 ffi::Buffer<ffi::DataType::S32> row_ptrs,
-                                 ffi::Buffer<ffi::DataType::S32> col_indices,
-                                 ffi::Buffer<ffi::DataType::F64> values,
-                                 ffi::Buffer<ffi::DataType::F64> b,
-                                 ffi::ResultBuffer<ffi::DataType::F64> x,
-                                 ffi::ResultBuffer<ffi::DataType::F64> stats,
-                                 std::string_view config,
-                                 int32_t transpose_solve,
-                                 int32_t return_stats)
+                                        ffi::Buffer<ffi::DataType::S32> row_ptrs,
+                                        ffi::Buffer<ffi::DataType::S32> col_indices,
+                                        ffi::Buffer<ffi::DataType::F64> values,
+                                        ffi::Buffer<ffi::DataType::F64> b,
+                                        ffi::ResultBuffer<ffi::DataType::F64> x,
+                                        ffi::ResultBuffer<ffi::DataType::F64> stats,
+                                        std::string_view config,
+                                        int32_t transpose_solve,
+                                        int32_t return_stats)
   {
     return AmgxSolveInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
         stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats);
@@ -587,18 +596,18 @@ namespace
 
   // MPI Float implementation
   inline ffi::Error AmgxSolveMPIImpl(cudaStream_t stream,
-                              ffi::Buffer<ffi::DataType::S32> row_ptrs,
-                              ffi::Buffer<ffi::DataType::S64> col_indices,
-                              ffi::Buffer<ffi::DataType::F32> values,
-                              ffi::Buffer<ffi::DataType::F32> b,
-                              ffi::Buffer<ffi::DataType::S32> nglobal,
-                              ffi::Buffer<ffi::DataType::S32> comm_ptr,
-                              ffi::Buffer<ffi::DataType::S32> lrank,
-                              ffi::ResultBuffer<ffi::DataType::F32> x,
-                              ffi::ResultBuffer<ffi::DataType::F32> stats,
-                              std::string_view config,
-                              int32_t transpose_solve,
-                              int32_t return_stats)
+                                     ffi::Buffer<ffi::DataType::S32> row_ptrs,
+                                     ffi::Buffer<ffi::DataType::S64> col_indices,
+                                     ffi::Buffer<ffi::DataType::F32> values,
+                                     ffi::Buffer<ffi::DataType::F32> b,
+                                     ffi::Buffer<ffi::DataType::S32> nglobal,
+                                     ffi::Buffer<ffi::DataType::S32> comm_ptr,
+                                     ffi::Buffer<ffi::DataType::S32> lrank,
+                                     ffi::ResultBuffer<ffi::DataType::F32> x,
+                                     ffi::ResultBuffer<ffi::DataType::F32> stats,
+                                     std::string_view config,
+                                     int32_t transpose_solve,
+                                     int32_t return_stats)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
         stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats);
@@ -606,18 +615,18 @@ namespace
 
   // MPI Double implementation
   inline ffi::Error AmgxSolveMPIImplDouble(cudaStream_t stream,
-                                    ffi::Buffer<ffi::DataType::S32> row_ptrs,
-                                    ffi::Buffer<ffi::DataType::S64> col_indices,
-                                    ffi::Buffer<ffi::DataType::F64> values,
-                                    ffi::Buffer<ffi::DataType::F64> b,
-                                    ffi::Buffer<ffi::DataType::S32> nglobal,
-                                    ffi::Buffer<ffi::DataType::S32> comm_ptr,
-                                    ffi::Buffer<ffi::DataType::S32> lrank,
-                                    ffi::ResultBuffer<ffi::DataType::F64> x,
-                                    ffi::ResultBuffer<ffi::DataType::F64> stats,
-                                    std::string_view config,
-                                    int32_t transpose_solve,
-                                    int32_t return_stats)
+                                           ffi::Buffer<ffi::DataType::S32> row_ptrs,
+                                           ffi::Buffer<ffi::DataType::S64> col_indices,
+                                           ffi::Buffer<ffi::DataType::F64> values,
+                                           ffi::Buffer<ffi::DataType::F64> b,
+                                           ffi::Buffer<ffi::DataType::S32> nglobal,
+                                           ffi::Buffer<ffi::DataType::S32> comm_ptr,
+                                           ffi::Buffer<ffi::DataType::S32> lrank,
+                                           ffi::ResultBuffer<ffi::DataType::F64> x,
+                                           ffi::ResultBuffer<ffi::DataType::F64> stats,
+                                           std::string_view config,
+                                           int32_t transpose_solve,
+                                           int32_t return_stats)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
         stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats);
@@ -629,11 +638,11 @@ namespace
 
   template <typename T, ffi::DataType DType>
   inline ffi::Error AmgxAllGatherInternal(cudaStream_t stream,
-                                   ffi::Buffer<DType> sendbuf,
-                                   ffi::Buffer<ffi::DataType::S32> recvcounts,
-                                   ffi::Buffer<ffi::DataType::S32> displs,
-                                   ffi::Buffer<ffi::DataType::S32> comm_ptr_buf,
-                                   ffi::ResultBuffer<DType> recvbuf)
+                                          ffi::Buffer<DType> sendbuf,
+                                          ffi::Buffer<ffi::DataType::S32> recvcounts,
+                                          ffi::Buffer<ffi::DataType::S32> displs,
+                                          ffi::Buffer<ffi::DataType::S32> comm_ptr_buf,
+                                          ffi::ResultBuffer<DType> recvbuf)
   {
     cudaStreamSynchronize(stream);
 
@@ -689,21 +698,21 @@ namespace
   }
 
   inline ffi::Error AmgxAllGatherImpl(cudaStream_t stream,
-                               ffi::Buffer<ffi::DataType::F32> sendbuf,
-                               ffi::Buffer<ffi::DataType::S32> recvcounts,
-                               ffi::Buffer<ffi::DataType::S32> displs,
-                               ffi::Buffer<ffi::DataType::S32> comm_ptr,
-                               ffi::ResultBuffer<ffi::DataType::F32> recvbuf)
+                                      ffi::Buffer<ffi::DataType::F32> sendbuf,
+                                      ffi::Buffer<ffi::DataType::S32> recvcounts,
+                                      ffi::Buffer<ffi::DataType::S32> displs,
+                                      ffi::Buffer<ffi::DataType::S32> comm_ptr,
+                                      ffi::ResultBuffer<ffi::DataType::F32> recvbuf)
   {
     return AmgxAllGatherInternal<float, ffi::DataType::F32>(stream, sendbuf, recvcounts, displs, comm_ptr, recvbuf);
   }
 
   inline ffi::Error AmgxAllGatherImplDouble(cudaStream_t stream,
-                                     ffi::Buffer<ffi::DataType::F64> sendbuf,
-                                     ffi::Buffer<ffi::DataType::S32> recvcounts,
-                                     ffi::Buffer<ffi::DataType::S32> displs,
-                                     ffi::Buffer<ffi::DataType::S32> comm_ptr,
-                                     ffi::ResultBuffer<ffi::DataType::F64> recvbuf)
+                                            ffi::Buffer<ffi::DataType::F64> sendbuf,
+                                            ffi::Buffer<ffi::DataType::S32> recvcounts,
+                                            ffi::Buffer<ffi::DataType::S32> displs,
+                                            ffi::Buffer<ffi::DataType::S32> comm_ptr,
+                                            ffi::ResultBuffer<ffi::DataType::F64> recvbuf)
   {
     return AmgxAllGatherInternal<double, ffi::DataType::F64>(stream, sendbuf, recvcounts, displs, comm_ptr, recvbuf);
   }
