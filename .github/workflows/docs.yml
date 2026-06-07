@@ -6,6 +6,11 @@ on:
       - main
   workflow_dispatch:
 
+# Allow only one concurrent deployment, without cancelling an in-progress run.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 jobs:
   # Build the documentation and upload the static HTML files as an artifact.
   build:
@@ -28,11 +33,10 @@ jobs:
         with:
           path: site/
 
-  # Deploy the artifact to GitHub pages (currently disabled)
+  # Deploy the artifact to GitHub pages
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    if: false # Currently disabled
     permissions:
       pages: write
       id-token: write
