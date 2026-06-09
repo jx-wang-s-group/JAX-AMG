@@ -1,6 +1,13 @@
 # JAX-AMG
 
+[![Docs](https://img.shields.io/github/actions/workflow/status/jx-wang-s-group/JAX-AMG/docs.yml?style=flat-square&label=docs)](https://jx-wang-s-group.github.io/JAX-AMG/)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org/)
+[![arXiv](https://img.shields.io/badge/arXiv-2606.09001-b31b1b.svg?style=flat-square)](https://arxiv.org/abs/2606.09001)
+
 **JAX-AMG** brings the power of NVIDIA's [AmgX](https://developer.nvidia.com/amgx) library to the JAX ecosystem, providing high-performance, GPU-accelerated sparse linear solvers with full support for automatic differentiation.
+
+Documentation: <https://jx-wang-s-group.github.io/JAX-AMG/>
 
 ## Features
 
@@ -75,4 +82,22 @@ x_local, info = jaxamg.solve(
 # Gather solution at root rank
 x_global = gather_solution(x_local, comm, root=0)
 if rank == 0: print(x_global)
+```
+
+---
+
+## Citation
+
+If you use JAX-AMG in your work, please consider using the following citation ([arXiv:2606.09001](https://arxiv.org/abs/2606.09001)):
+
+```bibtex
+@misc{jaxamg2026,
+      title={JAX-AMG: A GPU-Accelerated Differentiable Sparse Linear Solver Library for JAX},
+      author={Yi Liu and Xiantao Fan and Jian-Xun Wang},
+      year={2026},
+      eprint={2606.09001},
+      archivePrefix={arXiv},
+      primaryClass={cs.MS},
+      url={https://arxiv.org/abs/2606.09001},
+}
 ```
