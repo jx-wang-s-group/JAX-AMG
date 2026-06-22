@@ -1,5 +1,6 @@
 """MPI utilities for distributed AmgX solving."""
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
 import jax
@@ -404,18 +405,16 @@ def partition_vector(
     return b_global[row_start:row_end], row_start, row_end
 
 
-def gather_solution(
-    x_local: ArrayLike, comm: "Comm", root: int = 0
-) -> ArrayLike | None:
-    """Gather distributed solution to root rank using MPI Gatherv.
+def gather_vector(x_local: ArrayLike, comm: "Comm", root: int = 0) -> ArrayLike | None:
+    """Gather a row-partitioned vector to the root rank using MPI Gatherv.
 
     Args:
-        x_local: Local solution vector
+        x_local: This rank's local segment of the distributed vector
         comm: MPI communicator
         root: Root rank to gather to (default: 0)
 
     Returns:
-        JAX array of global solution (root rank only), None otherwise
+        JAX array of the assembled global vector (root rank only), None otherwise
     """
     from mpi4py import MPI
 
@@ -437,6 +436,122 @@ def gather_solution(
     else:
         comm.Gatherv(x_local_np, None, root=root)
         return None
+
+
+def make_allgather_vector(
+    comm: "Comm",
+    partition_info: tuple[int, int],
+    nglobal: int,
+    *,
+    backend: str = "auto",
+) -> Callable[[jax.Array], jax.Array]:
+    """Build a differentiable MPI all-gather of a row-partitioned vector.
+
+    Returns a callable ``allgather(x_local) -> x_global`` that assembles every
+    rank's local segment into the full length-``nglobal`` vector **on every
+    rank**, and is differentiable under ``jax.grad`` / ``jax.vjp``.
+
+    Forward:  ``Allgatherv`` (collective).  Backward: each rank receives the
+    slice of the incoming global cotangent that corresponds to its own rows
+    (``g_global[row_start:row_end]``) -- the exact adjoint of the gather.
+
+    Unlike :func:`gather_vector` (root-only ``Gatherv``, not differentiable),
+    this returns the assembled vector on *all* ranks and participates in
+    automatic differentiation, which is what makes it usable inside a
+    distributed loss.  Use it when the loss is defined on the global solution
+    (global normalization, cross-rank coupling, an inner product against a
+    dense global vector, ...).  A loss that is separable across the row
+    partition (e.g. a plain sum of per-row squared errors) does not need it:
+    differentiate the local loss and sum the scalar gradients across ranks.
+
+    Gradient contract:
+        The result is replicated across ranks.  When the downstream loss is
+        evaluated **identically and redundantly on every rank** from
+        ``x_global`` (the usual distributed-optimization pattern), the VJP
+        returns each rank's *local contribution* to the gradient of a
+        replicated parameter.  To recover the full gradient, sum the per-rank
+        parameter gradients yourself (e.g. ``comm.allreduce(g, op=MPI.SUM)``).
+        This primitive deliberately performs no such reduction so that it
+        remains a pure linear operator.
+
+    Args:
+        comm: MPI communicator.
+        partition_info: ``(row_start, row_end)`` -- the global rows owned by
+            this rank (half-open interval).
+        nglobal: Length of the assembled global vector.
+        backend: ``"auto"`` (default) uses the GPU-direct mpi4jax all-gather
+            when mpi4jax is importable and otherwise falls back to a host
+            (``pure_callback``) all-gather; ``"mpi4jax"`` or ``"host"`` force a
+            specific backend.
+
+    Returns:
+        A differentiable callable ``allgather(x_local) -> x_global``.
+    """
+    import importlib.util
+
+    row_start, row_end = partition_info
+    n_local = row_end - row_start
+
+    # Static communication layout, computed once and captured by the closure.
+    all_sizes = comm.allgather(n_local)
+    recvcounts_tuple = tuple(int(s) for s in all_sizes)
+    recvcounts_np = np.array(recvcounts_tuple, dtype=np.int32)
+    displacements = np.insert(np.cumsum(recvcounts_np[:-1]), 0, 0).astype(np.int32)
+
+    total = int(recvcounts_np.sum())
+    if total != int(nglobal):
+        raise ValueError(
+            f"Sum of local sizes ({total}) does not match nglobal ({nglobal})."
+        )
+
+    if backend == "auto":
+        use_mpi4jax = importlib.util.find_spec("mpi4jax") is not None
+    elif backend in ("mpi4jax", "host"):
+        use_mpi4jax = backend == "mpi4jax"
+    else:
+        raise ValueError(
+            f"Unknown backend {backend!r}; expected 'auto', 'mpi4jax', or 'host'."
+        )
+
+    def _forward_mpi4jax(x_local: jax.Array) -> jax.Array:
+        return _mpi4jax_allgatherv(x_local, recvcounts_tuple, comm)
+
+    def _forward_host(x_local: jax.Array) -> jax.Array:
+        from mpi4py import MPI
+
+        # Resolve dtype at trace time so both float32 and float64 are supported.
+        np_dtype = np.float32 if x_local.dtype == jnp.float32 else np.float64
+        mpi_dtype = MPI.FLOAT if np_dtype == np.float32 else MPI.DOUBLE
+
+        def _allgatherv(x_np: np.ndarray) -> np.ndarray:
+            # pure_callback may hand back an array with a byte-order prefix
+            # (e.g. '=f8'); ascontiguousarray with an explicit dtype strips it
+            # so mpi4py can resolve the buffer type.
+            x_np = np.ascontiguousarray(x_np, dtype=np_dtype)
+            recvbuf = np.empty(nglobal, dtype=np_dtype)
+            comm.Allgatherv(x_np, [recvbuf, recvcounts_np, displacements, mpi_dtype])
+            return recvbuf
+
+        result_shape = jax.ShapeDtypeStruct((nglobal,), x_local.dtype)
+        return jax.pure_callback(_allgatherv, result_shape, x_local)
+
+    _forward = _forward_mpi4jax if use_mpi4jax else _forward_host
+
+    @jax.custom_vjp
+    def allgather(x_local: jax.Array) -> jax.Array:
+        return _forward(x_local)
+
+    def _allgather_fwd(x_local: jax.Array) -> tuple[jax.Array, None]:
+        # The gather is linear, so the backward pass needs no residuals.
+        return allgather(x_local), None
+
+    def _allgather_bwd(_: None, g_global: jax.Array) -> tuple[jax.Array]:
+        # Adjoint of an all-gather: this rank keeps the segment of the global
+        # cotangent that corresponds to its own rows.
+        return (g_global[row_start:row_end],)
+
+    allgather.defvjp(_allgather_fwd, _allgather_bwd)
+    return allgather
 
 
 def get_partition_info(n_global: int, rank: int, nranks: int) -> tuple[int, int, int]:

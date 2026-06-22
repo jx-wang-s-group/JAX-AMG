@@ -12,7 +12,9 @@ from jaxamg.matrices import (
     tridiagonal_matrix_distributed,
 )
 from jaxamg.mpi_utils import (
-    gather_solution,
+    gather_vector,
+    get_partition_info,
+    make_allgather_vector,
     partition_csr_matrix,
     partition_vector,
     validate_partition,
@@ -61,7 +63,7 @@ def test_mpi_poisson(mpi_context):
     )
 
     # Gather the solution to the root process
-    x = gather_solution(x_local, comm, root=0)
+    x = gather_vector(x_local, comm, root=0)
 
     # Check if the solve was successful
     assert info["status"] == jaxamg.AMGXStatus.SUCCESS
@@ -300,3 +302,52 @@ def test_mpi_transpose(mpi_context):
     np.testing.assert_array_equal(indptr_T_jit, indptr_T)
     np.testing.assert_array_equal(indices_T_jit, indices_T)
     np.testing.assert_allclose(data_T_jit, data_T)
+
+
+@pytest.mark.mpi(min_size=2)
+@pytest.mark.parametrize("backend", ["host", "mpi4jax"])
+def test_make_allgather_vector(mpi_context, backend):
+    """Differentiable all-gather: forward equals a plain allgather, and the
+    VJP is the adjoint slice (each rank keeps its own segment)."""
+    comm, rank, nranks = mpi_context
+
+    jax.config.update("jax_enable_x64", True)
+
+    # n_global not divisible by nranks -> exercise uneven partitions.
+    n_global = 23
+    row_start, row_end, n_local = get_partition_info(n_global, rank, nranks)
+
+    # Distinct local data on each rank.
+    x_local = jnp.asarray(np.arange(row_start, row_end, dtype=np.float64) + 0.5 * rank)
+
+    allgather = make_allgather_vector(
+        comm, (row_start, row_end), n_global, backend=backend
+    )
+
+    # Forward equals a plain MPI allgather + concatenate.
+    x_global = allgather(x_local)
+    x_global_ref = np.concatenate(comm.allgather(np.asarray(x_local)))
+    np.testing.assert_allclose(np.asarray(x_global), x_global_ref, rtol=1e-12)
+
+    # Backward: the adjoint of an all-gather is this rank's slice of the global
+    # cotangent.
+    g_global = jnp.asarray(np.arange(n_global, dtype=np.float64) + 1.0)
+    _, vjp_fn = jax.vjp(allgather, x_local)
+    (g_local,) = vjp_fn(g_global)
+    np.testing.assert_allclose(
+        np.asarray(g_local), np.asarray(g_global)[row_start:row_end], rtol=1e-12
+    )
+
+    # Must work under jit(grad) of a scalar loss defined on the global vector --
+    # the distributed-optimization use case. The loss is replicated on every
+    # rank, so the VJP yields this rank's local contribution.
+    target = jnp.asarray(np.arange(n_global, dtype=np.float64))
+
+    def loss(x_loc):
+        return jnp.sum((allgather(x_loc) - target) ** 2)
+
+    g = jax.jit(jax.grad(loss))(x_local)
+    expected = 2.0 * (np.asarray(x_global) - np.asarray(target))[row_start:row_end]
+    np.testing.assert_allclose(np.asarray(g), expected, rtol=1e-10)
+
+    jax.config.update("jax_enable_x64", False)

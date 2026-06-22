@@ -19,6 +19,7 @@ from jaxamg.matrices import (
     tridiagonal_matrix,
     tridiagonal_matrix_distributed,
 )
+from jaxamg.mpi_utils import gather_vector
 
 jax.config.update("jax_enable_x64", True)
 
@@ -87,14 +88,13 @@ def main():
         f"  Rank {rank}: Loss = {loss_mpi:.4e}, Grad norm = {jnp.linalg.norm(grad_mpi):.4e}"
     )
 
-    b_gathered = comm.gather(np.array(b_local), root=0)
-    grad_gathered = comm.gather(np.array(grad_mpi), root=0)
+    b_global = gather_vector(b_local, comm)
+    grad_global = gather_vector(grad_mpi, comm)
     loss_total = comm.reduce(float(loss_mpi), op=MPI.SUM, root=0)
 
-    if rank == 0 and b_gathered is not None and grad_gathered is not None:
+    if rank == 0:
         print("\nValidating against single-GPU result...")
 
-        b_global = jnp.concatenate(b_gathered)
         A_global = tridiagonal_matrix(n_global, dtype=jnp.float64)
 
         def loss_fn_ref(b_vec):
@@ -102,11 +102,8 @@ def main():
             return jnp.sum(x_ref**2)
 
         loss_ref, grad_ref = jax.value_and_grad(loss_fn_ref)(b_global)
-        grad_mpi_global = np.concatenate(grad_gathered)
         loss_error = abs(loss_total - loss_ref) / (abs(loss_ref))
-        grad_error = np.linalg.norm(grad_mpi_global - grad_ref) / (
-            np.linalg.norm(grad_ref)
-        )
+        grad_error = np.linalg.norm(grad_global - grad_ref) / (np.linalg.norm(grad_ref))
 
         print(f"  Loss (MPI): {loss_total:.4e}")
         print(f"  Loss (single-GPU): {loss_ref:.4e}")

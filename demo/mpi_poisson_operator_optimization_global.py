@@ -8,9 +8,9 @@ Usage:
     mpirun -n 4 python demo/mpi_poisson_operator_optimization_global.py
 """
 
-from mpi4py import MPI
 import jax
 import jax.numpy as jnp
+from mpi4py import MPI
 
 import jaxamg
 from jaxamg.matrices import (
@@ -18,54 +18,9 @@ from jaxamg.matrices import (
     poisson_operator_distributed,
     rhs_ones,
 )
-from jaxamg.mpi_utils import get_partition_info
+from jaxamg.mpi_utils import get_partition_info, make_allgather_vector
 
 jax.config.update("jax_enable_x64", True)
-
-
-def make_gather_solution(partition_info, comm, total_size, arr_dtype):
-    """Build a differentiable MPI Allgatherv callable.
-
-    Precomputes partition layout once and registers a custom VJP so that
-    jax.grad can backpropagate through the gather: the backward pass simply
-    slices the incoming global gradient back to each rank's local segment.
-    """
-    import numpy as np
-    from mpi4py import MPI
-
-    _rank = comm.Get_rank()
-    _local_size = np.array(partition_info['row_end'] - partition_info['row_start'], dtype=np.int32)
-    _all_sizes = np.empty(comm.Get_size(), dtype=np.int32)
-    comm.Allgather(_local_size, _all_sizes)
-    _displacements = np.insert(np.cumsum(_all_sizes[:-1]), 0, 0).astype(np.int32)
-    _total = int(total_size)
-    _mpi_dtype = MPI.FLOAT if arr_dtype == jnp.float32 else MPI.DOUBLE
-    _np_dtype = np.float32 if _mpi_dtype == MPI.FLOAT else np.float64
-    _disp = int(_displacements[_rank])
-    _lsize = int(_all_sizes[_rank])
-
-    @jax.custom_vjp
-    def gather_solution(x_local):
-        def _allgatherv(x_np):
-            # pure_callback passes arrays with byte-order prefix (e.g. '=f8');
-            # ascontiguousarray with explicit dtype strips it so mpi4py can resolve it
-            x_np = np.ascontiguousarray(x_np, dtype=_np_dtype)
-            recvbuf = np.empty(_total, dtype=_np_dtype)
-            comm.Allgatherv(x_np, [recvbuf, _all_sizes, _displacements, _mpi_dtype])
-            return recvbuf
-
-        result_shape = jax.ShapeDtypeStruct((total_size,), x_local.dtype)
-        return jax.pure_callback(_allgatherv, result_shape, x_local)
-
-    def _gather_fwd(x_local):
-        return gather_solution(x_local), None
-
-    def _gather_bwd(_, g_global):
-        # Scatter: each rank takes its slice of the incoming global gradient
-        return (g_global[_disp : _disp + _lsize],)
-
-    gather_solution.defvjp(_gather_fwd, _gather_bwd)
-    return gather_solution
 
 
 def main():
@@ -139,10 +94,7 @@ def main():
     coloring_cache = jaxamg.cache_coloring(dummy_op, shape=(n_local, n_global))
 
     # Precompute the differentiable gather once (not inside the loss)
-    gather_solution = make_gather_solution(
-        {'row_start': row_start, 'row_end': row_end},
-        comm, n_global, jnp.float64,
-    )
+    allgather = make_allgather_vector(comm, (row_start, row_end), n_global)
 
     if rank == 0:
         print("\nStarting optimization...")
@@ -157,7 +109,7 @@ def main():
         op = poisson_operator_distributed(grid_size, row_start, row_end, skew=skew)
         A = jaxamg.with_cache(op, coloring=coloring_cache, mpi=mpi_cache)
         x_pred_loc, info = jaxamg.solve(A, b_loc)
-        x_pred_global = gather_solution(x_pred_loc)
+        x_pred_global = allgather(x_pred_loc)
         return jnp.sum((x_pred_global - x_target_global) ** 2) / n_global
 
     grad_fn = jax.jit(jax.grad(loss_global))

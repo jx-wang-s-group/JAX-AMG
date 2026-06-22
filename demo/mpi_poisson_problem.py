@@ -17,7 +17,7 @@ from mpi4py import MPI
 import jaxamg
 from jaxamg.matrices import poisson_matrix, poisson_matrix_distributed, rhs_linear
 from jaxamg.mpi_utils import (
-    gather_solution,
+    gather_vector,
     partition_vector,
     validate_partition,
 )
@@ -88,7 +88,7 @@ def main():
         print(f"  Info: {info}")
         print(f"  Solve time: {solve_time:.3f}s\n")
 
-    x_mpi = gather_solution(x_local, comm, root=0)
+    x_mpi = gather_vector(x_local, comm, root=0)
 
     if rank == 0:
         print("Validating against single-GPU result...")

@@ -15,6 +15,7 @@ from mpi4py import MPI
 
 import jaxamg
 from jaxamg.matrices import tridiagonal_matrix, tridiagonal_matrix_distributed
+from jaxamg.mpi_utils import gather_vector
 
 jax.config.update("jax_enable_x64", True)
 
@@ -118,31 +119,23 @@ def main():
         print()
         print("Optimization complete!")
 
-    # Verify against single-GPU (rank 0 only)
+    # Verify final loss against single-GPU reference
+    b_final_global = gather_vector(b_current, comm)
+
     if rank == 0:
         print()
         print("Verifying final loss against single-GPU reference...")
 
-        # Gather final b from all ranks
-        b_final_list = comm.gather(np.array(b_current), root=0)
+        # Compute reference loss on the same final b
+        A_global = tridiagonal_matrix(n_global, diagonal_value=4.0, dtype=jnp.float64)
+        x_ref, _ = jaxamg.solve(A_global, b_final_global, solver="CG")
+        loss_ref = float(jnp.sum(x_ref * x_ref))
 
-        if b_final_list is not None:
-            b_final_global = jnp.concatenate(b_final_list)
-
-            # Compute reference loss on the same final b
-            A_global = tridiagonal_matrix(
-                n_global, diagonal_value=4.0, dtype=jnp.float64
-            )
-            x_ref, _ = jaxamg.solve(A_global, b_final_global, solver="CG")
-            loss_ref = float(jnp.sum(x_ref * x_ref))
-
-            print(f"  MPI loss:        {loss_current_global:.6e}")
-            print(f"  Single-GPU loss: {loss_ref:.6e}")
-            print(
-                f"  Relative error:  {abs(loss_current_global - loss_ref) / abs(loss_ref):.2e}"
-            )
-    else:
-        comm.gather(np.array(b_current), root=0)
+        print(f"  MPI loss:        {loss_current_global:.6e}")
+        print(f"  Single-GPU loss: {loss_ref:.6e}")
+        print(
+            f"  Relative error:  {abs(loss_current_global - loss_ref) / abs(loss_ref):.2e}"
+        )
 
     comm.Barrier()
     jaxamg.finalize()
