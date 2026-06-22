@@ -616,6 +616,64 @@ def poisson_operator_distributed(
     return matvec
 
 
+def poisson3d_operator(
+    robin: float = 0.0, diagonal_value: float = 6.0, dtype: DTypeLike | None = None
+) -> Callable:
+    """Create a matrix-free 3D Poisson operator (7-point stencil).
+
+    The operator discretizes -Δu on a regular n×n×n grid, applied via stencil
+    shifts (no matrix is formed). The input is a flattened length-n³ vector; the
+    output is A @ u. The default is homogeneous Dirichlet BCs.
+
+    Args:
+        robin: Robin boundary coefficient. With ``robin == 0`` (the default) the
+            operator uses homogeneous Dirichlet BCs (off-grid neighbors dropped,
+            uniform interior diagonal). With ``robin > 0`` each boundary cell gets
+            ``robin`` added to its diagonal per off-grid face, so boundary rows
+            carry heterogeneous, larger diagonals -- a non-trivial, non-singular,
+            diagonally dominant operator.
+        diagonal_value: The (interior) diagonal entry. Defaults to ``6.0``, the
+            standard 7-point Laplacian (one per face neighbor). Setting it away
+            from 6 shifts the diagonal, e.g. ``diagonal_value = 6 + theta`` gives a
+            diagonally-shifted, more strongly dominant operator.
+
+    Returns:
+        Callable matvec mapping a flattened 3D field to the global result.
+    """
+
+    def matvec(u_flat):
+        size = u_flat.shape[0]
+        n = round(size ** (1.0 / 3.0))
+        while n * n * n < size:
+            n += 1
+        while n * n * n > size:
+            n -= 1
+
+        u = u_flat.reshape((n, n, n))
+        out = diagonal_value * u
+        # Subtract the six face neighbors; entries off the grid are zero
+        # (Dirichlet), so each shifted contribution is added only where valid.
+        out = out.at[1:, :, :].add(-u[:-1, :, :])
+        out = out.at[:-1, :, :].add(-u[1:, :, :])
+        out = out.at[:, 1:, :].add(-u[:, :-1, :])
+        out = out.at[:, :-1, :].add(-u[:, 1:, :])
+        out = out.at[:, :, 1:].add(-u[:, :, :-1])
+        out = out.at[:, :, :-1].add(-u[:, :, 1:])
+
+        if robin != 0.0:
+            # Robin BC: add `robin` to the diagonal for every off-grid face a
+            # cell touches, so boundary rows get heterogeneous larger diagonals.
+            bw = jnp.zeros((n, n, n))
+            bw = bw.at[0].add(1.0).at[-1].add(1.0)
+            bw = bw.at[:, 0].add(1.0).at[:, -1].add(1.0)
+            bw = bw.at[:, :, 0].add(1.0).at[:, :, -1].add(1.0)
+            out = out + robin * bw * u
+
+        return out.ravel()
+
+    return matvec
+
+
 def convection_diffusion_matrix_2d(
     n: int,
     epsilon: float = 1.0,
