@@ -24,6 +24,9 @@ def main():
     rank = comm.Get_rank()
     nranks = comm.Get_size()
 
+    _gpus = jax.devices()
+    jax.config.update("jax_default_device", _gpus[rank % len(_gpus)])
+
     n_global = 64
 
     if rank == 0:

@@ -10,6 +10,7 @@ Validates results against single-GPU reference solution.
 
 import time
 
+import jax
 import jax.numpy as jnp
 from mpi4py import MPI
 
@@ -27,6 +28,9 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     nranks = comm.Get_size()
+
+    _gpus = jax.devices()
+    jax.config.update("jax_default_device", _gpus[rank % len(_gpus)])
 
     grid_size = 32
     n = grid_size**2

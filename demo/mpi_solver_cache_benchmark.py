@@ -40,6 +40,9 @@ def run_benchmark(n_global, n_runs=5):
     rank = comm.Get_rank()
     nranks = comm.Get_size()
 
+    _gpus = jax.devices()
+    jax.config.update("jax_default_device", _gpus[rank % len(_gpus)])
+
     if rank == 0:
         print(
             f"\nBenchmarking MPI tridiagonal matrix of size {n_global} x {n_global}..."
