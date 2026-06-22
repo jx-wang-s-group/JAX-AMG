@@ -344,8 +344,14 @@ def _get_solver_primitive_mpi(
                     "max_nnz is required for distributed transpose of non-symmetric matrices. "
                     "Ensure max_nnz is computed when creating the solver (via cache_mpi_metadata or dynamic computation)."
                 )
+            # Order the transpose after the forward solve (it otherwise reads
+            # only A); without this XLA may interleave their MPI collectives in
+            # a rank-inconsistent order and deadlock.
+            a_data, a_indices, a_indptr, _ = jax.lax.optimization_barrier(
+                (A.data, A.indices, A.indptr, x)
+            )
             at_data, at_indices, at_indptr = _mpi4jax_alltoallv_transpose(
-                A.data, A.indices, A.indptr, recvcounts_tuple, comm, max_nnz
+                a_data, a_indices, a_indptr, recvcounts_tuple, comm, max_nnz
             )
 
             # Reconstruct BCSR for A^T
@@ -353,15 +359,11 @@ def _get_solver_primitive_mpi(
 
             (adj_b, _), _ = solve(A_T, g_x, recvcounts, displs)
 
-        # Gather x across all ranks for gradient computation.
-        # Create a data dependency on adj_b so that XLA cannot reorder the
-        # allgather collective before the backward solve.  Without this,
-        # uneven partitions (different JIT programs per rank) can cause XLA
-        # to schedule the two MPI collectives in different orders on
-        # different ranks, leading to a deadlock.
-        x_global = allgather(
-            x + jnp.zeros_like(x) * adj_b[0], recvcounts, displs, comm_ptr_arr
-        )
+        # Gather x across all ranks for gradient computation; order it after the
+        # backward solve (same as the transpose above) so all ranks issue MPI
+        # collectives in a consistent order.
+        x_bar, _ = jax.lax.optimization_barrier((x, adj_b))
+        x_global = allgather(x_bar, recvcounts, displs, comm_ptr_arr)
 
         # Compute ∂L/∂A: ∂L/∂A_ij = -adj_b[i] * x[j]
         n_local = A.shape[0]
