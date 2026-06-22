@@ -278,10 +278,15 @@ def _mpi4jax_alltoallv_transpose(
     at_cols = recv_rows_flat  # Column index in A^T (global row in A)
 
     # Sort by (row, col) for CSR format
-    # Create composite key for sorting: row * n_global + col
+    # Create composite key for sorting: row * n_global + col. This must be int64:
+    # for large grids row*n_global overflows int32 (e.g. 48^3 -> ~6.1e9 > 2.1e9),
+    # which would scramble the row ordering and produce a malformed A^T.
     n_global = sum(recvcounts_tuple)  # Static Python int
-    sort_key = at_rows_local * n_global + at_cols
-    sort_idx = jnp.argsort(sort_key)
+    with temp_enable_x64():
+        sort_key = at_rows_local.astype(jnp.int64) * n_global + at_cols.astype(
+            jnp.int64
+        )
+        sort_idx = jnp.argsort(sort_key)
 
     r_sorted = at_rows_local[sort_idx]
     c_sorted = at_cols[sort_idx]
