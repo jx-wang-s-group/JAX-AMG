@@ -1,5 +1,7 @@
 site_name: JAX-AMG
 site_description: JAX bindings for NVIDIA AmgX sparse linear solver
+repo_url: https://github.com/jx-wang-s-group/JAX-AMG
+repo_name: jx-wang-s-group/JAX-AMG
 
 theme:
   name: material
@@ -59,4 +61,5 @@ nav:
   - MPI: mpi.md
   - Caching: caching.md
   - Environment Variables: environ.md
+  - Development: development.md
   - API Reference: api.md
