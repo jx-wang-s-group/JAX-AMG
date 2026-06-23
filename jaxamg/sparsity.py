@@ -40,6 +40,8 @@ from jax import lax
 from jax.extend.core import Literal
 from jax.typing import ArrayLike
 
+from .utils import temp_enable_x64
+
 # --- Tracing-based detection: interpret the operator's jaxpr ---
 # Element-wise primitives: output element depends on the union of its operands'
 # elements at the same (broadcast) position. Unary ops preserve connectivity
@@ -146,13 +148,8 @@ _UNKNOWN = object()  # sentinel: a value that depends on the operator input
 def _host_exact():
     """Run host-side index/position binds on CPU with x64 enabled, so position
     arithmetic stays exact regardless of the global precision config."""
-    prev = jax.config.jax_enable_x64
-    jax.config.update("jax_enable_x64", True)
-    try:
-        with jax.default_device(_CPU):
-            yield
-    finally:
-        jax.config.update("jax_enable_x64", prev)
+    with temp_enable_x64(), jax.default_device(_CPU):
+        yield
 
 
 class _BailOut(Exception):
