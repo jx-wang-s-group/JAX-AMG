@@ -2,12 +2,25 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jaxamg.matrices import tridiagonal_operator
+from jaxamg.matrices import poisson3d_operator, tridiagonal_operator
 from jaxamg.sparsity import (
     get_column_coloring,
     materialize_sparse_matrix,
     probe_sparsity_pattern,
+    trace_sparsity_pattern,
 )
+
+
+def _assert_valid_coloring(rows, cols, colors):
+    """No two columns sharing a row may share a color."""
+    rows, cols = np.asarray(rows), np.asarray(cols)
+    for r in np.unique(rows):
+        cols_in_row = cols[rows == r]
+        row_colors = colors[cols_in_row].tolist()
+        assert len(set(row_colors)) == len(cols_in_row), (
+            f"invalid coloring: row {r} columns {cols_in_row.tolist()} "
+            f"have repeated colors {row_colors}"
+        )
 
 
 class TestGraphColoring:
@@ -25,19 +38,10 @@ class TestGraphColoring:
         # Compute coloring
         colors, n_colors = get_column_coloring(rows, cols, shape)
 
-        # The coloring must be VALID: any two columns sharing a non-zero row
-        # must get different colors (so they can be probed together). Check this
-        # invariant per row -- it holds deterministically for any correct
-        # coloring, independent of how many colors the algorithm chooses (the
-        # color count itself is algorithm-dependent and not asserted here).
-        rows_arr, cols_arr = np.asarray(rows), np.asarray(cols)
-        for r in np.unique(rows_arr):
-            cols_in_row = cols_arr[rows_arr == r]
-            row_colors = colors[cols_in_row].tolist()
-            assert len(set(row_colors)) == len(cols_in_row), (
-                f"invalid coloring: row {r} columns {cols_in_row.tolist()} "
-                f"have repeated colors {row_colors}"
-            )
+        # The coloring must be VALID: any two columns sharing a non-zero row must
+        # get different colors (so they can be probed together). The color *count*
+        # is algorithm-dependent and not asserted here.
+        _assert_valid_coloring(rows, cols, colors)
 
         # Materialize (verifying JIT compatibility)
         @jax.jit
@@ -92,3 +96,39 @@ class TestGraphColoring:
         grad_analytical = 2 * theta_val * sum_sq_L
 
         np.testing.assert_allclose(grad_jax, grad_analytical)
+
+    def test_valid_coloring_on_dense_3d_stencil(self):
+        # A denser pattern (3D 7-point, ~7 nonzeros/row) exercises the
+        # Jones-Plassman coloring over many rounds; the result must stay valid.
+        n = 5**3
+        op = poisson3d_operator(robin=2.0)
+        rows, cols = trace_sparsity_pattern(op, (n, n))
+        colors, n_colors = get_column_coloring(rows, cols, (n, n))
+        _assert_valid_coloring(rows, cols, colors)
+        assert n_colors >= 7  # at least max nonzeros per row
+
+
+class TestColoringEdgeCases:
+    def test_empty_pattern(self):
+        # No nonzeros -> every column uncolored (-1), zero colors used.
+        m = 8
+        colors, n_colors = get_column_coloring(
+            np.array([], dtype=int), np.array([], dtype=int), (m, m)
+        )
+        assert n_colors == 0
+        assert colors.shape == (m,)
+        assert (colors == -1).all()
+
+
+class TestProbing:
+    def test_recovers_tridiagonal_pattern(self):
+        n = 10
+        op = tridiagonal_operator(-2.0)
+        rows, cols = probe_sparsity_pattern(op, (n, n))
+        got = set(zip(np.asarray(rows).tolist(), np.asarray(cols).tolist()))
+        expected = {(i, j) for i in range(n) for j in range(n) if abs(i - j) <= 1}
+        assert got == expected
+
+    def test_empty_shape_returns_empty(self):
+        rows, cols = probe_sparsity_pattern(lambda x: x, (0, 0))
+        assert rows.size == 0 and cols.size == 0
