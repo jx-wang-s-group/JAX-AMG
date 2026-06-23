@@ -143,29 +143,20 @@ def cache_mpi_metadata(
     elif callable(A):
         # For distributed operators, we need to use global size for proper materialization
         # The operator shape is (n_local, n_global): takes global vector, returns local portion
-        from .utils import (
-            get_column_coloring,
-            get_sparsity_pattern,
-            materialize_sparse_matrix,
-        )
+        from .sparsity import cache_coloring, materialize_sparse_matrix
 
         # Check if operator already has cached coloring
         cached_info = getattr(A, "_coloring_info", None)
 
-        if cached_info is not None:
-            # Use cached sparsity pattern
-            rows, cols, column_colors, n_colors, shape = cached_info
-            A_materialized = materialize_sparse_matrix(
-                A, shape, rows, cols, column_colors, n_colors
-            )
-        else:
-            # Compute sparsity pattern with correct shape for distributed operator
-            shape = (n_local, nglobal)
-            rows, cols = get_sparsity_pattern(A, shape)
-            column_colors, n_colors = get_column_coloring(rows, cols, shape)
-            A_materialized = materialize_sparse_matrix(
-                A, shape, rows, cols, column_colors, n_colors
-            )
+        if cached_info is None:
+            # Detect + colour via cache_coloring (tracing, then one-hot probing as
+            # fallback) using the distributed (n_local, n_global) shape.
+            cached_info = cache_coloring(A, (n_local, nglobal))
+
+        rows, cols, column_colors, n_colors, shape = cached_info
+        A_materialized = materialize_sparse_matrix(
+            A, shape, rows, cols, column_colors, n_colors
+        )
 
         local_nnz = len(A_materialized.data)
     else:
@@ -188,50 +179,3 @@ def cache_mpi_metadata(
     }
 
     return cache_dict
-
-
-def cache_coloring(
-    operator: Any, shape: tuple[int, int] | int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, tuple[int, int]]:
-    """
-    Compute and cache coloring information for an operator.
-
-    This function computes the sparsity pattern and graph coloring for a callable
-    operator, enabling efficient use inside JIT-compiled functions.
-
-    Args:
-        operator: A callable operator A(x) that returns `A @ x`.
-        shape: Shape of the operator (n, m) or int size (for n×n matrix).
-
-    Returns:
-        Cached coloring information that can be reattached with `with_cache(..., coloring=...)`.
-    """
-    if isinstance(shape, int):
-        shape = (shape, shape)
-
-    # Check if already cached
-    existing_cache = getattr(operator, "_coloring_info", None)
-    if existing_cache is not None:
-        # Verify size matches
-        cached_shape = existing_cache[4]
-        if cached_shape == shape:
-            return existing_cache
-        else:
-            raise ValueError(
-                f"Operator already has cached coloring for shape {cached_shape}, "
-                f"but requested shape {shape}. Create a new operator instance."
-            )
-
-    # Compute sparsity pattern and coloring
-    rows, cols = get_sparsity_pattern(operator, shape)
-    column_colors, n_colors = get_column_coloring(rows, cols, shape)
-
-    cache = (rows, cols, column_colors, n_colors, shape)
-
-    # Try to attach to operator for convenience
-    try:
-        setattr(operator, "_coloring_info", cache)
-    except Exception:
-        pass  # Ignore if caching fails
-
-    return cache

@@ -3,10 +3,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxamg.matrices import tridiagonal_operator
-from jaxamg.utils import (
+from jaxamg.sparsity import (
     get_column_coloring,
-    get_sparsity_pattern,
     materialize_sparse_matrix,
+    probe_sparsity_pattern,
 )
 
 
@@ -18,7 +18,7 @@ class TestGraphColoring:
 
         # Get sparsity pattern of a tridiagonal operator
         operator = tridiagonal_operator(-2.0)
-        rows, cols = get_sparsity_pattern(operator, shape)
+        rows, cols = probe_sparsity_pattern(operator, shape)
 
         assert len(rows) >= 3 * n - 2  # Tridiagonal nnz
 
@@ -65,7 +65,7 @@ class TestGraphColoring:
 
         # Use Laplacian to determine the fixed sparsity pattern
         L = lambda x: operator(1.0, x)
-        rows, cols = get_sparsity_pattern(L, shape)
+        rows, cols = probe_sparsity_pattern(L, shape)
         colors, n_colors = get_column_coloring(rows, cols, shape)
 
         # Define a loss function

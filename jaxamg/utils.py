@@ -4,8 +4,6 @@ Helper functions for BCSR matrix operations.
 
 import contextlib
 import os
-import warnings
-from collections import defaultdict
 from collections.abc import Callable
 from typing import cast
 
@@ -95,204 +93,6 @@ def to_scipy(A: jsp.BCSR, format: str = "csr") -> sp.spmatrix:
         raise ValueError(
             f"Unsupported format: {format}. Supported formats: csr, csc, coo, lil, dok, bsr"
         )
-
-
-def get_sparsity_pattern(
-    A_callable: Callable,
-    shape: tuple[int, int],
-    tol: float = 1e-10,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Determine the sparsity pattern of a linear operator by applying it to basis vectors.
-    Returns (rows, cols) of non-zero entries.
-
-    Uses jax.vmap to evaluate all m columns in parallel. If the full batch
-    causes an OOM error, the batch size is halved automatically and retried
-    until a working size is found.
-
-    This function must be run outside of JIT compilation.
-    """
-    n, m = shape
-    vmapped_A = jax.vmap(A_callable)
-
-    def _eval_batch(start: int, size: int) -> np.ndarray:
-        # one_hot creates (size, m) basis rows without allocating a full m×m eye
-        indices = jnp.arange(start, start + size)
-        basis = jax.nn.one_hot(indices, m, dtype=jnp.float32)  # (size, m)
-        out = vmapped_A(basis)  # (size, n)
-        if out.shape != (size, n):
-            raise ValueError(
-                f"Operator returned shape {out.shape}, expected ({size}, {n})."
-            )
-        return np.array(out)
-
-    def _run(batch_size: int) -> np.ndarray:
-        chunks = [
-            _eval_batch(start, min(batch_size, m - start))
-            for start in range(0, m, batch_size)
-        ]
-        return np.concatenate(chunks, axis=0)  # (m, n)
-
-    def _is_oom(e: Exception) -> bool:
-        s = str(e).lower()
-        return "resource exhausted" in s or "out of memory" in s or "oom" in s
-
-    batch_size = m
-    result: np.ndarray | None = None
-    while result is None and batch_size >= 1:
-        try:
-            result = _run(batch_size)
-        except Exception as e:
-            if _is_oom(e):
-                batch_size //= 2
-                if batch_size >= 1:
-                    warnings.warn(
-                        f"OOM in get_sparsity_pattern; retrying with batch_size={batch_size}.",
-                        stacklevel=2,
-                    )
-            else:
-                raise
-
-    if result is None:
-        raise RuntimeError("OOM even with batch_size=1; operator may be too large.")
-
-    # result[j, i] = A(e_j)[i] = A[i, j]  →  find non-zeros
-    mask = np.abs(result) > tol  # (m, n)
-    j_idx, i_idx = np.where(mask)  # j=col of A, i=row of A
-    if len(i_idx) == 0:
-        return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
-    return i_idx.astype(np.int32), j_idx.astype(np.int32)
-
-
-def get_column_coloring(
-    rows: np.ndarray, cols: np.ndarray, shape: tuple[int, int]
-) -> tuple[np.ndarray, int]:
-    """
-    Compute a coloring of the columns such that no two columns with the same color
-    share a non-zero row, enabling simultaneous evaluation.
-
-    Builds the column conflict graph via a sparse A^T A product (replaces the O(nnz²)
-    Python loop), then runs the Jones-Plassman parallel greedy coloring: each round
-    selects a maximal independent set (MIS) using a vectorized JAX scatter-max over
-    random weights, assigns the current color to the whole MIS, and repeats.
-
-    Returns:
-        colors: array of shape (m,) where colors[j] is the color ID of column j.
-        n_colors: total number of colors used.
-    """
-    n, m = shape
-
-    if len(rows) == 0:
-        return np.full(m, -1, dtype=np.int32), 0
-
-    # Build column conflict graph: ATA[c1, c2] > 0 iff columns c1 and c2 share a row.
-    ones = np.ones(len(rows), dtype=np.float32)
-    A_bool = sp.csr_matrix((ones, (rows, cols)), shape=(n, m))
-    ATA = (A_bool.T @ A_bool).tocsr()
-    ATA.setdiag(0)
-    ATA.eliminate_zeros()
-
-    # Flat edge list: edge k goes from src_nodes[k] to dst_nodes[k].
-    # Precomputed once; used every round for the scatter-max.
-    nnz_per_col = np.diff(ATA.indptr)
-    src_nodes = jnp.array(np.repeat(np.arange(m), nnz_per_col), dtype=jnp.int32)
-    dst_nodes = jnp.array(ATA.indices, dtype=jnp.int32)
-    has_edges = len(src_nodes) > 0
-
-    # Jones-Plassman coloring
-    # Each round: assign random weights, find MIS (nodes whose weight beats every
-    # uncolored neighbor), color MIS with the current color, mark them done.
-    colors = np.full(m, -1, dtype=np.int32)
-    in_pattern = np.zeros(m, dtype=bool)
-    in_pattern[np.unique(cols)] = True
-    uncolored = in_pattern.copy()  # numpy mask; updated each round
-
-    key = jax.random.PRNGKey(0)
-    color_id = 0
-
-    while uncolored.any():
-        key, subkey = jax.random.split(key)
-        # Weights in (0, 1] for uncolored nodes; 0 for already-colored nodes so
-        # they can never dominate an uncolored neighbor in the max comparison.
-        w = jax.random.uniform(subkey, (m,), minval=1e-7, maxval=1.0)
-        w = w * jnp.array(uncolored, dtype=jnp.float32)
-
-        # neighbor_max[c] = max weight among all neighbors of c.
-        # Scatter-max over the flat edge list: O(nnz), no Python loops.
-        if has_edges:
-            neighbor_max = (
-                jnp.full(m, -jnp.inf).at[src_nodes].max(w[dst_nodes])
-            )
-        else:
-            neighbor_max = jnp.full(m, -jnp.inf)
-
-        # MIS: uncolored nodes that beat every neighbor → valid independent set.
-        mis_np = np.array(jnp.array(uncolored) & (w > neighbor_max))
-
-        colors[mis_np] = color_id
-        uncolored[mis_np] = False
-        color_id += 1
-
-    return colors, color_id
-
-
-def materialize_sparse_matrix(
-    A_callable: Callable,
-    shape: tuple[int, int],
-    rows: ArrayLike,
-    cols: ArrayLike,
-    column_colors: ArrayLike,
-    n_colors: int,
-) -> jsp.BCSR:
-    """
-    Materialize the values of a sparse matrix inside JIT using graph coloring.
-
-    This reduces the number of operator evaluations from N (columns) to C (colors).
-
-    Args:
-        A_callable: The function A(x) -> y. Can be differentiated through.
-        shape: (n, m)
-        rows, cols: Fixed sparsity pattern indices (JAX or Numpy arrays).
-        column_colors: Array mapping column index to color ID.
-        n_colors: Number of colors.
-
-    Returns:
-        A_bcsr: jax.experimental.sparse.BCSR matrix containing the values from A_callable.
-    """
-    n, m = shape
-
-    # Ensure indices are JAX arrays
-    rows = jnp.array(rows, dtype=jnp.int32)
-    cols = jnp.array(cols, dtype=jnp.int32)
-    column_colors = jnp.array(column_colors, dtype=jnp.int32)
-
-    def evaluate_color(color_id):
-        # Create probe vector v_c such that v_c[j] = 1 if color[j] == c, else 0
-        mask = column_colors == color_id
-        v = mask.astype(jnp.float32)
-        w = A_callable(v)
-        return w
-
-    # Map over all colors: (n_colors, n)
-    # Use lax.map instead of vmap to support primitives without batching rules (e.g. CSR matvec)
-    w_matrix = jax.lax.map(evaluate_color, jnp.arange(n_colors))
-
-    # Extract values: w_matrix[color[j], row] corresponds to A[row, j]
-    colors_for_cols = column_colors[cols]
-    values = w_matrix[colors_for_cols, rows]
-
-    # Reconstruct BCSR matrix with sorted indices
-    sort_idx = jnp.lexsort((cols, rows))
-    rows_sorted = rows[sort_idx]
-    cols_sorted = cols[sort_idx]
-    values_sorted = values[sort_idx]
-
-    # CHANGED
-    indptr = jnp.zeros(int(n) + 1, dtype=jnp.int32)
-    row_counts = jnp.bincount(rows_sorted, length=n)
-    indptr = indptr.at[1:].set(jnp.cumsum(row_counts).astype(jnp.int32))
-
-    return jsp.BCSR((values_sorted, cols_sorted, indptr), shape=shape)
 
 
 def get_preferred_dtype(A: MatrixOrOperator, b: ArrayLike) -> DTypeLike:
@@ -415,6 +215,8 @@ def to_bcsr_matrix(
     # 1. Handle Callables (materialize via graph coloring)
     if callable(A):
         A = cast(Callable, A)
+        from .sparsity import cache_coloring, materialize_sparse_matrix
+
         # Check for cached coloring info attached to the callable
         cached_info = getattr(A, "_coloring_info", None)
 
@@ -449,22 +251,18 @@ def to_bcsr_matrix(
                     "Call solve(A, b) once outside of JIT to compute and cache the sparsity pattern."
                 )
 
-            # Outside JIT: Compute sparsity and coloring (expensive O(N))
-            rows, cols = get_sparsity_pattern(A, shape)
-            column_colors, n_colors = get_column_coloring(rows, cols, shape)
-
-            cached_info = (rows, cols, column_colors, n_colors, shape)
-            try:
-                setattr(A, "_coloring_info", cached_info)
-            except Exception:
-                pass  # Ignore if caching fails (e.g. on partials or immutable objects)
+            # Outside JIT: detect the sparsity + colouring via cache_coloring,
+            # which traces the operator's jaxpr (exact, in one trace) and falls
+            # back to one-hot probing only when tracing is unavailable. It also
+            # attaches `_coloring_info` to A for reuse.
+            cached_info = cache_coloring(A, shape)
 
         rows, cols, column_colors, n_colors, cached_shape = cached_info
 
         if shape != cached_shape:
             raise ValueError(f"Operator shape changed from {cached_shape} to {shape}.")
 
-        # Materialize using graph coloring (works efficienty inside JIT)
+        # Materialize using graph coloring (works efficiently inside JIT)
         # Note: materialize_sparse_matrix already returns a BCSR
         A_bcsr = materialize_sparse_matrix(
             A, shape, rows, cols, column_colors, n_colors

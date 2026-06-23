@@ -1,5 +1,4 @@
 from .cache import (
-    cache_coloring,
     cache_mpi_metadata,
     with_cache,
 )
@@ -11,6 +10,7 @@ from .jaxamg import (
     solve,
 )
 from .preconditioners import make_preconditioner
+from .sparsity import cache_coloring
 
 __all__ = [
     "solve",
