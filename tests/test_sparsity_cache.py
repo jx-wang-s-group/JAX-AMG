@@ -1,0 +1,185 @@
+"""Tests for the detect -> colour -> materialise orchestration in sparsity.py:
+``cache_coloring`` (tracing path, probing fallback, caching, shape errors),
+``materialize_sparse_matrix`` (incl. drop-zeros of structural-but-numerical
+zeros), and ``_verify_recovery``.
+"""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from jaxamg.matrices import poisson3d_operator
+from jaxamg.sparsity import (
+    _verify_recovery,
+    cache_coloring,
+    materialize_sparse_matrix,
+    trace_sparsity_pattern,
+)
+
+
+def _dense(op, n):
+    return np.asarray(jax.jacfwd(op)(jnp.ones(n)))
+
+
+def _dense_by_columns(op, n):
+    """Ground-truth matrix for a linear op that can't be differentiated (e.g. a
+    pure_callback): column j is op(e_j)."""
+    return np.stack([np.asarray(op(jnp.eye(n)[j])) for j in range(n)], axis=1)
+
+
+def _materialize_dense(op, cache):
+    rows, cols, colors, n_colors, shape = cache
+    A = materialize_sparse_matrix(op, shape, rows, cols, colors, n_colors)
+    return np.asarray(A.todense())
+
+
+class TestCacheColoringTracingPath:
+    def test_takes_tracing_path(self):
+        # A traceable stencil should be detected by tracing (not probing).
+        n = 6**3
+        op = poisson3d_operator(robin=2.0)
+        assert trace_sparsity_pattern(op, (n, n)) is not None
+        cache = cache_coloring(op, (n, n))
+        assert cache[4] == (n, n)
+
+    def test_materializes_correctly(self):
+        n = 6**3
+        op = poisson3d_operator(robin=2.0)
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-4
+        )
+
+
+class TestCacheColoringProbingFallback:
+    def test_opaque_operator_falls_back_and_is_correct(self):
+        # An opaque-to-tracing but vmap-able linear operator: tracing returns None,
+        # so cache_coloring must fall back to one-hot probing and still be exact.
+        n = 16
+
+        def opaque(u):
+            return jax.pure_callback(
+                lambda v: np.asarray(v) * 2.0 - np.roll(np.asarray(v), 1),
+                jax.ShapeDtypeStruct((n,), u.dtype),
+                u,
+                vmap_method="sequential",
+            )
+
+        assert trace_sparsity_pattern(opaque, (n, n)) is None  # tracing bails
+        cache = cache_coloring(opaque, (n, n))  # -> probing fallback
+        np.testing.assert_allclose(
+            _materialize_dense(opaque, cache), _dense_by_columns(opaque, n), atol=1e-4
+        )
+
+    def test_non_vmappable_operator_uses_sequential_fallback(self):
+        # pure_callback with the default vmap_method has NO vmap rule, so probing
+        # must fall back to a sequential lax.map (this used to raise outright).
+        n = 16
+
+        def opaque(u):
+            return jax.pure_callback(
+                lambda v: np.asarray(v) * 2.0 - np.roll(np.asarray(v), 1),
+                jax.ShapeDtypeStruct((n,), u.dtype),
+                u,  # vmap_method=None -> not vmap-able
+            )
+
+        cache = cache_coloring(opaque, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(opaque, cache), _dense_by_columns(opaque, n), atol=1e-4
+        )
+
+
+class TestZeroOperator:
+    def test_zero_operator_materializes_to_zero(self):
+        # An operator with no input dependence traces to an empty pattern
+        # (rows.size == 0), so cache_coloring falls through to probing; the
+        # materialized matrix must be all zeros.
+        n = 12
+        op = lambda x: jnp.zeros_like(x)
+        cache = cache_coloring(op, (n, n))
+        assert len(cache[0]) == 0  # empty pattern
+        assert np.allclose(_materialize_dense(op, cache), 0.0)
+
+
+class TestOverlappingScatterFallback:
+    def test_falls_back_to_probing_and_is_correct(self):
+        # Overlapping scatter-add (segment-sum): tracing detects the overlap and
+        # bails, so cache_coloring must fall back to probing and stay exact.
+        n = 12
+        idx = jnp.repeat(jnp.arange(n // 2), 2)  # [0, 0, 1, 1, ...]
+        op = lambda x: jnp.zeros(n).at[idx].add(x)
+        assert trace_sparsity_pattern(op, (n, n)) is None
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-4
+        )
+
+
+class TestCacheColoringOrchestration:
+    def test_caches_and_reuses(self):
+        op = lambda x: 2.0 * x - jnp.roll(x, 1)
+        first = cache_coloring(op, (16, 16))
+        second = cache_coloring(op, (16, 16))
+        assert first is second  # reused from the attached _coloring_info
+        assert getattr(op, "_coloring_info", None) is first
+
+    def test_shape_mismatch_raises(self):
+        op = lambda x: 2.0 * x - jnp.roll(x, 1)
+        cache_coloring(op, (16, 16))
+        with pytest.raises(ValueError):
+            cache_coloring(op, (17, 17))
+
+    def test_int_shape_expands_to_square(self):
+        cache = cache_coloring(lambda x: 3.0 * x, 16)
+        assert cache[4] == (16, 16)
+
+
+class TestDropZeros:
+    def test_structural_but_numerical_zeros_removed(self):
+        # A position-dependent coefficient that is exactly zero on half the rows:
+        # those rows are structurally present in the trace but numerically zero,
+        # so drop_zeros must prune them and the cached pattern must match the
+        # dense Jacobian's nonzeros exactly.
+        n = 16
+        c = jnp.array([1.0, 0.0] * (n // 2))
+        op = lambda x: c * (2.0 * x - jnp.roll(x, 1) - jnp.roll(x, -1))
+        rows, cols, colors, n_colors, shape = cache_coloring(op, (n, n))
+        J = _dense(op, n)
+        assert len(rows) == int((np.abs(J) > 1e-9).sum())
+        np.testing.assert_allclose(
+            _materialize_dense(op, (rows, cols, colors, n_colors, shape)), J, atol=1e-4
+        )
+
+
+class TestVerifyRecovery:
+    def test_accepts_correct_rejects_perturbed(self):
+        import jax.experimental.sparse as jsp
+
+        n = 16
+        op = lambda x: 2.0 * x - jnp.roll(x, 1)
+        rows, cols, colors, n_colors, _ = cache_coloring(op, (n, n))
+        good = materialize_sparse_matrix(op, (n, n), rows, cols, colors, n_colors)
+        assert _verify_recovery(op, good, n) is True
+        # Scaling the values breaks reconstruction -> must be rejected.
+        bad = jsp.BCSR(
+            (np.asarray(good.data) * 1.5, good.indices, good.indptr), shape=(n, n)
+        )
+        assert _verify_recovery(op, bad, n) is False
+
+
+class TestMaterializeAutodiff:
+    def test_gradient_flows_through_materialize(self):
+        # Gradient of a scalar of A(theta) w.r.t. theta, materialized via coloring.
+        n = 8
+        base = poisson3d_operator(robin=1.0)
+        op1 = lambda x: base(x) + 1.0 * x
+        rows, cols, colors, n_colors, shape = cache_coloring(op1, (n, n))
+
+        def loss(theta):
+            op = lambda x: base(x) + theta * x
+            A = materialize_sparse_matrix(op, shape, rows, cols, colors, n_colors)
+            return jnp.sum(A.data**2)
+
+        g = jax.grad(loss)(2.0)
+        assert np.isfinite(float(g)) and float(g) != 0.0

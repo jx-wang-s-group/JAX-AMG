@@ -278,10 +278,15 @@ def _mpi4jax_alltoallv_transpose(
     at_cols = recv_rows_flat  # Column index in A^T (global row in A)
 
     # Sort by (row, col) for CSR format
-    # Create composite key for sorting: row * n_global + col
+    # Create composite key for sorting: row * n_global + col. This must be int64:
+    # for large grids row*n_global overflows int32 (e.g. 48^3 -> ~6.1e9 > 2.1e9),
+    # which would scramble the row ordering and produce a malformed A^T.
     n_global = sum(recvcounts_tuple)  # Static Python int
-    sort_key = at_rows_local * n_global + at_cols
-    sort_idx = jnp.argsort(sort_key)
+    with temp_enable_x64():
+        sort_key = at_rows_local.astype(jnp.int64) * n_global + at_cols.astype(
+            jnp.int64
+        )
+        sort_idx = jnp.argsort(sort_key)
 
     r_sorted = at_rows_local[sort_idx]
     c_sorted = at_cols[sort_idx]
@@ -351,6 +356,39 @@ def partition_csr_matrix(
 
     A_local = jsp.BCSR((local_data, local_indices, local_indptr), shape=(n_local, n))
     return A_local, row_start, row_end
+
+
+def partition_operator(
+    operator: Callable, nglobal: int, rank: int, nranks: int
+) -> tuple[Callable, int, int]:
+    """Partition a global matrix-free operator across MPI ranks (row-based).
+
+    Wraps a global operator -- a callable mapping a length-``nglobal`` vector to
+    the global result ``A @ x`` -- into this rank's row-local operator, which
+    returns only the rows ``[row_start, row_end)`` this rank owns. That is the
+    ``(n_local, nglobal)`` form the distributed solve expects, so a user can pass
+    a single global operator instead of writing a distributed one by hand.
+
+    No global matrix is formed: each rank materializes only its local block.
+
+    Args:
+        operator: Global operator ``A(x)`` mapping a length-``nglobal`` vector to
+            a length-``nglobal`` result.
+        nglobal: Global problem size (total rows across all ranks).
+        rank: MPI rank (0-indexed).
+        nranks: Total number of MPI ranks.
+
+    Returns:
+        local_operator: Callable mapping the global vector to this rank's rows.
+        row_start: Starting row index (global).
+        row_end: Ending row index (global, exclusive).
+    """
+    row_start, row_end, _ = get_partition_info(nglobal, rank, nranks)
+
+    def local_operator(x_global: ArrayLike) -> jax.Array:
+        return operator(x_global)[row_start:row_end]
+
+    return local_operator, row_start, row_end
 
 
 def validate_partition(

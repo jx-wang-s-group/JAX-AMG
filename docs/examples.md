@@ -52,7 +52,9 @@ The input matrix can be a sparse matrix (from JAX or SciPy) of various types, or
 
 You can also solve using a callable operator instead of an explicit matrix.
 
-Note: The solve still requires an internal matrix representation, so this is not fully matrix-free backend execution.
+!!! note
+
+    AmgX still needs an explicit matrix, so the operator is materialized internally — its sparsity pattern is detected automatically (by tracing the operator's jaxpr, with basis-vector probing as a fallback) and the values are assembled via graph-colored probing. This is cached, so it happens once. See [Caching](caching.md) for details.
 
 === "Python"
 
