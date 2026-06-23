@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import jax
@@ -37,10 +37,16 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
 from jax import lax
-from jax.extend.core import Literal
+from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 from jax.typing import ArrayLike
 
 from .utils import temp_enable_x64
+
+# A connectivity matrix ``C`` has ``C[i, j] = 1`` iff output element ``i`` depends
+# on global input ``j``; propagated through the jaxpr as a scipy CSR matrix. Typed
+# as Any since scipy.sparse ships no usable stubs -- the alias documents intent at
+# call sites without mypy trying (and failing) to check CSR internals.
+Conn = Any
 
 # --- Tracing-based detection: interpret the operator's jaxpr ---
 # Element-wise primitives: output element depends on the union of its operands'
@@ -145,7 +151,7 @@ _UNKNOWN = object()  # sentinel: a value that depends on the operator input
 
 
 @contextlib.contextmanager
-def _host_exact():
+def _host_exact() -> Iterator[None]:
     """Run host-side index/position binds on CPU with x64 enabled, so position
     arithmetic stays exact regardless of the global precision config."""
     with temp_enable_x64(), jax.default_device(_CPU):
@@ -156,15 +162,15 @@ class _BailOut(Exception):
     """Raised when the operator cannot be traced structurally; caller falls back."""
 
 
-def _empty(n_rows, n_global):
+def _empty(n_rows: int, n_global: int) -> Conn:
     return sp.csr_matrix((n_rows, n_global), dtype=np.int8)
 
 
-def _is_empty(C):
+def _is_empty(C: Conn) -> bool:
     return C.nnz == 0
 
 
-def _index_operand_positions(prim, n_operands):
+def _index_operand_positions(prim: str, n_operands: int) -> set[int]:
     """Operand positions that are indices/offsets rather than data, for a movement
     primitive. Their values steer where data lands but never flow into the output,
     so they are bound as concrete values (not connectivity id blocks)."""
@@ -175,7 +181,12 @@ def _index_operand_positions(prim, n_operands):
     return set()  # pad: both operand and padding value are data
 
 
-def _movement_rowmap(prim, params, in_shapes, in_vals):
+def _movement_rowmap(
+    prim: str,
+    params: dict[str, Any],
+    in_shapes: list[tuple[int, ...]],
+    in_vals: list[Any],
+) -> tuple[np.ndarray, int]:
     """Return (rowmap, n_combined): for movement primitives, rowmap[o] is the
     source row (in the vstack of all operands) feeding output element o.
 
@@ -243,7 +254,7 @@ def _movement_rowmap(prim, params, in_shapes, in_vals):
 _PRIM_BY_NAME: dict = {}
 
 
-def _build_prim_table():
+def _build_prim_table() -> None:
     for name in ("pad", "dynamic_slice", "gather"):
         obj = getattr(lax, f"{name}_p", None)
         if obj is not None:
@@ -253,7 +264,9 @@ def _build_prim_table():
 _build_prim_table()
 
 
-def _reduce_map(params, in_shape, out_shape):
+def _reduce_map(
+    params: dict[str, Any], in_shape: tuple[int, ...], out_shape: tuple[int, ...]
+) -> tuple[np.ndarray, int]:
     """Map each operand element to its reduced output element (reduce_* ops)."""
     axes = set(params["axes"])
     keep = [d for d in range(len(in_shape)) if d not in axes]
@@ -268,29 +281,35 @@ def _reduce_map(params, in_shape, out_shape):
     return out_flat.astype(np.int64), int(np.prod(out_shape) if out_shape else 1)
 
 
-def _interp(jaxpr, consts, n_global, arg_conns, arg_vals=None):
+def _interp(
+    jaxpr: Jaxpr,
+    consts: Sequence[Any],
+    n_global: int,
+    arg_conns: list[Conn],
+    arg_vals: list[Any] | None = None,
+) -> list[Conn]:
     """Interpret one (sub-)jaxpr, returning the connectivity of each outvar.
 
     arg_vals carries known concrete values of the inputs (or _UNKNOWN), so that
     constant-folding (e.g. of convolution kernels or scatter indices) works across
     call boundaries.
     """
-    env = {}
-    vals = {}  # concrete values of input-INDEPENDENT vars (constant-folding)
+    env: dict[Var, Conn] = {}
+    vals: dict[Var, Any] = {}  # concrete values of input-INDEPENDENT vars
     if arg_vals is None:
         arg_vals = [_UNKNOWN] * len(arg_conns)
 
-    def read(v):
+    def read(v: Var | Literal) -> Conn:
         if isinstance(v, Literal):
             return _empty(int(np.prod(np.shape(v.val))) or 1, n_global)
         return env[v]
 
-    def val_of(v):
+    def val_of(v: Var | Literal) -> Any:
         if isinstance(v, Literal):
             return np.asarray(v.val)
         return vals.get(v, _UNKNOWN)
 
-    def shape_of(v):
+    def shape_of(v: Var | Literal) -> tuple[int, ...]:
         return tuple(v.aval.shape)
 
     for v, C, val in zip(jaxpr.invars, arg_conns, arg_vals):
@@ -363,10 +382,10 @@ def _interp(jaxpr, consts, n_global, arg_conns, arg_vals=None):
             out_shape = out_shapes[0]
             out_size = out_sizes[0]
             acc = _empty(out_size, n_global)
-            for v, C in zip(eqn.invars, in_Cs):
+            for iv, C in zip(eqn.invars, in_Cs):
                 if _is_empty(C):
                     continue
-                s = shape_of(v)
+                s = shape_of(iv)
                 if tuple(s) == tuple(out_shape):
                     contrib = C
                 else:
@@ -431,7 +450,9 @@ def _interp(jaxpr, consts, n_global, arg_conns, arg_vals=None):
     return [read(v) for v in jaxpr.outvars]
 
 
-def _scatter_add(eqn, in_Cs, idx_val, n_global):
+def _scatter_add(
+    eqn: JaxprEqn, in_Cs: list[Conn], idx_val: np.ndarray, n_global: int
+) -> Conn:
     """Connectivity of operand.at[idx].add(updates): operand OR scattered updates.
 
     Handles the common non-overlapping case (static indices); bails otherwise.
@@ -468,7 +489,13 @@ def _scatter_add(eqn, in_Cs, idx_val, n_global):
     return operand_C + M @ updates_C
 
 
-def _conv(eqn, in_Cs, val_of, out_size, n_global):
+def _conv(
+    eqn: JaxprEqn,
+    in_Cs: list[Conn],
+    val_of: Callable[[Var | Literal], Any],
+    out_size: int,
+    n_global: int,
+) -> Conn:
     """Connectivity of a convolution with a constant kernel: each output element
     depends on the union of input elements in its receptive field. Computed by
     probing each nonzero kernel tap with a 1-hot kernel to get the shift map
@@ -518,7 +545,9 @@ def _conv(eqn, in_Cs, val_of, out_size, n_global):
     return acc
 
 
-def _scan(eqn, in_Cs, in_vals, n_global):
+def _scan(
+    eqn: JaxprEqn, in_Cs: list[Conn], in_vals: list[Any], n_global: int
+) -> list[Conn]:
     """Connectivity through a scan, by unrolling: thread the carry connectivity
     step by step and stack the per-step outputs. Bails on very long scans.
     """
@@ -561,7 +590,12 @@ def _scan(eqn, in_Cs, in_vals, n_global):
     return result
 
 
-def _dot_general(eqn, in_Cs, val_of, n_global):
+def _dot_general(
+    eqn: JaxprEqn,
+    in_Cs: list[Conn],
+    val_of: Callable[[Var | Literal], Any],
+    n_global: int,
+) -> Conn:
     """Connectivity of a contraction (dot_general / matmul / einsum) with one
     constant operand: each output element depends on the union of the data
     operand's elements over the contracted fibre where the constant is nonzero.
@@ -603,7 +637,7 @@ def _dot_general(eqn, in_Cs, val_of, n_global):
     if cnnz * dfree_size > 50_000_000:
         raise _BailOut("dot_general too large (dense)")
 
-    def _cols(arr, dims):
+    def _cols(arr: np.ndarray, dims: tuple[int, ...]) -> np.ndarray:
         return arr[:, list(dims)] if dims else np.zeros((arr.shape[0], 0), np.int64)
 
     cb_idx, cc_idx, cf_idx = (
@@ -655,7 +689,9 @@ def _dot_general(eqn, in_Cs, val_of, n_global):
     return M @ data_C
 
 
-def trace_sparsity_pattern(operator, shape):
+def trace_sparsity_pattern(
+    operator: Callable, shape: tuple[int, int]
+) -> tuple[np.ndarray, np.ndarray] | None:
     """Recover (rows, cols) of a JAX operator's sparsity, or None to fall back.
 
     Traces the operator to a jaxpr and propagates a connectivity (index-set)
@@ -887,7 +923,7 @@ def materialize_sparse_matrix(
 
     column_colors = jnp.array(column_colors, dtype=jnp.int32)
 
-    def evaluate_color(color_id):
+    def evaluate_color(color_id: ArrayLike) -> jax.Array:
         # Create probe vector v_c such that v_c[j] = 1 if color[j] == c, else 0
         mask = column_colors == color_id
         v = mask.astype(jnp.float32)
@@ -929,7 +965,9 @@ def materialize_sparse_matrix(
 
 
 # --- Verification and orchestration (cache_coloring) ---
-def _drop_zeros(A_bcsr, tol=1e-9):
+def _drop_zeros(
+    A_bcsr: jsp.BCSR, tol: float = 1e-9
+) -> tuple[jsp.BCSR, np.ndarray, np.ndarray]:
     """Return (BCSR, rows, cols) with near-zero entries removed."""
     data = np.asarray(A_bcsr.data)
     indices = np.asarray(A_bcsr.indices)
@@ -950,7 +988,9 @@ def _drop_zeros(A_bcsr, tol=1e-9):
     return A, row_of[keep], indices[keep].astype(np.int32)
 
 
-def _verify_recovery(operator, A_bcsr, n_global, n_check=5):
+def _verify_recovery(
+    operator: Callable, A_bcsr: jsp.BCSR, n_global: int, n_check: int = 5
+) -> bool:
     """Check the recovered matrix reproduces the operator on random vectors.
 
     If A_bcsr != A (entries missing because the operator was not really
@@ -976,7 +1016,9 @@ def _verify_recovery(operator, A_bcsr, n_global, n_check=5):
     return True
 
 
-def _try_trace_coloring(operator, n_local, n_global):
+def _try_trace_coloring(
+    operator: Callable, n_local: int, n_global: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, tuple[int, int]] | None:
     """Exact sparsity from the operator's jaxpr (no probing), VERIFIED against the
     operator. Works for any JAX-expressed operator; returns None for operators
     that can't be traced structurally (opaque calls, data-dependent indexing),
