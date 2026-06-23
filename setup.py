@@ -12,9 +12,18 @@ Environment Variables:
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from setuptools import Extension, setup
+from setuptools.command.build_ext import build_ext
+
+
+def _fail(message):
+    """Print an actionable error and abort the build without a Python traceback."""
+    sys.stdout.flush()
+    print(f"\n[jaxamg] ERROR: {message}\n", file=sys.stderr)
+    raise SystemExit(1)
 
 
 def find_cuda() -> str | None:
@@ -134,7 +143,7 @@ def get_build_config() -> dict:
     try:
         import pybind11
     except ImportError:
-        raise RuntimeError(
+        _fail(
             "pybind11 is required to build this package. "
             "Install with: pip install pybind11>=2.10.0"
         )
@@ -142,16 +151,16 @@ def get_build_config() -> dict:
     try:
         from jax import ffi
     except ImportError:
-        raise RuntimeError(
+        _fail(
             "jax is required to build this package. "
-            "Install with: pip install jax>=0.4.35"
+            "Install with: pip install jax>=0.5.0"
         )
 
     # Find CUDA
     cuda_home = find_cuda()
     print(f"\033[1;34m[setup.py] CUDA_HOME: {cuda_home}\033[0m")
     if not cuda_home:
-        raise RuntimeError(
+        _fail(
             "CUDA not found. Please install CUDA Toolkit and either:\n"
             "  1. Set CUDA_HOME environment variable, or\n"
             "  2. Ensure nvcc is in your PATH"
@@ -162,7 +171,7 @@ def get_build_config() -> dict:
     print(f"\033[1;34m[setup.py] AMGX_ROOT: {amgx_root}\033[0m")
     print(f"\033[1;34m[setup.py] AMGX_BUILD: {amgx_build}\033[0m")
     if not amgx_root or not amgx_build:
-        raise RuntimeError(
+        _fail(
             "AmgX not found. Please:\n"
             "  1. Set AMGX_ROOT to the AmgX source directory\n"
             "  2. Set AMGX_BUILD to the AmgX build directory (or build in AMGX_ROOT/build)\n"
@@ -257,17 +266,35 @@ def get_build_config() -> dict:
     }
 
 
-# Build configuration
-build_config = get_build_config()
+class BuildExt(build_ext):
+    """Resolve CUDA/AmgX/MPI paths at build time rather than at import time.
 
-# C++ extension module
+    Keeping the heavy (and failure-prone) native-dependency detection inside
+    ``build_extensions()`` means commands that do not compile the extension --
+    notably ``sdist`` and metadata generation -- succeed without CUDA/AmgX
+    present. Only an actual ``build_ext`` triggers detection, so the source
+    distribution can be built and published from a machine without a GPU
+    toolchain (e.g. CI).
+    """
+
+    def build_extensions(self) -> None:
+        cfg = get_build_config()
+        for ext in self.extensions:
+            ext.include_dirs = cfg["include_dirs"] + list(ext.include_dirs)
+            ext.library_dirs = cfg["library_dirs"] + list(ext.library_dirs)
+            ext.runtime_library_dirs = cfg["runtime_library_dirs"] + list(
+                ext.runtime_library_dirs or []
+            )
+            ext.libraries = cfg["libraries"] + list(ext.libraries)
+        super().build_extensions()
+
+
+# C++ extension module. The native dependency paths (CUDA/AmgX/MPI) are filled
+# in at build time by BuildExt so that sdist/metadata commands work without
+# CUDA/AmgX installed.
 ext_module = Extension(
     "jaxamg._amgx",
     sources=["jaxamg/_amgx.cc"],
-    include_dirs=build_config["include_dirs"],
-    library_dirs=build_config["library_dirs"],
-    runtime_library_dirs=build_config["runtime_library_dirs"],
-    libraries=build_config["libraries"],
     extra_compile_args=["-O3", "-std=c++17"],
     language="c++",
 )
@@ -275,4 +302,5 @@ ext_module = Extension(
 # Setup (metadata now in pyproject.toml)
 setup(
     ext_modules=[ext_module],
+    cmdclass={"build_ext": BuildExt},
 )

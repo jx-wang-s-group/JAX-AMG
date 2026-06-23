@@ -2,70 +2,81 @@
 
 ## Prerequisites: CUDA and AmgX
 
-First, ensure that [CUDA Toolkit](https://developer.nvidia.com/cuda/toolkit) and [AmgX](https://developer.nvidia.com/amgx) are installed. Installation details for AmgX are available in its [GitHub repository](https://github.com/NVIDIA/AMGX). For MPI support, you also need an MPI library (such as OpenMPI or MPICH) and build AmgX accordingly.
+JAX-AMG compiles a native extension against CUDA and AmgX, so a build toolchain
+and these libraries must be in place before installing:
+
+- Python 3.10+ and a C++ compiler
+- [CUDA Toolkit](https://developer.nvidia.com/cuda/toolkit) 12.0+
+- [NVIDIA AmgX](https://developer.nvidia.com/amgx) 2.5.0+, built from source (see the [build instructions](https://github.com/NVIDIA/AMGX#quickstart))
+- For distributed (MPI) mode: an MPI library (e.g., OpenMPI or MPICH), with AmgX built against it. A CUDA-aware MPI build is optional but recommended for GPU-direct communication.
 
 Next, set the required environment variables so the build system can locate the dependencies. If CUDA and AmgX are installed in standard locations, they may be detected automatically.
 
 ```bash
 export CUDA_HOME=/usr/local/cuda
 export AMGX_ROOT=/usr/local/amgx
-export AMGX_BUILD=/usr/local/amgx/build
+export AMGX_BUILD=/usr/local/amgx/build   # Optional (defaults to $AMGX_ROOT/build)
 ```
 
 
 ## Installation
 
-=== "Installation Script"
+=== "pip (PyPI)"
 
-    The install script auto-detects your CUDA version and handles all dependencies:
+    Run the command for your CUDA version:
 
     ```bash
-    # Single-GPU installation (default)
-    bash scripts/install.sh
-
-    # Distributed (MPI) installation
-    bash scripts/install.sh --mpi
+    pip install "jaxamg[cuda12]"   # CUDA 12
+    pip install "jaxamg[cuda13]"   # CUDA 13
     ```
 
-=== "Manual pip Installation"
+    **Distributed (MPI) mode.** Build the MPI bindings against your own MPI first
+    (a generic `mpi4py` wheel may not match the MPI AmgX was built with), then
+    install the `mpi` extra:
 
-    1. **Install JAX**:
+    ```bash
+    # Build mpi4py against your system MPI
+    pip install mpi4py --no-binary mpi4py
+    # mpi4jax (built with nanobind)
+    pip install nanobind
+    CUDA_ROOT=$CUDA_HOME pip install mpi4jax --no-build-isolation
+    # JAX-AMG with the matching CUDA extra + MPI
+    pip install "jaxamg[cuda13,mpi]"
+    ```
 
-        ```bash
-        # Install JAX with CUDA support
-        pip install "jax[cuda12]>=0.4.35" # For CUDA 12
-        pip install "jax[cuda13]>=0.4.35" # For CUDA 13
-        ```
+=== "Installation Script (from source)"
 
-    2. **Install JAX-AMG**:
+    Clone the repository and run the script, which auto-detects your CUDA version
+    and handles all dependencies:
 
-        - **For Single-GPU Mode:**
-        ```bash
-        pip install -e .
-        ```
+    ```bash
+    git clone https://github.com/jx-wang-s-group/JAX-AMG.git
+    cd JAX-AMG
+    bash scripts/install.sh          # add --mpi for distributed mode
+    ```
 
-        - **For Distributed (MPI) Mode:**
-        ```bash
-        # Install MPI library (skip if you already have one)
-        # For instance, install OpenMPI via conda:
-        # conda install -c conda-forge openmpi-mpicc
+=== "Manual (from source)"
 
-        # Build mpi4py from source
-        pip install mpi4py --no-binary mpi4py
+    ```bash
+    git clone https://github.com/jx-wang-s-group/JAX-AMG.git
+    cd JAX-AMG
 
-        # Install mpi4jax
-        pip install cython
-        CUDA_ROOT=$CUDA_HOME pip install mpi4jax --no-build-isolation
+    # Install JAX with CUDA support (or jax[cuda13])
+    pip install "jax[cuda12]>=0.5.0"
 
-        # Install jaxamg with MPI dependencies
-        pip install -e ".[mpi]"
-        ```
+    # Single-GPU
+    pip install -e .
+
+    # Distributed (MPI): build mpi4py/mpi4jax first (see the pip tab), then:
+    pip install -e ".[mpi]"
+    ```
 
 === "Conda Environments"
 
-    Use the provided conda environment files.
-
     ```bash
+    git clone https://github.com/jx-wang-s-group/JAX-AMG.git
+    cd JAX-AMG
+
     # Single-GPU mode
     conda env create -f environment.yml
     conda activate jaxamg
@@ -77,7 +88,7 @@ export AMGX_BUILD=/usr/local/amgx/build
 
     The environment files use `jax[cuda13]`. If you need CUDA 12 instead, edit the `.yml` files and replace `cuda13` with `cuda12` before creating the environment.
 
-    If `mpi4jax` was built without CUDA support, you need to rebuild it after creating the conda environment:
+    If `mpi4jax` was built without CUDA support, rebuild it after creating the conda environment:
 
     ```bash
     CUDA_ROOT=$CUDA_HOME pip install mpi4jax --no-build-isolation --no-cache-dir --force-reinstall

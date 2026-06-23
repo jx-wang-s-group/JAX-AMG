@@ -17,6 +17,13 @@
 - JAX (with CUDA support)
 - mpi4py & mpi4jax (optional, for MPI support)
 
+## Installation
+
+```bash
+pip install "jaxamg[cuda12]"   # or jaxamg[cuda13]
+```
+
+JAX-AMG compiles a native extension against your CUDA toolkit and a source build of NVIDIA AmgX, so set `CUDA_HOME` and `AMGX_ROOT` first. See the [Installation](install.md) guide for full details (MPI, conda, building from source).
 
 ## Basic Usage
 

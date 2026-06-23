@@ -1,0 +1,10 @@
+# Files to include in the source distribution (sdist) beyond the defaults.
+# The C++ headers below are #included by jaxamg/_amgx.cc and are required to
+# compile the native extension from a downloaded sdist; without them the build
+# fails. .pyi/py.typed ship the type information (PEP 561).
+include LICENSE
+include README.md
+include pyproject.toml
+include setup.py
+recursive-include jaxamg *.h *.cc *.pyi
+include jaxamg/py.typed

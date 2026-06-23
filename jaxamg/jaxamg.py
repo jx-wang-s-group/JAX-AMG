@@ -12,8 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import ArrayLike
 
-from . import _amgx
 from . import config as amgx_config
+from ._ext import _amgx
 from .mpi_utils import (
     _amgx_allgather_impl,
     _mpi4jax_allgatherv,

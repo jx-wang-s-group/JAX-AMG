@@ -1,7 +1,7 @@
 # JAX-AMG
 
 [![Docs](https://img.shields.io/github/actions/workflow/status/jx-wang-s-group/JAX-AMG/docs.yml?style=flat-square&label=docs)](https://jx-wang-s-group.github.io/JAX-AMG/)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square)](https://github.com/jx-wang-s-group/JAX-AMG/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org/)
 [![arXiv](https://img.shields.io/badge/arXiv-2606.09001-b31b1b.svg?style=flat-square)](https://arxiv.org/abs/2606.09001)
 
@@ -20,7 +20,7 @@ Documentation: <https://jx-wang-s-group.github.io/JAX-AMG/>
 ## Prerequisites
 
 - Python 3.10+
-- JAX 0.4.35+ with CUDA support
+- JAX 0.5.0+ with CUDA support
 - AmgX 2.5.0+
 - CUDA Toolkit 12.0+
 
@@ -28,6 +28,22 @@ Documentation: <https://jx-wang-s-group.github.io/JAX-AMG/>
 
 - MPI library (e.g., OpenMPI, MPICH)
 - CUDA-aware MPI (optional, for GPU-direct communication)
+
+## Installation
+
+JAX-AMG is installed with pip. It compiles a native extension against a CUDA toolkit and a source build of [NVIDIA AmgX](https://github.com/NVIDIA/AMGX), so set `CUDA_HOME` and `AMGX_ROOT` first, then run the command for your CUDA version:
+
+```bash
+pip install "jaxamg[cuda12]"   # or jaxamg[cuda13]
+```
+
+At runtime, add the AmgX and CUDA libraries to your library path:
+
+```bash
+export LD_LIBRARY_PATH=$AMGX_ROOT/build:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+```
+
+For distributed (MPI) mode, the install script, conda, or building from source, see the full [Installation Guide](https://jx-wang-s-group.github.io/JAX-AMG/install/).
 
 ---
 

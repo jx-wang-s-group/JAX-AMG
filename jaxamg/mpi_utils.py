@@ -11,7 +11,7 @@ import numpy as np
 import scipy.sparse as sp
 from jax.typing import ArrayLike
 
-from . import _amgx
+from ._ext import _amgx
 from .utils import temp_enable_x64
 
 if TYPE_CHECKING:

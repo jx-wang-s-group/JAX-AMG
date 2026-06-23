@@ -1,3 +1,4 @@
+from ._version import __version__
 from .cache import (
     cache_mpi_metadata,
     with_cache,
@@ -13,6 +14,7 @@ from .preconditioners import make_preconditioner
 from .sparsity import cache_coloring
 
 __all__ = [
+    "__version__",
     "solve",
     "with_cache",
     "cache_coloring",

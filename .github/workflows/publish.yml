@@ -1,0 +1,57 @@
+name: Publish to PyPI
+
+# Builds the source distribution and publishes it to PyPI on a GitHub release.
+# A wheel is intentionally not built here: jaxamg links against a user-provided
+# AmgX build and (optionally) the system MPI, so it is distributed as an sdist
+# that compiles on the user's machine. The sdist build needs no GPU/AmgX/CUDA
+# because setup.py defers native-dependency detection to build_ext.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Fail fast if the release tag (e.g. v0.1.1) doesn't match the version in
+      # jaxamg/_version.py -- otherwise the build would re-publish an existing
+      # version and PyPI would reject it after wasting the build. _version.py is
+      # loaded in isolation so this works without compiling the extension.
+      - name: Verify tag matches package version
+        if: github.event_name == 'release'
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION=$(python -c "import importlib.util as u; s=u.spec_from_file_location('v','jaxamg/_version.py'); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.__version__)")
+          echo "tag=$TAG  package version=$VERSION"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::Release tag '$GITHUB_REF_NAME' does not match jaxamg/_version.py ($VERSION). Bump _version.py to match the tag."
+            exit 1
+          fi
+      - name: Build sdist
+        run: pipx run build --sdist
+      - name: Check metadata
+        run: pipx run twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: Publish to PyPI
+    needs: build-sdist
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # OIDC token for PyPI Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

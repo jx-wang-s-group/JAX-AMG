@@ -195,14 +195,17 @@ print_info "Detecting CUDA version..."
 CUDA_VERSION=$("$CUDA_HOME/bin/nvcc" --version | grep "release" | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1/p')
 
 if [[ "$CUDA_VERSION" == "12" ]]; then
-    JAX_CUDA_EXTRA="jax[cuda12]>=0.4.35"
+    JAX_CUDA_EXTRA="jax[cuda12]>=0.5.0"
+    CUDA_EXTRA="cuda12"
     print_success "CUDA 12 detected - will install jax[cuda12]"
 elif [[ "$CUDA_VERSION" == "13" ]]; then
-    JAX_CUDA_EXTRA="jax[cuda13]>=0.4.35"
+    JAX_CUDA_EXTRA="jax[cuda13]>=0.5.0"
+    CUDA_EXTRA="cuda13"
     print_success "CUDA 13 detected - will install jax[cuda13]"
 else
     print_warning "Unknown CUDA version $CUDA_VERSION, defaulting to cuda12"
-    JAX_CUDA_EXTRA="jax[cuda12]>=0.4.35"
+    JAX_CUDA_EXTRA="jax[cuda12]>=0.5.0"
+    CUDA_EXTRA="cuda12"
 fi
 
 # Step 6: Install the package
@@ -213,8 +216,11 @@ print_info "Installing JAX-AMG..."
 print_info "Installing JAX with CUDA support..."
 pip install "$JAX_CUDA_EXTRA"
 
-# Determine pip install command
-PIP_EXTRAS=""
+# Determine pip extras. These mirror the extras declared in pyproject.toml, so
+# the editable install below is the single source of truth for dependencies.
+# Always include the CUDA extra matching the detected toolkit; jax[cudaXX] was
+# already installed above, so pip sees it satisfied and skips it here.
+EXTRAS="$CUDA_EXTRA"
 if [[ "$INSTALL_MPI" == true ]]; then
     # Build mpi4py from source to ensure it links against the same MPI as AmgX
     print_info "Building mpi4py from source (for MPI compatibility)..."
@@ -223,19 +229,20 @@ if [[ "$INSTALL_MPI" == true ]]; then
     # Install mpi4jax with --no-build-isolation for CUDA compatibility
     # mpi4jax uses CUDA_ROOT (not CUDA_HOME) to find CUDA
     # (per mpi4jax docs: https://github.com/mpi4jax/mpi4jax)
-    print_info "Installing mpi4jax (with cython for CUDA backend)..."
-    pip install cython
+    # nanobind is mpi4jax's build dependency; it must be present before the
+    # --no-build-isolation install below.
+    print_info "Installing mpi4jax (nanobind is its build dependency)..."
+    pip install nanobind
     CUDA_ROOT="$CUDA_HOME" pip install mpi4jax --no-build-isolation --no-cache-dir
 
-    PIP_EXTRAS="[mpi]"
+    # mpi4py/mpi4jax are now installed from source; [mpi] only records the
+    # dependency (pip sees them satisfied and leaves them untouched).
+    EXTRAS="$EXTRAS,mpi"
 fi
 if [[ "$INSTALL_DEV" == true ]]; then
-    if [[ -n "$PIP_EXTRAS" ]]; then
-        PIP_EXTRAS="[mpi,dev]"
-    else
-        PIP_EXTRAS="[dev]"
-    fi
+    EXTRAS="$EXTRAS,dev"
 fi
+PIP_EXTRAS="[$EXTRAS]"
 
 # Get the script directory and project root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

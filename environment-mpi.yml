@@ -18,6 +18,6 @@ dependencies:
   - pip:
       - jax[cuda13]
       - mpi4py
-      - cython
-      - mpi4jax
+      - nanobind
+      - mpi4jax>=0.9.0
       - -e ".[mpi]"
