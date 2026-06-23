@@ -16,6 +16,7 @@ from jaxamg.mpi_utils import (
     get_partition_info,
     make_allgather_vector,
     partition_csr_matrix,
+    partition_operator,
     partition_vector,
     validate_partition,
 )
@@ -349,5 +350,57 @@ def test_make_allgather_vector(mpi_context, backend):
     g = jax.jit(jax.grad(loss))(x_local)
     expected = 2.0 * (np.asarray(x_global) - np.asarray(target))[row_start:row_end]
     np.testing.assert_allclose(np.asarray(g), expected, rtol=1e-10)
+
+    jax.config.update("jax_enable_x64", False)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_partition_operator(mpi_context):
+    """partition_operator turns a global operator into this rank's row-local one,
+    and materializing it reproduces exactly this rank's rows of the global matrix
+    -- only the local (n_local, n_global) block is ever formed."""
+    comm, rank, nranks = mpi_context
+
+    jax.config.update("jax_enable_x64", True)
+
+    # n_global not divisible by nranks -> exercise uneven partitions.
+    n_global = 23
+    rng = np.random.default_rng(0)
+
+    # A concrete non-symmetric sparse global matrix and its matvec operator.
+    A = rng.standard_normal((n_global, n_global))
+    A[np.abs(A) < 1.0] = 0.0  # induce sparsity
+    A[np.diag_indices(n_global)] = 5.0  # nonzero diagonal
+    A_j = jnp.asarray(A)
+    global_op = lambda x: A_j @ x
+
+    local_op, row_start, row_end = partition_operator(global_op, n_global, rank, nranks)
+
+    # Partition bounds agree with get_partition_info.
+    rs_ref, re_ref, n_local = get_partition_info(n_global, rank, nranks)
+    assert (row_start, row_end) == (rs_ref, re_ref)
+
+    # The local operator is exactly the global operator sliced to this rank's rows.
+    x = jnp.asarray(rng.standard_normal(n_global))
+    np.testing.assert_allclose(
+        np.asarray(local_op(x)),
+        np.asarray(global_op(x))[row_start:row_end],
+        rtol=1e-12,
+    )
+
+    # Materializing the local operator reproduces this rank's rows of A.
+    from jaxamg.sparsity import (
+        get_column_coloring,
+        materialize_sparse_matrix,
+        probe_sparsity_pattern,
+    )
+
+    shape = (n_local, n_global)
+    rows, cols = probe_sparsity_pattern(local_op, shape)
+    colors, n_colors = get_column_coloring(rows, cols, shape)
+    A_local = materialize_sparse_matrix(local_op, shape, rows, cols, colors, n_colors)
+    np.testing.assert_allclose(
+        np.asarray(A_local.todense()), A[row_start:row_end, :], atol=1e-10
+    )
 
     jax.config.update("jax_enable_x64", False)

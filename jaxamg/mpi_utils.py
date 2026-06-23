@@ -358,6 +358,39 @@ def partition_csr_matrix(
     return A_local, row_start, row_end
 
 
+def partition_operator(
+    operator: Callable, nglobal: int, rank: int, nranks: int
+) -> tuple[Callable, int, int]:
+    """Partition a global matrix-free operator across MPI ranks (row-based).
+
+    Wraps a global operator -- a callable mapping a length-``nglobal`` vector to
+    the global result ``A @ x`` -- into this rank's row-local operator, which
+    returns only the rows ``[row_start, row_end)`` this rank owns. That is the
+    ``(n_local, nglobal)`` form the distributed solve expects, so a user can pass
+    a single global operator instead of writing a distributed one by hand.
+
+    No global matrix is formed: each rank materializes only its local block.
+
+    Args:
+        operator: Global operator ``A(x)`` mapping a length-``nglobal`` vector to
+            a length-``nglobal`` result.
+        nglobal: Global problem size (total rows across all ranks).
+        rank: MPI rank (0-indexed).
+        nranks: Total number of MPI ranks.
+
+    Returns:
+        local_operator: Callable mapping the global vector to this rank's rows.
+        row_start: Starting row index (global).
+        row_end: Ending row index (global, exclusive).
+    """
+    row_start, row_end, _ = get_partition_info(nglobal, rank, nranks)
+
+    def local_operator(x_global: ArrayLike) -> jax.Array:
+        return operator(x_global)[row_start:row_end]
+
+    return local_operator, row_start, row_end
+
+
 def validate_partition(
     A_local: jsp.BCSR, nglobal: int, row_start: int, row_end: int
 ) -> None:

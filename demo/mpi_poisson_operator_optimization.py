@@ -13,12 +13,8 @@ import jax.numpy as jnp
 from mpi4py import MPI
 
 import jaxamg
-from jaxamg.matrices import (
-    poisson_operator,
-    poisson_operator_distributed,
-    rhs_ones,
-)
-from jaxamg.mpi_utils import get_partition_info
+from jaxamg.matrices import poisson_operator, rhs_ones
+from jaxamg.mpi_utils import get_partition_info, partition_operator
 
 jax.config.update("jax_enable_x64", True)
 
@@ -79,8 +75,10 @@ def main():
         "tolerance": 1e-6,
     }
 
-    # Create dummy operator for caching
-    dummy_op = poisson_operator_distributed(grid_size, row_start, row_end, skew=1.0)
+    # Create local dummy operator for caching
+    dummy_op, _, _ = partition_operator(
+        poisson_operator(skew=1.0), n_global, rank, nranks
+    )
 
     # Cache MPI metadata
     mpi_cache = jaxamg.cache_mpi_metadata(
@@ -94,9 +92,10 @@ def main():
         print("\nStarting optimization...")
 
     # Define loss function
-    # @jax.jit
     def loss_local(skew, b_loc, x_true_loc):
-        op = poisson_operator_distributed(grid_size, row_start, row_end, skew=skew)
+        op, _, _ = partition_operator(
+            poisson_operator(skew=skew), n_global, rank, nranks
+        )
         A = jaxamg.with_cache(op, coloring=coloring_cache, mpi=mpi_cache)
 
         x_pred_loc, info = jaxamg.solve(A, b_loc)

@@ -567,55 +567,6 @@ def poisson_operator(skew: float = 0.0, dtype: DTypeLike | None = None) -> Calla
     return matvec
 
 
-def poisson_operator_distributed(
-    n_side: int,
-    row_start: int,
-    row_end: int,
-    skew: float = 0.0,
-    dtype: DTypeLike | None = None,
-) -> Callable:
-    """
-    Create a distributed Poisson operator.
-
-    The operator takes a global vector u, applies the Poisson stencil,
-    and returns the local portion of the result (rows [row_start, row_end)).
-
-    Args:
-        n_side: Grid size (results in n_side^2 global size)
-        row_start: Starting global row index for this rank
-        row_end: Ending global row index for this rank (exclusive)
-        skew: Skew-symmetric coefficient (default 0.0)
-        dtype: Data type of the operator
-
-    Returns:
-        Callable operator u_global_flat -> local_segment_flat
-    """
-    # Create kernel with skew parameter
-    # Standard symmetric: [[0, -1, 0], [-1, 4, -1], [0, -1, 0]]
-    kernel = jnp.array(
-        [
-            [0.0, -1.0 - skew / 2.0, 0.0],
-            [-1.0 - skew / 2.0, 4.0, -1.0 + skew / 2.0],
-            [0.0, -1.0 + skew / 2.0, 0.0],
-        ],
-        dtype=dtype,
-    )
-
-    def matvec(u_flat):
-        # Reshape flat global vector to 2D grid
-        u = u_flat.reshape((n_side, n_side))
-
-        # Apply convolution with zero padding (Dirichlet BCs)
-        Au = jax.scipy.signal.convolve2d(
-            u, kernel, mode="same", boundary="fill", fillvalue=0.0
-        )
-
-        # Flatten and extract local rows
-        return Au.ravel()[row_start:row_end]
-
-    return matvec
-
-
 def poisson3d_operator(
     robin: float = 0.0, diagonal_value: float = 6.0, dtype: DTypeLike | None = None
 ) -> Callable:
