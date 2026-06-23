@@ -33,6 +33,13 @@ When to use each option:
     - It is especially helpful in iterative loops where the operator structure stays
       the same while values change.
     - In practice, pass the result of `cache_coloring(...)` into `with_cache(...)`.
+    - Under the hood, `cache_coloring(...)` detects the operator's sparsity pattern
+      by **tracing** its jaxpr — propagating an index-set structure through each
+      primitive to recover the exact pattern in a single trace — and falls back to
+      exhaustive **probing** with basis vectors for operators it cannot trace
+      (opaque calls, data-dependent indexing). The tracing method follows
+      [Hill & Dalle (2025)](https://arxiv.org/abs/2501.17737); their Julia package
+      is [SparseConnectivityTracer.jl](https://github.com/adrhill/SparseConnectivityTracer.jl).
 
 - `mpi=...`
     - This reuses MPI metadata such as counts, displacements, communicator pointer,

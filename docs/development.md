@@ -46,7 +46,7 @@ ranks; assign a distinct GPU to each via `CUDA_VISIBLE_DEVICES`:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
 OMPI_MCA_opal_cuda_support=true MPI4JAX_USE_CUDA_MPI=1 \
-mpirun -n 2 python -m pytest tests/test_mpi.py --with-mpi
+mpirun -n 2 python -m pytest --only-mpi tests/
 ```
 
 - `--only-mpi` runs *only* the MPI-marked tests.
