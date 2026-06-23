@@ -329,13 +329,24 @@ def _interp(
         # Constant-fold input-independent vars (e.g. iota-built scatter indices,
         # precomputed grid metrics, convolution kernels) so they can be resolved
         # later. Pure call primitives (jit) fold too when all inputs are known.
+        # Nullary generators like ``iota`` have no inputs (``all([])`` is True), so
+        # they fold too -- this is what lets index chains built from ``jnp.arange``
+        # resolve to concrete values for the gather/scatter/dynamic_slice rules.
         if prim not in _OPAQUE:
             in_vals = [val_of(v) for v in eqn.invars]
-            if in_vals and all(x is not _UNKNOWN for x in in_vals):
+            if all(x is not _UNKNOWN for x in in_vals):
                 try:
+                    # Cast each input to the dtype the jaxpr declares for it:
+                    # primitives with a fixed signature (e.g. pjit sub-jaxprs)
+                    # require an exact dtype match, and a host int literal would
+                    # otherwise arrive as int64 and mismatch an int32 operand.
                     with _host_exact():
                         outs = eqn.primitive.bind(
-                            *[jnp.asarray(x) for x in in_vals], **eqn.params
+                            *[
+                                jnp.asarray(x, dtype=v.aval.dtype)
+                                for v, x in zip(eqn.invars, in_vals)
+                            ],
+                            **eqn.params,
                         )
                     outs = outs if eqn.primitive.multiple_results else [outs]
                     for ov, o in zip(eqn.outvars, outs):
@@ -365,8 +376,9 @@ def _interp(
             continue
 
         if prim == "cond":
-            # invars: [index, *operands]; branches: tuple of ClosedJaxpr.
-            branch_conns = in_Cs[1:]
+            # invars: [index, *operands]; branches: tuple of ClosedJaxpr. The
+            # output is a union over branches (we don't know which is taken).
+            pred_C, branch_conns = in_Cs[0], in_Cs[1:]
             branch_vals = [val_of(v) for v in eqn.invars[1:]]
             acc = None
             for br in eqn.params["branches"]:
@@ -374,7 +386,13 @@ def _interp(
                 bc = getattr(br, "consts", [])
                 outs = _interp(bj, bc, n_global, branch_conns, branch_vals)
                 acc = outs if acc is None else [a.maximum(o) for a, o in zip(acc, outs)]
+            # The branch taken depends on the predicate, so if the predicate is
+            # itself input-dependent every output element inherits that dependence.
+            pred_dep = None if _is_empty(pred_C) else pred_C.max(axis=0).tocsr()
             for v, C in zip(eqn.outvars, acc):
+                if pred_dep is not None:
+                    ones = sp.csr_matrix(np.ones((C.shape[0], 1), dtype=np.int8))
+                    C = C + ones @ pred_dep
                 env[v] = C
             continue
 
@@ -463,24 +481,33 @@ def _scatter_add(
     dnums = eqn.params["dimension_numbers"]
     op_size = int(np.prod(operand_shape)) or 1
     upd_size = int(np.prod(updates_shape)) or 1
+    scatter_kw = dict(
+        indices_are_sorted=eqn.params.get("indices_are_sorted", False),
+        unique_indices=eqn.params.get("unique_indices", False),
+        mode=eqn.params.get("mode"),
+    )
     # Map each update element to its operand position via an overwrite-scatter of
-    # update ids; detect overlap (would lose contributions) and bail if found.
+    # update ids, and separately COUNT how many updates land on each position. A
+    # position hit by >1 update is an overlap: scatter-add would accumulate those
+    # updates, but the overwrite map keeps only one, so its connectivity would be
+    # under-counted -> bail to probing. (Counting is the reliable test; the
+    # overwrite map alone cannot detect overlap, since update ids are distinct.)
     with _host_exact():
+        idx = jnp.asarray(idx_val)
         op_ids = jnp.full(operand_shape, -1, dtype=jnp.int64)
         upd_ids = jnp.arange(upd_size, dtype=jnp.int64).reshape(updates_shape)
-        mapped = lax.scatter(
-            op_ids,
-            jnp.asarray(idx_val),
-            upd_ids,
+        mapped = lax.scatter(op_ids, idx, upd_ids, dnums, **scatter_kw)
+        counts = lax.scatter_add(
+            jnp.zeros(operand_shape, dtype=jnp.int64),
+            idx,
+            jnp.ones(updates_shape, dtype=jnp.int64),
             dnums,
-            indices_are_sorted=eqn.params.get("indices_are_sorted", False),
-            unique_indices=eqn.params.get("unique_indices", False),
-            mode=eqn.params.get("mode"),
+            **scatter_kw,
         )
+    if bool((np.asarray(counts) > 1).any()):
+        raise _BailOut("overlapping scatter-add")
     targets = np.asarray(mapped).reshape(-1)  # op position -> update id (or -1)
     has = targets >= 0
-    if np.unique(targets[has]).size != int(has.sum()):
-        raise _BailOut("overlapping scatter-add")
     rows = np.nonzero(has)[0]
     M = sp.csr_matrix(
         (np.ones(rows.size, dtype=np.int8), (rows, targets[has])),
@@ -743,12 +770,23 @@ def _probe_columns(
     (m, n) matrix is never assembled), halving the batch on OOM. O(m) probes.
     """
     n, m = shape
-    vmapped_A = jax.vmap(A_callable)
+
+    # Batch the probes with vmap when the operator supports it; fall back to a
+    # sequential lax.map for operators that have no vmap rule (e.g. pure_callback
+    # / FFI), matching materialize_sparse_matrix. Decide once via a cheap
+    # eval_shape, which trips the missing-vmap-rule error without executing.
+    try:
+        jax.eval_shape(jax.vmap(A_callable), jax.ShapeDtypeStruct((1, m), jnp.float32))
+        batched_A = jax.vmap(A_callable)
+    except Exception:
+
+        def batched_A(basis):
+            return jax.lax.map(A_callable, basis)
 
     def _eval_batch(start: int, size: int) -> tuple[np.ndarray, np.ndarray]:
         indices = jnp.arange(start, start + size)
         basis = jax.nn.one_hot(indices, m, dtype=jnp.float32)  # (size, m)
-        out = vmapped_A(basis)  # (size, n)
+        out = batched_A(basis)  # (size, n)
         if out.shape != (size, n):
             raise ValueError(
                 f"Operator returned shape {out.shape}, expected ({size}, {n})."
