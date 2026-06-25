@@ -26,12 +26,14 @@ jobs:
       # loaded in isolation so this works without compiling the extension.
       - name: Verify tag matches package version
         if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${RELEASE_TAG#v}"
           VERSION=$(python -c "import importlib.util as u; s=u.spec_from_file_location('v','jaxamg/_version.py'); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.__version__)")
           echo "tag=$TAG  package version=$VERSION"
           if [ "$TAG" != "$VERSION" ]; then
-            echo "::error::Release tag '$GITHUB_REF_NAME' does not match jaxamg/_version.py ($VERSION). Bump _version.py to match the tag."
+            echo "::error::Release tag '$RELEASE_TAG' does not match jaxamg/_version.py ($VERSION). Bump _version.py to match the tag."
             exit 1
           fi
       - name: Build sdist
