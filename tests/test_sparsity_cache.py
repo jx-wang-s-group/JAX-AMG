@@ -36,6 +36,12 @@ def _materialize_dense(op, cache):
     return np.asarray(A.todense())
 
 
+def _pat_set(rc):
+    """A (rows, cols) pattern as a set of (row, col) pairs, for order-free compares."""
+    r, c = rc
+    return set(zip(r.tolist(), c.tolist()))
+
+
 class TestCacheColoringTracingPath:
     def test_takes_tracing_path(self):
         # A traceable stencil should be detected by tracing (not probing).
@@ -108,10 +114,6 @@ class TestZeroSkipMul:
     """``mul`` drops rows forced to zero by a structurally-zero constant operand,
     tightening the pattern without changing the matrix."""
 
-    def _set(self, rc):
-        r, c = rc
-        return set(zip(r.tolist(), c.tolist()))
-
     def test_zero_skip_removes_overreporting(self):
         # Mask the dense rows of a lower-triangular op: the old `mul` rule kept the
         # full pattern of L@x (loose superset of the truth); the zero-skip makes it
@@ -123,9 +125,9 @@ class TestZeroSkipMul:
 
         rt, ct = trace_sparsity_pattern(op, (n, n))  # new, zero-skipped
         rl, cl = trace_sparsity_pattern(lambda x: L @ x, (n, n))  # old, over-reported
-        tight = self._set((rt, ct))
-        loose = self._set((rl, cl))
-        true_pat = self._set(probe_sparsity_pattern(op, (n, n)))  # exact (linear op)
+        tight = _pat_set((rt, ct))
+        loose = _pat_set((rl, cl))
+        true_pat = _pat_set(probe_sparsity_pattern(op, (n, n)))  # exact (linear op)
 
         assert tight == true_pat  # exact now
         assert true_pat < loose  # old pattern over-reported
@@ -140,6 +142,48 @@ class TestZeroSkipMul:
             _materialize_dense(op, (rl, cl, colors_l, ncl, (n, n))), truth, atol=1e-5
         )
         assert nct < ncl  # 4 vs 48
+
+
+class TestScatterReplace:
+    """Plain scatter (``base.at[i:j].set(block)``) drops the operand dependence at
+    written positions rather than over-reporting it as combine semantics would."""
+
+    def test_replace_drops_operand_at_written_rows(self):
+        # base is diagonal; a window is overwritten by a block of other inputs, so
+        # those rows lose their operand (diagonal) dependence. Linear, so probing
+        # is a valid oracle.
+        n = 16
+        op = lambda x: (3.0 * x).at[10:14].set(x[0:4] + x[4:8])
+
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        assert (10, 10) not in _pat_set(pat)  # operand dependence dropped at write
+
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-5
+        )
+
+
+class TestDynamicUpdateSlice:
+    """``lax.dynamic_update_slice`` traces to an exact pattern instead of bailing
+    to probing; the update window replaces that slice of the operand."""
+
+    def test_static_window_is_exact(self):
+        n = 16
+
+        def op(x):
+            return jax.lax.dynamic_update_slice(3.0 * x, x[0:4] + x[4:8], (10,))
+
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None  # handled now, no longer bails to probing
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-5
+        )
 
 
 class TestOverlappingScatterFallback:

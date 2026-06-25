@@ -473,8 +473,14 @@ def _interp(
             idx_val = val_of(eqn.invars[1])
             if idx_val is _UNKNOWN:
                 raise _BailOut("scatter with data-dependent indices")
-            env[eqn.outvars[0]] = _scatter_add(
-                eqn, in_Cs, np.asarray(idx_val), n_global
+            env[eqn.outvars[0]] = _scatter(
+                eqn, in_Cs, np.asarray(idx_val), combine=prim != "scatter"
+            )
+            continue
+
+        if prim == "dynamic_update_slice":
+            env[eqn.outvars[0]] = _dynamic_update_slice(
+                eqn, in_Cs, [val_of(v) for v in eqn.invars]
             )
             continue
 
@@ -510,12 +516,41 @@ def _interp(
     return [read(v) for v in jaxpr.outvars]
 
 
-def _scatter_add(
-    eqn: JaxprEqn, in_Cs: list[Conn], idx_val: np.ndarray, n_global: int
-) -> Conn:
-    """Connectivity of operand.at[idx].add(updates): operand OR scattered updates.
+def _dynamic_update_slice(eqn: JaxprEqn, in_Cs: list[Conn], in_vals: list[Any]) -> Conn:
+    """Connectivity of dynamic_update_slice(operand, update, *starts): the update
+    block replaces a window of the operand, so window positions take the update's
+    connectivity and the rest keep the operand's. Static starts only."""
+    operand_C, update_C = in_Cs[0], in_Cs[1]
+    operand_shape = tuple(eqn.invars[0].aval.shape)
+    update_shape = tuple(eqn.invars[1].aval.shape)
+    if any(s is _UNKNOWN for s in in_vals[2:]):
+        raise _BailOut("dynamic_update_slice with data-dependent start")
+    # lax clamps each start so the window fits inside the operand.
+    starts = [
+        max(0, min(int(s), d - u))
+        for s, d, u in zip(in_vals[2:], operand_shape, update_shape)
+    ]
+    op_size = int(np.prod(operand_shape)) or 1
+    upd_size = int(np.prod(update_shape)) or 1
+    window = tuple(slice(s, s + u) for s, u in zip(starts, update_shape))
+    window_flat = np.arange(op_size).reshape(operand_shape)[window].reshape(-1)
+    # Update block -> its window positions; operand kept outside the window.
+    M = sp.csr_matrix(
+        (np.ones(upd_size, dtype=np.int8), (window_flat, np.arange(upd_size))),
+        shape=(op_size, upd_size),
+    )
+    keep = np.ones(op_size, dtype=np.int8)
+    keep[window_flat] = 0
+    D = sp.diags(keep, format="csr", dtype=np.int8)
+    return (D @ operand_C + M @ update_C).tocsr()
 
-    Handles the common non-overlapping case (static indices); bails otherwise.
+
+def _scatter(
+    eqn: JaxprEqn, in_Cs: list[Conn], idx_val: np.ndarray, combine: bool
+) -> Conn:
+    """Connectivity of a scatter with static indices. ``combine`` (scatter-add/...):
+    written positions depend on the operand AND the scattered updates. Plain scatter
+    (replace): written positions depend only on the updates, last writer winning.
     """
     operand_C, _idx_C, updates_C = in_Cs
     operand_shape = tuple(eqn.invars[0].aval.shape)
@@ -528,12 +563,10 @@ def _scatter_add(
         unique_indices=eqn.params.get("unique_indices", False),
         mode=eqn.params.get("mode"),
     )
-    # Map each update element to its operand position via an overwrite-scatter of
-    # update ids, and separately COUNT how many updates land on each position. A
-    # position hit by >1 update is an overlap: scatter-add would accumulate those
-    # updates, but the overwrite map keeps only one, so its connectivity would be
-    # under-counted -> bail to probing. (Counting is the reliable test; the
-    # overwrite map alone cannot detect overlap, since update ids are distinct.)
+    # Overwrite-scatter of update ids gives the last update landing on each operand
+    # position; scatter-add of ones counts them. Replace keeps the last writer, so
+    # the overwrite map is exact. Combine accumulates, so an overlap would be
+    # under-counted via the overwrite map -> bail to probing.
     with _host_exact():
         idx = jnp.asarray(idx_val)
         op_ids = jnp.full(operand_shape, -1, dtype=jnp.int64)
@@ -546,16 +579,22 @@ def _scatter_add(
             dnums,
             **scatter_kw,
         )
-    if bool((np.asarray(counts) > 1).any()):
+    if combine and bool((np.asarray(counts) > 1).any()):
         raise _BailOut("overlapping scatter-add")
-    targets = np.asarray(mapped).reshape(-1)  # op position -> update id (or -1)
+    targets = np.asarray(mapped).reshape(-1)  # op position -> last update id, or -1
     has = targets >= 0
     rows = np.nonzero(has)[0]
     M = sp.csr_matrix(
         (np.ones(rows.size, dtype=np.int8), (rows, targets[has])),
         shape=(op_size, upd_size),
     )
-    return operand_C + M @ updates_C
+    if combine:
+        return operand_C + M @ updates_C
+    # Replace: written positions lose their operand dependence.
+    keep = np.ones(op_size, dtype=np.int8)
+    keep[has] = 0
+    D = sp.diags(keep, format="csr", dtype=np.int8)
+    return (D @ operand_C + M @ updates_C).tocsr()
 
 
 def _conv(
