@@ -77,14 +77,10 @@ def main():
 
     operator = lx.FunctionLinearOperator(
         lambda x: A @ x,
-        input_structure=jax.ShapeDtypeStruct(b.shape, b.dtype),
+        b,
         tags=(lx.symmetric_tag, lx.positive_semidefinite_tag),
     )
-    preconditioner = lx.FunctionLinearOperator(
-        M,
-        input_structure=jax.ShapeDtypeStruct(b.shape, b.dtype),
-        tags=(lx.symmetric_tag, lx.positive_semidefinite_tag),
-    )
+    preconditioner = jaxamg.make_lineax_preconditioner(operator)
     run_lineax_solver(
         "Lineax CG",
         lx.CG(rtol=tol, atol=tol, max_steps=maxiter),
@@ -132,12 +128,9 @@ def main():
 
         nonsym_operator = lx.FunctionLinearOperator(
             lambda x, A_nonsym=A_nonsym: A_nonsym @ x,
-            input_structure=jax.ShapeDtypeStruct(b.shape, b.dtype),
+            b,
         )
-        nonsym_preconditioner = lx.FunctionLinearOperator(
-            M_nonsym,
-            input_structure=jax.ShapeDtypeStruct(b.shape, b.dtype),
-        )
+        nonsym_preconditioner = jaxamg.make_lineax_preconditioner(nonsym_operator)
 
         run_lineax_solver(
             "Lineax BiCGStab",
