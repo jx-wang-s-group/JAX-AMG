@@ -53,6 +53,10 @@ to specify what you want to change.  For example,
 `config={"preconditioner": {"solver": "AMG"}}` inherits all the Classical AMG
 settings above.
 
+!!! note "Preconditioner default differs"
+
+    The default above is for `jaxamg.solve(...)`, a full Krylov solve (`PBICGSTAB`) preconditioned by AMG. `jaxamg.make_preconditioner(...)` (and `make_lineax_preconditioner(...)`) instead default to a *single* AMG V-cycle (`solver="AMG"`, `max_iters=1`) used as an approximate inverse, since there the outer Krylov method owns the iteration. Override via their own `config`/`kwargs`.
+
 JAX-AMG also enables residual tracking internally (`monitor_residual=1`,
 `store_res_history=1`) so `info["residual"]` is always available.
 

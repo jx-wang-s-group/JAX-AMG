@@ -139,6 +139,10 @@ See [Solver Configuration](config.md) for full details.
 
 You can also use JAX-AMG only for the preconditioner application, while a native JAX Krylov method owns the outer iterations.
 
+!!! note
+
+    `make_preconditioner` (and `make_lineax_preconditioner`, shown below) apply a single AMG V-cycle as an approximate inverse (not a full solve); the outer Krylov method (here `cg`) owns the iterations. See [Default config](config.md#default-config) for how this differs from `jaxamg.solve`.
+
 === "Python"
 
     ```python
@@ -170,9 +174,7 @@ You can also use JAX-AMG only for the preconditioner application, while a native
 
 ### Using JAX-AMG as a preconditioner for Lineax
 
-If you use [Lineax](https://docs.kidger.site/lineax/), `jaxamg.make_lineax_preconditioner(...)` turns a `lineax.AbstractLinearOperator` into an AMG preconditioner operator in a single call, ready to pass through Lineax's `options={"preconditioner": ...}` interface.
-
-It folds the `jaxamg.make_preconditioner(...)` plus `lineax.FunctionLinearOperator` wiring into one step, detecting and caching the operator's sparsity pattern up front and inheriting the operator's tags.
+If you use [Lineax](https://docs.kidger.site/lineax/), `jaxamg.make_lineax_preconditioner(...)` wraps a `lineax.AbstractLinearOperator` as an AMG preconditioner operator, ready to pass to `options={"preconditioner": ...}`.
 
 === "Python"
 

@@ -51,9 +51,16 @@ def make_preconditioner(
     The returned callable can be passed directly as the `M` argument to
     `jax.scipy.sparse.linalg.cg(...)` or `jax.scipy.sparse.linalg.bicgstab(...)`.
 
+    By default the approximate inverse is a *single* AMG V-cycle (`solver="AMG"`,
+    `max_iters=1`), so each application is one cheap AMG sweep. This is deliberately
+    different from `jaxamg.solve`, whose default is a full Krylov solve (`PBICGSTAB`)
+    preconditioned by AMG: here AMG *is* the preconditioner and the outer Krylov
+    method owns the iteration. Pass `config`/`kwargs` for a stronger inner
+    application (e.g. more sweeps, a W-cycle, or `max_iters=2`).
+
     Args:
         A: Matrix or callable operator to precondition.
-        config: Optional AmgX configuration. If omitted, an AMG-only
+        config: Optional AmgX configuration. If omitted, a single-cycle AMG
             approximate-inverse config is used.
         comm: Optional MPI communicator for distributed solves. If `A` already
             has MPI metadata attached via `jaxamg.with_cache(..., mpi=...)`, this
