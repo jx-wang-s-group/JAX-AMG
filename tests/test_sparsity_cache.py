@@ -13,7 +13,9 @@ from jaxamg.matrices import poisson3d_operator
 from jaxamg.sparsity import (
     _verify_recovery,
     cache_coloring,
+    get_column_coloring,
     materialize_sparse_matrix,
+    probe_sparsity_pattern,
     trace_sparsity_pattern,
 )
 
@@ -100,6 +102,44 @@ class TestZeroOperator:
         cache = cache_coloring(op, (n, n))
         assert len(cache[0]) == 0  # empty pattern
         assert np.allclose(_materialize_dense(op, cache), 0.0)
+
+
+class TestZeroSkipMul:
+    """``mul`` drops rows forced to zero by a structurally-zero constant operand,
+    tightening the pattern without changing the matrix."""
+
+    def _set(self, rc):
+        r, c = rc
+        return set(zip(r.tolist(), c.tolist()))
+
+    def test_zero_skip_removes_overreporting(self):
+        # Mask the dense rows of a lower-triangular op: the old `mul` rule kept the
+        # full pattern of L@x (loose superset of the truth); the zero-skip makes it
+        # exact -- same matrix from both, the loose one just costs more colours.
+        n = 48
+        L = jnp.asarray(np.tril(np.ones((n, n), np.float32)))
+        keep = jnp.asarray((np.arange(n) < 4).astype(np.float32))
+        op = lambda x: keep * (L @ x)
+
+        rt, ct = trace_sparsity_pattern(op, (n, n))  # new, zero-skipped
+        rl, cl = trace_sparsity_pattern(lambda x: L @ x, (n, n))  # old, over-reported
+        tight = self._set((rt, ct))
+        loose = self._set((rl, cl))
+        true_pat = self._set(probe_sparsity_pattern(op, (n, n)))  # exact (linear op)
+
+        assert tight == true_pat  # exact now
+        assert true_pat < loose  # old pattern over-reported
+
+        truth = _dense(op, n)
+        colors_t, nct = get_column_coloring(rt, ct, (n, n))
+        colors_l, ncl = get_column_coloring(rl, cl, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, (rt, ct, colors_t, nct, (n, n))), truth, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            _materialize_dense(op, (rl, cl, colors_l, ncl, (n, n))), truth, atol=1e-5
+        )
+        assert nct < ncl  # 4 vs 48
 
 
 class TestOverlappingScatterFallback:

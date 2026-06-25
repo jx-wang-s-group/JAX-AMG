@@ -170,6 +170,34 @@ def _is_empty(C: Conn) -> bool:
     return C.nnz == 0
 
 
+def _const_zero_mask(
+    val: Any, in_shape: tuple[int, ...], out_shape: tuple[int, ...]
+) -> np.ndarray:
+    """Flat bool mask over output positions where ``val`` (broadcast from
+    ``in_shape`` to ``out_shape``) is exactly zero."""
+    is_zero = np.asarray(val) == 0
+    if tuple(in_shape) == tuple(out_shape):
+        return is_zero.reshape(-1)
+    return np.broadcast_to(is_zero, out_shape).reshape(-1)
+
+
+def _mul_zero_positions(
+    in_shapes: list[tuple[int, ...]],
+    in_vals: list[Any],
+    out_shape: tuple[int, ...],
+) -> np.ndarray | None:
+    """Flat bool mask of ``mul`` outputs forced to zero by a structurally-zero
+    constant operand (``0*x``), or ``None`` if neither operand is such a constant.
+    Only ``mul``: div/integer_pow zero-skips fire only on nonlinear operators."""
+    mask = None
+    for shape, v in zip(in_shapes, in_vals):
+        if v is _UNKNOWN:
+            continue
+        zm = _const_zero_mask(v, shape, out_shape)
+        mask = zm if mask is None else mask | zm
+    return mask
+
+
 def _index_operand_positions(prim: str, n_operands: int) -> set[int]:
     """Operand positions that are indices/offsets rather than data, for a movement
     primitive. Their values steer where data lands but never flow into the output,
@@ -412,6 +440,20 @@ def _interp(
                     ).reshape(-1)
                     contrib = C[bpos]
                 acc = acc + contrib
+            # Zero-skip: rows multiplied by a structurally-zero constant carry no
+            # dependence; drop them so they don't inflate the colouring.
+            if prim == "mul":
+                zmask = _mul_zero_positions(
+                    [shape_of(v) for v in eqn.invars],
+                    [val_of(v) for v in eqn.invars],
+                    out_shape,
+                )
+                if zmask is not None and zmask.any():
+                    keep = sp.diags(
+                        (~zmask).astype(np.int8), format="csr", dtype=np.int8
+                    )
+                    acc = (keep @ acc).tocsr()
+                    acc.eliminate_zeros()
             env[eqn.outvars[0]] = acc
             continue
 
