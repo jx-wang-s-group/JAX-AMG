@@ -98,6 +98,33 @@ class TestCacheColoringProbingFallback:
         )
 
 
+class TestConservativeFallback:
+    """A localized opaque/unknown sub-op is over-approximated conservatively so the
+    rest of the operator still traces; a globally-opaque operator instead bails to
+    probing (its over-approximation would be near-dense)."""
+
+    def test_localized_opaque_traces_and_is_exact(self):
+        n = 16
+
+        def op(x):
+            y = 2.0 * x - jnp.roll(x, 1) - jnp.roll(x, -1)  # traceable stencil
+            corr = jax.pure_callback(  # opaque, but depends only on x[:2]
+                lambda v: np.asarray(v) * 0.5,
+                jax.ShapeDtypeStruct((2,), x.dtype),
+                x[:2],
+                vmap_method="sequential",
+            )
+            return y.at[:2].add(corr)
+
+        # The localized callback is over-approximated, so the trace does not bail.
+        assert trace_sparsity_pattern(op, (n, n)) is not None
+        # cache_coloring takes the tracing path; verify + drop_zeros keep it exact.
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense_by_columns(op, n), atol=1e-4
+        )
+
+
 class TestZeroOperator:
     def test_zero_operator_materializes_to_zero(self):
         # An operator with no input dependence traces to an empty pattern

@@ -152,6 +152,22 @@ _OPAQUE = {
     "while",  # data-dependent iteration count -> not traced
 }
 
+# Single-output movement primitives handled by _movement_rowmap. A primitive
+# outside this set (and the dispatch table) is unknown -> conservative fallback.
+_MOVEMENT_PRIMS = {
+    "reshape",
+    "squeeze",
+    "expand_dims",
+    "transpose",
+    "rev",
+    "slice",
+    "broadcast_in_dim",
+    "concatenate",
+    "pad",
+    "dynamic_slice",
+    "gather",
+}
+
 _CPU = jax.devices("cpu")[0]
 
 _UNKNOWN = object()  # sentinel: a value that depends on the operator input
@@ -222,6 +238,31 @@ def _select_pick(
             Dc = sp.diags(mask.astype(np.int8), format="csr", dtype=np.int8)
             result = result + Dc @ case_C
     return result.tocsr()
+
+
+def _conservative_outputs(
+    in_Cs: list[Conn], out_sizes: list[int], n_global: int, prim: str
+) -> list[Conn]:
+    """Superset connectivity for an un-traceable primitive: every output element
+    depends on the union of the primitive's input columns. Bails to probing when
+    that union is not local (spans more than half the inputs), so a globally-opaque
+    operator is still detected exactly by probing rather than over-approximated to
+    a near-dense pattern."""
+    nonempty = [C for C in in_Cs if C.nnz]
+    if not nonempty:
+        return [_empty(sz, n_global) for sz in out_sizes]
+    stacked = sp.vstack(nonempty, format="csr") if len(nonempty) > 1 else nonempty[0]
+    cols = np.unique(stacked.indices)
+    if cols.size > n_global // 2:
+        raise _BailOut(f"{prim} too non-local to over-approximate")
+    outs = []
+    for sz in out_sizes:
+        rows = np.repeat(np.arange(sz, dtype=np.int64), cols.size)
+        data = np.ones(rows.size, dtype=np.int8)
+        outs.append(
+            sp.csr_matrix((data, (rows, np.tile(cols, sz))), shape=(sz, n_global))
+        )
+    return outs
 
 
 def _index_operand_positions(prim: str, n_operands: int) -> set[int]:
@@ -409,7 +450,10 @@ def _interp(
                     pass
 
         if prim in _OPAQUE:
-            raise _BailOut(f"opaque primitive: {prim}")
+            outs = _conservative_outputs(in_Cs, out_sizes, n_global, prim)
+            for v, C in zip(eqn.outvars, outs):
+                env[v] = C
+            continue
 
         # Shortcut: if no operand carries any input dependence, outputs are empty.
         if all(_is_empty(C) for C in in_Cs):
@@ -533,19 +577,29 @@ def _interp(
             continue
 
         # Movement primitives (single output).
-        try:
-            in_shapes = [shape_of(v) for v in eqn.invars]
-            in_vals = [val_of(v) for v in eqn.invars]
-            rowmap, n_comb = _movement_rowmap(prim, eqn.params, in_shapes, in_vals)
-            combined = sp.vstack(in_Cs, format="csr") if len(in_Cs) > 1 else in_Cs[0]
-            if combined.shape[0] != n_comb:
-                raise _BailOut(f"shape mismatch in {prim}")
-            env[eqn.outvars[0]] = combined[rowmap]
-            continue
-        except _BailOut:
-            raise
-        except Exception as e:
-            raise _BailOut(f"unhandled primitive {prim}: {e}")
+        if prim in _MOVEMENT_PRIMS:
+            try:
+                in_shapes = [shape_of(v) for v in eqn.invars]
+                in_vals = [val_of(v) for v in eqn.invars]
+                rowmap, n_comb = _movement_rowmap(prim, eqn.params, in_shapes, in_vals)
+                combined = (
+                    sp.vstack(in_Cs, format="csr") if len(in_Cs) > 1 else in_Cs[0]
+                )
+                if combined.shape[0] != n_comb:
+                    raise _BailOut(f"shape mismatch in {prim}")
+                env[eqn.outvars[0]] = combined[rowmap]
+                continue
+            except _BailOut:
+                raise
+            except Exception as e:
+                raise _BailOut(f"movement rule failed for {prim}: {e}")
+
+        # Unknown primitive: conservative over-approximation (or bail to probing if
+        # it is too non-local to be worth over-approximating).
+        outs = _conservative_outputs(in_Cs, out_sizes, n_global, prim)
+        for v, C in zip(eqn.outvars, outs):
+            env[v] = C
+        continue
 
     return [read(v) for v in jaxpr.outvars]
 
