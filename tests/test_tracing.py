@@ -142,24 +142,18 @@ class TestTracingExact:
 
 
 class TestTracingConservativeSuperset:
-    """Branching primitives: the tracer cannot know which branch is taken, so it
-    returns a safe SUPERSET (union of branches). cache_coloring later refines it
-    to the exact matrix via materialize + drop_zeros (see test_sparsity_cache)."""
+    """``cond`` unions its branches (the tracer cannot know which is taken), giving
+    a safe SUPERSET that cache_coloring later refines via materialize + drop_zeros.
+    (``select_n``/``where`` with a static predicate is instead tightened exactly --
+    see test_sparsity_cache.TestSelectConstPredicate.)"""
 
-    @pytest.mark.parametrize(
-        "op",
-        [
-            lambda x: lax.cond(True, lambda v: jnp.roll(v, 1), lambda v: 2.0 * v, x),
-            lambda x: jnp.where(jnp.arange(12) % 2 == 0, x, jnp.roll(x, 1)),
-        ],
-        ids=["cond", "where_select"],
-    )
-    def test_trace_is_superset(self, op):
+    def test_cond_is_superset(self):
+        op = lambda x: lax.cond(True, lambda v: jnp.roll(v, 1), lambda v: 2.0 * v, x)
         traced = _trace_set(op, (12, 12))
         truth = _dense_pattern(op, 12)
         assert traced is not None
         assert traced >= truth  # conservative: never misses a true dependency
-        assert len(traced) > len(truth)  # and here strictly over-approximates
+        assert len(traced) > len(truth)  # cond unions both branches
 
     def test_data_dependent_cond_predicate_captured(self):
         # The cond predicate depends on x[0], so the branch taken -- and hence

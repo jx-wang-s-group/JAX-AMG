@@ -198,6 +198,25 @@ def _mul_zero_positions(
     return mask
 
 
+def _select_pick(
+    case_Cs: list[Conn], which_val: Any, out_shape: tuple[int, ...], out_size: int
+) -> Conn | None:
+    """Per-position connectivity for a constant-predicate ``select_n``: output ``i``
+    takes branch ``which[i]``, so the unselected branches are dropped instead of
+    unioned. Returns ``None`` (keep the conservative union) if a case is not
+    output-shaped."""
+    if any(C.shape[0] != out_size for C in case_Cs):
+        return None
+    which_flat = np.broadcast_to(np.asarray(which_val), out_shape).reshape(-1)
+    result = _empty(out_size, case_Cs[0].shape[1])
+    for c, case_C in enumerate(case_Cs):
+        mask = which_flat == c
+        if mask.any():
+            Dc = sp.diags(mask.astype(np.int8), format="csr", dtype=np.int8)
+            result = result + Dc @ case_C
+    return result.tocsr()
+
+
 def _index_operand_positions(prim: str, n_operands: int) -> set[int]:
     """Operand positions that are indices/offsets rather than data, for a movement
     primitive. Their values steer where data lands but never flow into the output,
@@ -454,6 +473,14 @@ def _interp(
                     )
                     acc = (keep @ acc).tocsr()
                     acc.eliminate_zeros()
+            # Constant select_n/where predicate: each output takes the selected
+            # branch, so drop the unselected branches instead of unioning them.
+            elif prim in ("select_n", "select"):
+                which_val = val_of(eqn.invars[0])
+                if which_val is not _UNKNOWN:
+                    picked = _select_pick(in_Cs[1:], which_val, out_shape, out_size)
+                    if picked is not None:
+                        acc = picked
             env[eqn.outvars[0]] = acc
             continue
 

@@ -153,6 +153,41 @@ class TestZeroSkipMul:
         assert _pat_set(pat) == {(i, i) for i in range(n)}
 
 
+class TestSelectConstPredicate:
+    """select_n / where with a static predicate takes one branch per row instead
+    of unioning all branches, so the pattern stays exact and tighter."""
+
+    def test_static_mask_picks_one_branch(self):
+        n = 12
+        op = lambda x: jnp.where(jnp.arange(n) < n // 2, x, jnp.roll(x, 1))
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        assert len(pat[0]) == n  # one entry per row, not the union of both branches
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-5
+        )
+
+    def test_integer_select_n_static_selector(self):
+        n = 12
+        sel = jnp.array([0, 1, 2] * 4)
+        op = lambda x: jax.lax.select_n(sel, x, jnp.roll(x, 1), jnp.roll(x, -1))
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        assert len(pat[0]) == n
+
+    def test_data_dependent_predicate_stays_conservative(self):
+        # An input-dependent predicate keeps the union (output depends on the
+        # predicate and both branches) -- a valid superset, not tightened away.
+        n = 12
+        op = lambda x: jnp.where(x > 0.0, 2.0 * x, jnp.roll(x, 1))
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert len(pat[0]) == 2 * n  # union of both branches (+ predicate diagonal)
+
+
 class TestScatterReplace:
     """Plain scatter (``base.at[i:j].set(block)``) drops the operand dependence at
     written positions rather than over-reporting it as combine semantics would."""
