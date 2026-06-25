@@ -170,7 +170,9 @@ You can also use JAX-AMG only for the preconditioner application, while a native
 
 ### Using JAX-AMG as a preconditioner for Lineax
 
-If you use [Lineax](https://docs.kidger.site/lineax/), you can also wrap the callable returned by `jaxamg.make_preconditioner(...)` as a `lineax.FunctionLinearOperator` and pass it through Lineax's `options={"preconditioner": ...}` interface.
+If you use [Lineax](https://docs.kidger.site/lineax/), `jaxamg.make_lineax_preconditioner(...)` turns a `lineax.AbstractLinearOperator` into an AMG preconditioner operator in a single call, ready to pass through Lineax's `options={"preconditioner": ...}` interface.
+
+It folds the `jaxamg.make_preconditioner(...)` plus `lineax.FunctionLinearOperator` wiring into one step, detecting and caching the operator's sparsity pattern up front and inheriting the operator's tags.
 
 === "Python"
 
@@ -188,20 +190,14 @@ If you use [Lineax](https://docs.kidger.site/lineax/), you can also wrap the cal
     A = poisson_matrix(n, skew=2.0)
     b = rhs_ones(n * n)
 
-    operator = lx.FunctionLinearOperator(
-        lambda x: A @ x,
-        input_structure=jax.ShapeDtypeStruct(b.shape, b.dtype),
-    )
-    M = lx.FunctionLinearOperator(
-        jaxamg.make_preconditioner(A),
-        input_structure=jax.ShapeDtypeStruct(b.shape, b.dtype),
-    )
+    operator = lx.FunctionLinearOperator(lambda x: A @ x, b)
+    preconditioner = jaxamg.make_lineax_preconditioner(operator)
 
     solution = lx.linear_solve(
         operator,
         b,
         solver=lx.BiCGStab(rtol=1e-6, atol=1e-6, max_steps=100),
-        options={"preconditioner": M},
+        options={"preconditioner": preconditioner},
     )
     residual = jnp.linalg.norm(b - A @ solution.value) / jnp.linalg.norm(b)
 
