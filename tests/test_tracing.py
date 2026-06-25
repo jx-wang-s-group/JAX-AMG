@@ -202,15 +202,6 @@ class TestTracingFallback:
         n = 12
         assert trace_sparsity_pattern(lambda x: jnp.cumsum(x), (n, n)) is None
 
-    def test_overlapping_scatter_add_returns_none(self):
-        # Two updates target the same operand position (segment-sum): scatter-add
-        # accumulates them, but the connectivity map cannot represent that, so the
-        # tracer must detect the overlap and bail rather than under-count.
-        n = 12
-        idx = jnp.repeat(jnp.arange(n // 2), 2)  # [0, 0, 1, 1, ...]
-        op = lambda x: jnp.zeros(n).at[idx].add(x)
-        assert trace_sparsity_pattern(op, (n, n)) is None
-
     def test_data_dependent_scatter_index_returns_none(self):
         # Scatter target positions computed from the input -> not traceable.
         n = 12

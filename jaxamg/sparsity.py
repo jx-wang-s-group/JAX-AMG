@@ -545,54 +545,103 @@ def _dynamic_update_slice(eqn: JaxprEqn, in_Cs: list[Conn], in_vals: list[Any]) 
     return (D @ operand_C + M @ update_C).tocsr()
 
 
+def _scatter_targets(
+    idx_val: np.ndarray,
+    eqn: JaxprEqn,
+    operand_shape: tuple[int, ...],
+    updates_shape: tuple[int, ...],
+) -> np.ndarray:
+    """Forward map ``update_flat -> operand_flat`` for a scatter with static indices,
+    recovering EVERY (operand, update) pair so overlapping updates are not lost.
+    Out-of-bounds updates map to -1 (dropped). Bails on batched dimension numbers
+    or CLIP mode (both uncommon)."""
+    dnums = eqn.params["dimension_numbers"]
+    if getattr(dnums, "operand_batching_dims", ()) or getattr(
+        dnums, "scatter_indices_batching_dims", ()
+    ):
+        raise _BailOut("batched scatter not traced")
+    mode = eqn.params.get("mode")
+    if mode is not None and "CLIP" in str(mode):
+        raise _BailOut("scatter CLIP mode not traced")
+
+    uwd = tuple(dnums.update_window_dims)
+    iwd = tuple(dnums.inserted_window_dims)
+    sdod = tuple(dnums.scatter_dims_to_operand_dims)
+    op_ndim = len(operand_shape)
+    upd_ndim = len(updates_shape)
+    index_vectors = idx_val.reshape(-1, idx_val.shape[-1])  # (n_scatter, index_depth)
+
+    # Scalar scatter (no window dims): one update element per scatter index, in
+    # row-major order -> fully vectorised.
+    if not uwd:
+        operand_multi = np.zeros((index_vectors.shape[0], op_ndim), dtype=np.int64)
+        for k, d in enumerate(sdod):
+            operand_multi[:, d] = index_vectors[:, k]
+        oob = np.zeros(index_vectors.shape[0], dtype=bool)
+        for d in range(op_ndim):
+            oob |= (operand_multi[:, d] < 0) | (operand_multi[:, d] >= operand_shape[d])
+        target = np.full(index_vectors.shape[0], -1, dtype=np.int64)
+        target[~oob] = np.ravel_multi_index(
+            [operand_multi[~oob, d] for d in range(op_ndim)], operand_shape
+        )
+        return target
+
+    # Window scatter: walk each (scatter index, window offset) pair.
+    batch_dims = [d for d in range(upd_ndim) if d not in uwd]
+    batch_shape = tuple(updates_shape[d] for d in batch_dims)
+    window_operand_dims = [d for d in range(op_ndim) if d not in iwd]
+    window_shape = tuple(updates_shape[d] for d in uwd)
+    target = np.full(int(np.prod(updates_shape)) or 1, -1, dtype=np.int64)
+    for b, index_vector in enumerate(index_vectors):
+        batch_coords = np.unravel_index(b, batch_shape) if batch_shape else ()
+        start = [0] * op_ndim
+        for k, d in enumerate(sdod):
+            start[d] = int(index_vector[k])
+        for win_idx in np.ndindex(*window_shape) if window_shape else [()]:
+            operand_idx = list(start)
+            for j, d in enumerate(window_operand_dims):
+                operand_idx[d] += win_idx[j]
+            if any(
+                operand_idx[d] < 0 or operand_idx[d] >= operand_shape[d]
+                for d in range(op_ndim)
+            ):
+                continue
+            upd_multi = [0] * upd_ndim
+            for i, d in enumerate(batch_dims):
+                upd_multi[d] = int(batch_coords[i])
+            for j, d in enumerate(uwd):
+                upd_multi[d] = win_idx[j]
+            target[int(np.ravel_multi_index(upd_multi, updates_shape))] = int(
+                np.ravel_multi_index(operand_idx, operand_shape)
+            )
+    return target
+
+
 def _scatter(
     eqn: JaxprEqn, in_Cs: list[Conn], idx_val: np.ndarray, combine: bool
 ) -> Conn:
-    """Connectivity of a scatter with static indices. ``combine`` (scatter-add/...):
-    written positions depend on the operand AND the scattered updates. Plain scatter
-    (replace): written positions depend only on the updates, last writer winning.
+    """Connectivity of a scatter with static indices, from the full update->operand
+    forward map so overlapping updates are all captured. ``combine`` (scatter-add/...):
+    written positions depend on the operand AND every update landing there. Plain
+    scatter (replace): written positions depend only on the updates.
     """
     operand_C, _idx_C, updates_C = in_Cs
     operand_shape = tuple(eqn.invars[0].aval.shape)
     updates_shape = tuple(eqn.invars[2].aval.shape)
-    dnums = eqn.params["dimension_numbers"]
     op_size = int(np.prod(operand_shape)) or 1
     upd_size = int(np.prod(updates_shape)) or 1
-    scatter_kw = dict(
-        indices_are_sorted=eqn.params.get("indices_are_sorted", False),
-        unique_indices=eqn.params.get("unique_indices", False),
-        mode=eqn.params.get("mode"),
-    )
-    # Overwrite-scatter of update ids gives the last update landing on each operand
-    # position; scatter-add of ones counts them. Replace keeps the last writer, so
-    # the overwrite map is exact. Combine accumulates, so an overlap would be
-    # under-counted via the overwrite map -> bail to probing.
-    with _host_exact():
-        idx = jnp.asarray(idx_val)
-        op_ids = jnp.full(operand_shape, -1, dtype=jnp.int64)
-        upd_ids = jnp.arange(upd_size, dtype=jnp.int64).reshape(updates_shape)
-        mapped = lax.scatter(op_ids, idx, upd_ids, dnums, **scatter_kw)
-        counts = lax.scatter_add(
-            jnp.zeros(operand_shape, dtype=jnp.int64),
-            idx,
-            jnp.ones(updates_shape, dtype=jnp.int64),
-            dnums,
-            **scatter_kw,
-        )
-    if combine and bool((np.asarray(counts) > 1).any()):
-        raise _BailOut("overlapping scatter-add")
-    targets = np.asarray(mapped).reshape(-1)  # op position -> last update id, or -1
-    has = targets >= 0
-    rows = np.nonzero(has)[0]
+    target = _scatter_targets(idx_val, eqn, operand_shape, updates_shape)
+    has = target >= 0
+    # update u -> operand target[u]; overlap = several updates in one operand row.
     M = sp.csr_matrix(
-        (np.ones(rows.size, dtype=np.int8), (rows, targets[has])),
+        (np.ones(int(has.sum()), dtype=np.int8), (target[has], np.nonzero(has)[0])),
         shape=(op_size, upd_size),
     )
     if combine:
-        return operand_C + M @ updates_C
+        return (operand_C + M @ updates_C).tocsr()
     # Replace: written positions lose their operand dependence.
     keep = np.ones(op_size, dtype=np.int8)
-    keep[has] = 0
+    keep[target[has]] = 0
     D = sp.diags(keep, format="csr", dtype=np.int8)
     return (D @ operand_C + M @ updates_C).tocsr()
 

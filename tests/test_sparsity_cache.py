@@ -186,14 +186,17 @@ class TestDynamicUpdateSlice:
         )
 
 
-class TestOverlappingScatterFallback:
-    def test_falls_back_to_probing_and_is_correct(self):
-        # Overlapping scatter-add (segment-sum): tracing detects the overlap and
-        # bails, so cache_coloring must fall back to probing and stay exact.
+class TestOverlappingScatterAdd:
+    def test_overlapping_scatter_add_traces_exactly(self):
+        # Overlapping scatter-add (segment-sum): several updates land on one row.
+        # The full forward map captures all of them, so it traces exactly instead
+        # of bailing to probing.
         n = 12
         idx = jnp.repeat(jnp.arange(n // 2), 2)  # [0, 0, 1, 1, ...]
         op = lambda x: jnp.zeros(n).at[idx].add(x)
-        assert trace_sparsity_pattern(op, (n, n)) is None
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
         cache = cache_coloring(op, (n, n))
         np.testing.assert_allclose(
             _materialize_dense(op, cache), _dense(op, n), atol=1e-4
