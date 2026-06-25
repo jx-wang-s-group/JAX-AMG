@@ -42,6 +42,13 @@ from jax.typing import ArrayLike
 
 from .utils import temp_enable_x64
 
+# Private DCE API; tracing degrades gracefully (less pruning) if it ever moves.
+_dce_jaxpr: Callable[..., Any] | None
+try:
+    from jax._src.interpreters.partial_eval import dce_jaxpr as _dce_jaxpr
+except Exception:  # pragma: no cover - exercised only if the private API moves
+    _dce_jaxpr = None
+
 # A connectivity matrix ``C`` has ``C[i, j] = 1`` iff output element ``i`` depends
 # on global input ``j``; propagated through the jaxpr as a scipy CSR matrix. Typed
 # as Any since scipy.sparse ships no usable stubs -- the alias documents intent at
@@ -873,6 +880,21 @@ def _dot_general(
     return M @ data_C
 
 
+def _dce(closed: Any) -> tuple[Jaxpr, Sequence[Any]]:
+    """Drop equations that don't feed the outputs, so a dead unsupported primitive
+    (computed but unused) doesn't force a needless bail. Falls back to the original
+    jaxpr if DCE is unavailable or would misalign the captured consts."""
+    if _dce_jaxpr is not None:
+        try:
+            used = [True] * len(closed.jaxpr.outvars)
+            new_jaxpr, _ = _dce_jaxpr(closed.jaxpr, used, instantiate=True)
+            if len(new_jaxpr.constvars) == len(closed.consts):
+                return new_jaxpr, closed.consts
+        except Exception:
+            pass
+    return closed.jaxpr, closed.consts
+
+
 def trace_sparsity_pattern(
     operator: Callable, shape: tuple[int, int]
 ) -> tuple[np.ndarray, np.ndarray] | None:
@@ -898,12 +920,14 @@ def trace_sparsity_pattern(
         closed = jax.make_jaxpr(operator)(jnp.ones(n_global))
     except Exception:
         return None
-    jaxpr = closed.jaxpr
-    if len(jaxpr.invars) != 1:
+    if len(closed.jaxpr.invars) != 1:
         return None
+    # DCE first so a dead unsupported primitive (computed but never used) doesn't
+    # force a needless bail to probing.
+    jaxpr, consts = _dce(closed)
     seed = sp.identity(n_global, dtype=np.int8, format="csr")
     try:
-        outs = _interp(jaxpr, closed.consts, n_global, [seed])
+        outs = _interp(jaxpr, consts, n_global, [seed])
     except _BailOut:
         return None
     except Exception:

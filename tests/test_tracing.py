@@ -168,6 +168,22 @@ class TestTracingConservativeSuperset:
         assert all((i, 0) in got for i in range(n))  # predicate input in every row
 
 
+class TestDeadCodeElimination:
+    """Dead equations are removed before tracing, so an unsupported primitive that
+    is computed but never used does not force a needless bail to probing."""
+
+    def test_dead_unsupported_op_does_not_bail(self):
+        n = 12
+
+        def op(x):
+            _ = jnp.cumsum(x)  # unhandled, but never feeds the output
+            return 2.0 * x
+
+        traced = _trace_set(op, (n, n))
+        assert traced is not None  # DCE dropped the dead cumsum -> no bail
+        assert traced == _dense_pattern(op, n)
+
+
 class TestTracingFallback:
     """Operators the tracer cannot resolve structurally must return None so the
     caller falls back to exhaustive probing."""
