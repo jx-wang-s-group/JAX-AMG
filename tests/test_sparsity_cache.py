@@ -13,7 +13,9 @@ from jaxamg.matrices import poisson3d_operator
 from jaxamg.sparsity import (
     _verify_recovery,
     cache_coloring,
+    get_column_coloring,
     materialize_sparse_matrix,
+    probe_sparsity_pattern,
     trace_sparsity_pattern,
 )
 
@@ -32,6 +34,12 @@ def _materialize_dense(op, cache):
     rows, cols, colors, n_colors, shape = cache
     A = materialize_sparse_matrix(op, shape, rows, cols, colors, n_colors)
     return np.asarray(A.todense())
+
+
+def _pat_set(rc):
+    """A (rows, cols) pattern as a set of (row, col) pairs, for order-free compares."""
+    r, c = rc
+    return set(zip(r.tolist(), c.tolist()))
 
 
 class TestCacheColoringTracingPath:
@@ -90,6 +98,33 @@ class TestCacheColoringProbingFallback:
         )
 
 
+class TestConservativeFallback:
+    """A localized opaque/unknown sub-op is over-approximated conservatively so the
+    rest of the operator still traces; a globally-opaque operator instead bails to
+    probing (its over-approximation would be near-dense)."""
+
+    def test_localized_opaque_traces_and_is_exact(self):
+        n = 16
+
+        def op(x):
+            y = 2.0 * x - jnp.roll(x, 1) - jnp.roll(x, -1)  # traceable stencil
+            corr = jax.pure_callback(  # opaque, but depends only on x[:2]
+                lambda v: np.asarray(v) * 0.5,
+                jax.ShapeDtypeStruct((2,), x.dtype),
+                x[:2],
+                vmap_method="sequential",
+            )
+            return y.at[:2].add(corr)
+
+        # The localized callback is over-approximated, so the trace does not bail.
+        assert trace_sparsity_pattern(op, (n, n)) is not None
+        # cache_coloring takes the tracing path; verify + drop_zeros keep it exact.
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense_by_columns(op, n), atol=1e-4
+        )
+
+
 class TestZeroOperator:
     def test_zero_operator_materializes_to_zero(self):
         # An operator with no input dependence traces to an empty pattern
@@ -102,14 +137,180 @@ class TestZeroOperator:
         assert np.allclose(_materialize_dense(op, cache), 0.0)
 
 
-class TestOverlappingScatterFallback:
-    def test_falls_back_to_probing_and_is_correct(self):
-        # Overlapping scatter-add (segment-sum): tracing detects the overlap and
-        # bails, so cache_coloring must fall back to probing and stay exact.
+class TestZeroSkipMul:
+    """``mul`` drops rows forced to zero by a structurally-zero constant operand,
+    tightening the pattern without changing the matrix."""
+
+    def test_zero_skip_removes_overreporting(self):
+        # Mask the dense rows of a lower-triangular op: the old `mul` rule kept the
+        # full pattern of L@x (loose superset of the truth); the zero-skip makes it
+        # exact -- same matrix from both, the loose one just costs more colours.
+        n = 48
+        L = jnp.asarray(np.tril(np.ones((n, n), np.float32)))
+        keep = jnp.asarray((np.arange(n) < 4).astype(np.float32))
+        op = lambda x: keep * (L @ x)
+
+        rt, ct = trace_sparsity_pattern(op, (n, n))  # new, zero-skipped
+        rl, cl = trace_sparsity_pattern(lambda x: L @ x, (n, n))  # old, over-reported
+        tight = _pat_set((rt, ct))
+        loose = _pat_set((rl, cl))
+        true_pat = _pat_set(probe_sparsity_pattern(op, (n, n)))  # exact (linear op)
+
+        assert tight == true_pat  # exact now
+        assert true_pat < loose  # old pattern over-reported
+
+        truth = _dense(op, n)
+        colors_t, nct = get_column_coloring(rt, ct, (n, n))
+        colors_l, ncl = get_column_coloring(rl, cl, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, (rt, ct, colors_t, nct, (n, n))), truth, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            _materialize_dense(op, (rl, cl, colors_l, ncl, (n, n))), truth, atol=1e-5
+        )
+        assert nct < ncl  # 4 vs 48
+
+    def test_scalar_zero_term_drops_dependence(self):
+        # `x * 0.0` is a scalar-zero mul -> the broadcast branch of the zero mask;
+        # the term contributes nothing, leaving just the diagonal of 2*x.
+        n = 10
+        op = lambda x: 2.0 * x + x * 0.0
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        assert _pat_set(pat) == {(i, i) for i in range(n)}
+
+
+class TestSelectConstPredicate:
+    """select_n / where with a static predicate takes one branch per row instead
+    of unioning all branches, so the pattern stays exact and tighter."""
+
+    def test_static_mask_picks_one_branch(self):
+        n = 12
+        op = lambda x: jnp.where(jnp.arange(n) < n // 2, x, jnp.roll(x, 1))
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        assert len(pat[0]) == n  # one entry per row, not the union of both branches
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-5
+        )
+
+    def test_integer_select_n_static_selector(self):
+        n = 12
+        sel = jnp.array([0, 1, 2] * 4)
+        op = lambda x: jax.lax.select_n(sel, x, jnp.roll(x, 1), jnp.roll(x, -1))
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        assert len(pat[0]) == n
+
+    def test_data_dependent_predicate_stays_conservative(self):
+        # An input-dependent predicate keeps the union (output depends on the
+        # predicate and both branches) -- a valid superset, not tightened away.
+        n = 12
+        op = lambda x: jnp.where(x > 0.0, 2.0 * x, jnp.roll(x, 1))
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert len(pat[0]) == 2 * n  # union of both branches (+ predicate diagonal)
+
+
+class TestScatterReplace:
+    """Plain scatter (``base.at[i:j].set(block)``) drops the operand dependence at
+    written positions rather than over-reporting it as combine semantics would."""
+
+    def test_replace_drops_operand_at_written_rows(self):
+        # base is diagonal; a window is overwritten by a block of other inputs, so
+        # those rows lose their operand (diagonal) dependence. Linear, so probing
+        # is a valid oracle.
+        n = 16
+        op = lambda x: (3.0 * x).at[10:14].set(x[0:4] + x[4:8])
+
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        assert (10, 10) not in _pat_set(pat)  # operand dependence dropped at write
+
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-5
+        )
+
+
+class TestDynamicUpdateSlice:
+    """``lax.dynamic_update_slice`` traces to an exact pattern instead of bailing
+    to probing; the update window replaces that slice of the operand."""
+
+    def test_static_window_is_exact(self):
+        n = 16
+
+        def op(x):
+            return jax.lax.dynamic_update_slice(3.0 * x, x[0:4] + x[4:8], (10,))
+
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None  # handled now, no longer bails to probing
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-5
+        )
+
+    def test_2d_window_is_exact(self):
+        # 2-D operand: a (2,3) block replaces operand[1:3, :].
+        n = 12
+
+        def op(x):
+            return jax.lax.dynamic_update_slice(
+                (2.0 * x).reshape(4, 3), x[:6].reshape(2, 3), (1, 0)
+            ).reshape(-1)
+
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-5
+        )
+
+    def test_start_clamped_to_bounds(self):
+        # An out-of-range start clamps so the window fits (lax semantics).
+        n = 16
+        op = lambda x: jax.lax.dynamic_update_slice(3.0 * x, x[:4], (99,))
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+
+
+class TestScatterAdd:
+    def test_scalar_overlap_traces_exactly(self):
+        # Overlapping scatter-add (segment-sum): several updates land on one row.
+        # The full forward map captures all of them, so it traces exactly instead
+        # of bailing to probing.
         n = 12
         idx = jnp.repeat(jnp.arange(n // 2), 2)  # [0, 0, 1, 1, ...]
         op = lambda x: jnp.zeros(n).at[idx].add(x)
-        assert trace_sparsity_pattern(op, (n, n)) is None
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-4
+        )
+
+    def test_window_overlap_traces_exactly(self):
+        # Row-block scatter-add with a repeated row index: a column-window per
+        # index, overlapping at row 1 -> exercises the window-scatter forward map.
+        n = 8
+        op = (
+            lambda x: jnp.zeros((4, 2))
+            .at[jnp.array([0, 1, 1])]
+            .add(x[:6].reshape(3, 2))
+            .reshape(-1)
+        )
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
         cache = cache_coloring(op, (n, n))
         np.testing.assert_allclose(
             _materialize_dense(op, cache), _dense(op, n), atol=1e-4
