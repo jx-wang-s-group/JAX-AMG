@@ -208,6 +208,21 @@ class TestTracingFallback:
         op = lambda x: jnp.zeros(n).at[jnp.argsort(x)].add(x)
         assert trace_sparsity_pattern(op, (n, n)) is None
 
+    def test_clip_mode_scatter_returns_none(self):
+        # CLIP-mode indexed update is not traced structurally -> falls back.
+        n = 16
+        op = lambda x: (3.0 * x).at[jnp.array([0, 2, 99])].set(x[:3], mode="clip")
+        assert trace_sparsity_pattern(op, (n, n)) is None
+
+    def test_dynamic_update_slice_dynamic_start_returns_none(self):
+        # An input-dependent window start makes placement data-dependent, so the
+        # tracer bails rather than trace a fixed window.
+        n = 16
+        op = lambda x: lax.dynamic_update_slice(
+            3.0 * x, x[:4], ((x[0] > 0.0).astype(jnp.int32),)
+        )
+        assert trace_sparsity_pattern(op, (n, n)) is None
+
     def test_dot_general_both_operands_data_returns_none(self):
         # x @ x is a contraction of two input-dependent operands (nonlinear); the
         # dot_general rule needs exactly one constant operand, so it must bail.

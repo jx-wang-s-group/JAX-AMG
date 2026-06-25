@@ -143,6 +143,15 @@ class TestZeroSkipMul:
         )
         assert nct < ncl  # 4 vs 48
 
+    def test_scalar_zero_term_drops_dependence(self):
+        # `x * 0.0` is a scalar-zero mul -> the broadcast branch of the zero mask;
+        # the term contributes nothing, leaving just the diagonal of 2*x.
+        n = 10
+        op = lambda x: 2.0 * x + x * 0.0
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        assert _pat_set(pat) == {(i, i) for i in range(n)}
+
 
 class TestScatterReplace:
     """Plain scatter (``base.at[i:j].set(block)``) drops the operand dependence at
@@ -185,15 +194,58 @@ class TestDynamicUpdateSlice:
             _materialize_dense(op, cache), _dense(op, n), atol=1e-5
         )
 
+    def test_2d_window_is_exact(self):
+        # 2-D operand: a (2,3) block replaces operand[1:3, :].
+        n = 12
 
-class TestOverlappingScatterAdd:
-    def test_overlapping_scatter_add_traces_exactly(self):
+        def op(x):
+            return jax.lax.dynamic_update_slice(
+                (2.0 * x).reshape(4, 3), x[:6].reshape(2, 3), (1, 0)
+            ).reshape(-1)
+
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-5
+        )
+
+    def test_start_clamped_to_bounds(self):
+        # An out-of-range start clamps so the window fits (lax semantics).
+        n = 16
+        op = lambda x: jax.lax.dynamic_update_slice(3.0 * x, x[:4], (99,))
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+
+
+class TestScatterAdd:
+    def test_scalar_overlap_traces_exactly(self):
         # Overlapping scatter-add (segment-sum): several updates land on one row.
         # The full forward map captures all of them, so it traces exactly instead
         # of bailing to probing.
         n = 12
         idx = jnp.repeat(jnp.arange(n // 2), 2)  # [0, 0, 1, 1, ...]
         op = lambda x: jnp.zeros(n).at[idx].add(x)
+        pat = trace_sparsity_pattern(op, (n, n))
+        assert pat is not None
+        assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
+        cache = cache_coloring(op, (n, n))
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), _dense(op, n), atol=1e-4
+        )
+
+    def test_window_overlap_traces_exactly(self):
+        # Row-block scatter-add with a repeated row index: a column-window per
+        # index, overlapping at row 1 -> exercises the window-scatter forward map.
+        n = 8
+        op = (
+            lambda x: jnp.zeros((4, 2))
+            .at[jnp.array([0, 1, 1])]
+            .add(x[:6].reshape(3, 2))
+            .reshape(-1)
+        )
         pat = trace_sparsity_pattern(op, (n, n))
         assert pat is not None
         assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
