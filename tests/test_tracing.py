@@ -142,24 +142,18 @@ class TestTracingExact:
 
 
 class TestTracingConservativeSuperset:
-    """Branching primitives: the tracer cannot know which branch is taken, so it
-    returns a safe SUPERSET (union of branches). cache_coloring later refines it
-    to the exact matrix via materialize + drop_zeros (see test_sparsity_cache)."""
+    """``cond`` unions its branches (the tracer cannot know which is taken), giving
+    a safe SUPERSET that cache_coloring later refines via materialize + drop_zeros.
+    (``select_n``/``where`` with a static predicate is instead tightened exactly --
+    see test_sparsity_cache.TestSelectConstPredicate.)"""
 
-    @pytest.mark.parametrize(
-        "op",
-        [
-            lambda x: lax.cond(True, lambda v: jnp.roll(v, 1), lambda v: 2.0 * v, x),
-            lambda x: jnp.where(jnp.arange(12) % 2 == 0, x, jnp.roll(x, 1)),
-        ],
-        ids=["cond", "where_select"],
-    )
-    def test_trace_is_superset(self, op):
+    def test_cond_is_superset(self):
+        op = lambda x: lax.cond(True, lambda v: jnp.roll(v, 1), lambda v: 2.0 * v, x)
         traced = _trace_set(op, (12, 12))
         truth = _dense_pattern(op, 12)
         assert traced is not None
         assert traced >= truth  # conservative: never misses a true dependency
-        assert len(traced) > len(truth)  # and here strictly over-approximates
+        assert len(traced) > len(truth)  # cond unions both branches
 
     def test_data_dependent_cond_predicate_captured(self):
         # The cond predicate depends on x[0], so the branch taken -- and hence
@@ -172,6 +166,22 @@ class TestTracingConservativeSuperset:
         res = trace_sparsity_pattern(op, (n, n))
         got = set(zip(res[0].tolist(), res[1].tolist()))
         assert all((i, 0) in got for i in range(n))  # predicate input in every row
+
+
+class TestDeadCodeElimination:
+    """Dead equations are removed before tracing, so an unsupported primitive that
+    is computed but never used does not force a needless bail to probing."""
+
+    def test_dead_unsupported_op_does_not_bail(self):
+        n = 12
+
+        def op(x):
+            _ = jnp.cumsum(x)  # unhandled, but never feeds the output
+            return 2.0 * x
+
+        traced = _trace_set(op, (n, n))
+        assert traced is not None  # DCE dropped the dead cumsum -> no bail
+        assert traced == _dense_pattern(op, n)
 
 
 class TestTracingFallback:
@@ -202,19 +212,25 @@ class TestTracingFallback:
         n = 12
         assert trace_sparsity_pattern(lambda x: jnp.cumsum(x), (n, n)) is None
 
-    def test_overlapping_scatter_add_returns_none(self):
-        # Two updates target the same operand position (segment-sum): scatter-add
-        # accumulates them, but the connectivity map cannot represent that, so the
-        # tracer must detect the overlap and bail rather than under-count.
-        n = 12
-        idx = jnp.repeat(jnp.arange(n // 2), 2)  # [0, 0, 1, 1, ...]
-        op = lambda x: jnp.zeros(n).at[idx].add(x)
-        assert trace_sparsity_pattern(op, (n, n)) is None
-
     def test_data_dependent_scatter_index_returns_none(self):
         # Scatter target positions computed from the input -> not traceable.
         n = 12
         op = lambda x: jnp.zeros(n).at[jnp.argsort(x)].add(x)
+        assert trace_sparsity_pattern(op, (n, n)) is None
+
+    def test_clip_mode_scatter_returns_none(self):
+        # CLIP-mode indexed update is not traced structurally -> falls back.
+        n = 16
+        op = lambda x: (3.0 * x).at[jnp.array([0, 2, 99])].set(x[:3], mode="clip")
+        assert trace_sparsity_pattern(op, (n, n)) is None
+
+    def test_dynamic_update_slice_dynamic_start_returns_none(self):
+        # An input-dependent window start makes placement data-dependent, so the
+        # tracer bails rather than trace a fixed window.
+        n = 16
+        op = lambda x: lax.dynamic_update_slice(
+            3.0 * x, x[:4], ((x[0] > 0.0).astype(jnp.int32),)
+        )
         assert trace_sparsity_pattern(op, (n, n)) is None
 
     def test_dot_general_both_operands_data_returns_none(self):
