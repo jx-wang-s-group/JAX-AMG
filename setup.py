@@ -265,28 +265,22 @@ def get_build_config() -> dict:
             libraries.extend(mpi_libs)
             print("\033[1;32m[setup.py] MPI support enabled\033[0m")
         else:
-            # MPI was requested -- explicitly via JAXAMG_ENABLE_MPI=1, or implied by
-            # an MPI-enabled AmgX -- but no MPI compiler is available. Abort cleanly
-            # here rather than defining JAXAMG_WITH_MPI and letting the build fail
-            # later with a cryptic "mpi.h: No such file or directory". To build
-            # without MPI, set JAXAMG_ENABLE_MPI=0.
-            if amgx_needs_mpi:
-                _fail(
-                    "AmgX (libamgxsh.so) was built with MPI, but no MPI C++ compiler "
-                    "(mpicxx/mpic++) was found on PATH.\n"
-                    "  Resolve this by one of:\n"
-                    "  1. Install an MPI dev toolchain (e.g. 'apt install libopenmpi-dev'), or\n"
-                    "  2. Set JAXAMG_ENABLE_MPI=0 to compile jaxamg without MPI (libmpi must\n"
-                    "     still be loadable at runtime for the MPI-enabled AmgX), or\n"
-                    "  3. Rebuild AmgX without MPI: cmake .. -DCMAKE_NO_MPI=ON"
-                )
-            else:
-                _fail(
-                    "JAXAMG_ENABLE_MPI=1 was set, but no MPI C++ compiler "
-                    "(mpicxx/mpic++) was found on PATH.\n"
-                    "  Install an MPI dev toolchain (e.g. 'apt install libopenmpi-dev'),\n"
-                    "  or set JAXAMG_ENABLE_MPI=0 to build without MPI."
-                )
+            # No MPI compiler found. We can only reach here with amgx_needs_mpi=True:
+            # the JAXAMG_ENABLE_MPI=1 + non-MPI-AmgX case already aborted above, so an
+            # enabled MPI build at this point always implies AmgX itself needs MPI.
+            # Abort cleanly rather than defining JAXAMG_WITH_MPI and failing later with
+            # a cryptic "mpi.h: No such file or directory".
+            _fail(
+                "AmgX (libamgxsh.so) was built with MPI, but no MPI C++ compiler "
+                "(mpicxx/mpic++) was found on PATH.\n"
+                "  Resolve this by one of:\n"
+                "  1. If MPI is already installed, put it on PATH or point to it\n"
+                "     directly with MPICXX=/path/to/mpicxx, or\n"
+                "  2. Install an MPI dev toolchain (e.g. 'apt install libopenmpi-dev'), or\n"
+                "  3. Set JAXAMG_ENABLE_MPI=0 to compile jaxamg without MPI (libmpi must\n"
+                "     still be loadable at runtime for the MPI-enabled AmgX), or\n"
+                "  4. Rebuild AmgX without MPI: cmake .. -DCMAKE_NO_MPI=ON"
+            )
     else:
         print(
             "\033[1;34m[setup.py] MPI support disabled (AmgX built without MPI)\033[0m"
