@@ -8,7 +8,9 @@
 
 #include <cuda_runtime.h>
 #include <amgx_c.h>
+#ifdef JAXAMG_WITH_MPI
 #include <mpi.h>
+#endif
 #include <xla/ffi/api/ffi.h>
 #include <cstdio>
 #include <mutex>
@@ -442,6 +444,7 @@ namespace
       std::mutex mutex_;
   };
 
+#ifdef JAXAMG_WITH_MPI
   // Singleton for global MPI AmgX resource management. Shares one
   // AMGX_resources_handle across all MPI cache entries so multiple
   // matrix/solver pairs can coexist on the same communicator.
@@ -483,6 +486,7 @@ namespace
       AMGX_config_handle cfg_;
       std::mutex mutex_;
   };
+#endif // JAXAMG_WITH_MPI
 
   std::once_flag g_amgx_init_flag;
 
@@ -528,7 +532,9 @@ namespace
     GetSolverCache().clear(DestroyResources);
     GetMPISolverCache().clear(DestroyResources);
     GlobalResources::Get().Destroy();
+#ifdef JAXAMG_WITH_MPI
     GlobalMPIResources::Get().Destroy();
+#endif
   }
 
   // Check if CUDA-aware MPI should be used (respects MPI4JAX convention)

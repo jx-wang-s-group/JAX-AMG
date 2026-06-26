@@ -20,7 +20,9 @@
 #include <unordered_map>
 #include <functional>
 #include <utility>
+#ifdef JAXAMG_WITH_MPI
 #include <mpi.h>
+#endif
 #include "_amgx_utils.h"
 #include "_amgx_solvers.h"
 
@@ -79,6 +81,7 @@ namespace
           .Attr<int32_t>("return_stats")            // return stats flag
   );
 
+#ifdef JAXAMG_WITH_MPI
   // Register MPI handlers
   XLA_FFI_DEFINE_HANDLER(
       AmgxSolveMPI,
@@ -141,6 +144,7 @@ namespace
           .Arg<ffi::Buffer<ffi::S32>>() // comm_ptr
           .Ret<ffi::Buffer<ffi::F64>>() // recvbuf
   );
+#endif // JAXAMG_WITH_MPI
 
 } // namespace
 
@@ -150,6 +154,7 @@ PYBIND11_MODULE(_amgx, m)
         { return py::capsule(reinterpret_cast<void *>(AmgxSolve)); });
   m.def("get_amgx_solve_double_handler", []()
         { return py::capsule(reinterpret_cast<void *>(AmgxSolveDouble)); });
+#ifdef JAXAMG_WITH_MPI
   m.def("get_amgx_solve_mpi_handler", []()
         { return py::capsule(reinterpret_cast<void *>(AmgxSolveMPI)); });
   m.def("get_amgx_solve_mpi_double_handler", []()
@@ -158,6 +163,10 @@ PYBIND11_MODULE(_amgx, m)
         { return py::capsule(reinterpret_cast<void *>(AmgxAllGather)); });
   m.def("get_amgx_allgather_double_handler", []()
         { return py::capsule(reinterpret_cast<void *>(AmgxAllGatherDouble)); });
+  m.attr("mpi_enabled") = py::bool_(true);
+#else
+  m.attr("mpi_enabled") = py::bool_(false);
+#endif
 
   m.def("initialize", &EnsureAmgxInitialized);
   m.def("finalize", &AmgxFinalize);

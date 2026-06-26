@@ -211,18 +211,47 @@ def get_build_config() -> dict:
             return False
 
     amgx_needs_mpi = amgx_requires_mpi()
-    env_enable_mpi = os.environ.get("JAXAMG_ENABLE_MPI", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    mpi_pref = os.environ.get("JAXAMG_ENABLE_MPI", "").strip().lower()
+    env_enable_mpi = mpi_pref in ("1", "true", "yes", "on")
+    env_disable_mpi = mpi_pref in ("0", "false", "no", "off")
 
-    # Auto-enable MPI if AmgX requires it
-    enable_mpi = env_enable_mpi or amgx_needs_mpi
+    # Resolve the MPI build mode:
+    #   JAXAMG_ENABLE_MPI=0/false/no/off -> force a clean non-MPI build, even if
+    #     AmgX itself was built with MPI (no mpi.h, no libmpi linkage, MPI entry
+    #     points raise at runtime).
+    #   JAXAMG_ENABLE_MPI=1/true/yes/on  -> force MPI on.
+    #   unset                            -> auto: on iff AmgX requires MPI.
+    if env_disable_mpi:
+        enable_mpi = False
+    else:
+        enable_mpi = env_enable_mpi or amgx_needs_mpi
 
-    if amgx_needs_mpi and not env_enable_mpi:
+    if env_disable_mpi:
+        print(
+            "\033[1;34m[setup.py] MPI explicitly disabled (JAXAMG_ENABLE_MPI=0)\033[0m"
+        )
+        if amgx_needs_mpi:
+            print(
+                "\033[1;33m[setup.py] Note: linked AmgX (libamgxsh.so) has undefined "
+                "MPI symbols, so libmpi must still be loadable at runtime even though "
+                "jaxamg's own MPI paths are compiled out.\033[0m"
+            )
+    elif amgx_needs_mpi and not env_enable_mpi:
         print(
             "\033[1;33m[setup.py] Auto-detected: AmgX was built with MPI support\033[0m"
+        )
+    elif env_enable_mpi and not amgx_needs_mpi:
+        # MPI was explicitly forced on, but AmgX itself has no MPI. Building MPI
+        # jaxamg against a non-MPI AmgX yields an extension that reports
+        # mpi_enabled=True yet cannot run distributed solves (a non-MPI AmgX
+        # ignores the communicator and solves each rank's partition in isolation
+        # -> silently wrong results). Abort rather than ship that.
+        _fail(
+            "JAXAMG_ENABLE_MPI=1 forces MPI on, but AmgX (libamgxsh.so) has no MPI "
+            "symbols.\n"
+            "  Distributed solves require an MPI-enabled AmgX. Either:\n"
+            "  1. Rebuild AmgX with MPI, or\n"
+            "  2. Set JAXAMG_ENABLE_MPI=0 (or leave it unset) for a single-GPU build."
         )
 
     if enable_mpi:
@@ -236,17 +265,22 @@ def get_build_config() -> dict:
             libraries.extend(mpi_libs)
             print("\033[1;32m[setup.py] MPI support enabled\033[0m")
         else:
-            if amgx_needs_mpi:
-                print(
-                    "\033[1;31m[setup.py] ERROR: AmgX requires MPI but mpicxx not found.\n"
-                    "  Please install MPI (e.g., 'apt install libopenmpi-dev') or\n"
-                    "  rebuild AmgX without MPI: cmake .. -DAMGX_NO_MPI=ON\033[0m"
-                )
-            else:
-                print(
-                    "\033[1;33m[setup.py] WARNING: JAXAMG_ENABLE_MPI=1 but mpicxx not found. "
-                    "Building without MPI linkage.\033[0m"
-                )
+            # No MPI compiler found. We can only reach here with amgx_needs_mpi=True:
+            # the JAXAMG_ENABLE_MPI=1 + non-MPI-AmgX case already aborted above, so an
+            # enabled MPI build at this point always implies AmgX itself needs MPI.
+            # Abort cleanly rather than defining JAXAMG_WITH_MPI and failing later with
+            # a cryptic "mpi.h: No such file or directory".
+            _fail(
+                "AmgX (libamgxsh.so) was built with MPI, but no MPI C++ compiler "
+                "(mpicxx/mpic++) was found on PATH.\n"
+                "  Resolve this by one of:\n"
+                "  1. If MPI is already installed, put it on PATH or point to it\n"
+                "     directly with MPICXX=/path/to/mpicxx, or\n"
+                "  2. Install an MPI dev toolchain (e.g. 'apt install libopenmpi-dev'), or\n"
+                "  3. Set JAXAMG_ENABLE_MPI=0 to compile jaxamg without MPI (libmpi must\n"
+                "     still be loadable at runtime for the MPI-enabled AmgX), or\n"
+                "  4. Rebuild AmgX without MPI: cmake .. -DCMAKE_NO_MPI=ON"
+            )
     else:
         print(
             "\033[1;34m[setup.py] MPI support disabled (AmgX built without MPI)\033[0m"
@@ -254,15 +288,22 @@ def get_build_config() -> dict:
 
     runtime_library_dirs = list(library_dirs)
 
+    # Compile the MPI code paths only when MPI is enabled. Without this macro the
+    # extension never includes <mpi.h> or references MPI symbols, so it builds and
+    # links cleanly on machines without an MPI development toolchain.
+    define_macros = [("JAXAMG_WITH_MPI", "1")] if enable_mpi else []
+
     print(f"\033[1;34m[setup.py] include_dirs: {include_dirs}\033[0m")
     print(f"\033[1;34m[setup.py] library_dirs: {library_dirs}\033[0m")
     print(f"\033[1;34m[setup.py] libraries: {libraries}\033[0m")
+    print(f"\033[1;34m[setup.py] define_macros: {define_macros}\033[0m")
 
     return {
         "include_dirs": include_dirs,
         "library_dirs": library_dirs,
         "runtime_library_dirs": runtime_library_dirs,
         "libraries": libraries,
+        "define_macros": define_macros,
     }
 
 
@@ -286,6 +327,7 @@ class BuildExt(build_ext):
                 ext.runtime_library_dirs or []
             )
             ext.libraries = cfg["libraries"] + list(ext.libraries)
+            ext.define_macros = list(ext.define_macros or []) + cfg["define_macros"]
         super().build_extensions()
 
 

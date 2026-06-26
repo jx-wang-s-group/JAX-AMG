@@ -29,18 +29,25 @@ _AMGX_CALL_NAME_DOUBLE = "amgx_solve_double"
 _AMGX_CALL_NAME_MPI = "amgx_solve_mpi"
 _AMGX_CALL_NAME_MPI_DOUBLE = "amgx_solve_mpi_double"
 
+# Whether the native extension was compiled with MPI support (JAXAMG_WITH_MPI).
+# A non-MPI build omits the MPI FFI handlers entirely, so the single-GPU path
+# below must be the only thing registered at import time.
+HAS_MPI = bool(getattr(_amgx, "mpi_enabled", False))
+
 # Get the handler from C++ and register for CUDA platform
 _AMGX_HANDLER = _amgx.get_amgx_solve_handler()
 _AMGX_HANDLER_DOUBLE = _amgx.get_amgx_solve_double_handler()
-_AMGX_HANDLER_MPI = _amgx.get_amgx_solve_mpi_handler()
-_AMGX_HANDLER_MPI_DOUBLE = _amgx.get_amgx_solve_mpi_double_handler()
 
 ffi.register_ffi_target(_AMGX_CALL_NAME, _AMGX_HANDLER, platform="CUDA")
 ffi.register_ffi_target(_AMGX_CALL_NAME_DOUBLE, _AMGX_HANDLER_DOUBLE, platform="CUDA")
-ffi.register_ffi_target(_AMGX_CALL_NAME_MPI, _AMGX_HANDLER_MPI, platform="CUDA")
-ffi.register_ffi_target(
-    _AMGX_CALL_NAME_MPI_DOUBLE, _AMGX_HANDLER_MPI_DOUBLE, platform="CUDA"
-)
+
+if HAS_MPI:
+    _AMGX_HANDLER_MPI = _amgx.get_amgx_solve_mpi_handler()
+    _AMGX_HANDLER_MPI_DOUBLE = _amgx.get_amgx_solve_mpi_double_handler()
+    ffi.register_ffi_target(_AMGX_CALL_NAME_MPI, _AMGX_HANDLER_MPI, platform="CUDA")
+    ffi.register_ffi_target(
+        _AMGX_CALL_NAME_MPI_DOUBLE, _AMGX_HANDLER_MPI_DOUBLE, platform="CUDA"
+    )
 
 
 class AMGXStatus(IntEnum):
@@ -457,6 +464,13 @@ def solve(
     # Branch: MPI mode or single-GPU mode
     if mpi_cache is not None or comm is not None:
         # MPI MODE
+        if not HAS_MPI:
+            raise RuntimeError(
+                "jaxamg was built without MPI support, but an MPI solve was "
+                "requested (comm was passed or MPI metadata is attached to A). "
+                "Rebuild with MPI enabled (JAXAMG_ENABLE_MPI=1, with mpicxx on "
+                "PATH) to use distributed solves."
+            )
         if mpi_cache is None:
             # Validate parameters for non-cache path
             if nglobal is None:

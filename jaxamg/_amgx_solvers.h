@@ -10,7 +10,9 @@
 #include <cusparse.h>
 #include <amgx_c.h>
 #include <xla/ffi/api/ffi.h>
+#ifdef JAXAMG_WITH_MPI
 #include <mpi.h>
+#endif
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -359,6 +361,7 @@ namespace
     return ffi::Error::Success();
   }
 
+#ifdef JAXAMG_WITH_MPI
   /*
    * AmgxSolveMPIInternal: MPI-aware templated core implementation.
    * Uses AMGX_resources_create() with MPI communicator and
@@ -561,6 +564,7 @@ namespace
 
     return ffi::Error::Success();
   }
+#endif // JAXAMG_WITH_MPI
 
   // Float implementation (single-GPU)
   inline ffi::Error AmgxSolveImpl(cudaStream_t stream,
@@ -594,6 +598,7 @@ namespace
         stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats);
   }
 
+#ifdef JAXAMG_WITH_MPI
   // MPI Float implementation
   inline ffi::Error AmgxSolveMPIImpl(cudaStream_t stream,
                                      ffi::Buffer<ffi::DataType::S32> row_ptrs,
@@ -716,6 +721,7 @@ namespace
   {
     return AmgxAllGatherInternal<double, ffi::DataType::F64>(stream, sendbuf, recvcounts, displs, comm_ptr, recvbuf);
   }
+#endif // JAXAMG_WITH_MPI
 
 } // namespace
 
