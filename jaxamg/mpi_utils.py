@@ -20,17 +20,22 @@ if TYPE_CHECKING:
 _AMGX_CALL_NAME_ALLGATHER = "amgx_allgather"
 _AMGX_CALL_NAME_ALLGATHER_DOUBLE = "amgx_allgather_double"
 
-_AMGX_HANDLER_ALLGATHER = _amgx.get_amgx_allgather_handler()
-_AMGX_HANDLER_ALLGATHER_DOUBLE = _amgx.get_amgx_allgather_double_handler()
+# The AllGather FFI handlers only exist in an MPI-enabled build (JAXAMG_WITH_MPI).
+# Skip fetching/registering them otherwise so import works without MPI.
+_HAS_MPI = bool(getattr(_amgx, "mpi_enabled", False))
 
-ffi.register_ffi_target(
-    _AMGX_CALL_NAME_ALLGATHER, _AMGX_HANDLER_ALLGATHER, platform="CUDA"
-)
-ffi.register_ffi_target(
-    _AMGX_CALL_NAME_ALLGATHER_DOUBLE,
-    _AMGX_HANDLER_ALLGATHER_DOUBLE,
-    platform="CUDA",
-)
+if _HAS_MPI:
+    _AMGX_HANDLER_ALLGATHER = _amgx.get_amgx_allgather_handler()
+    _AMGX_HANDLER_ALLGATHER_DOUBLE = _amgx.get_amgx_allgather_double_handler()
+
+    ffi.register_ffi_target(
+        _AMGX_CALL_NAME_ALLGATHER, _AMGX_HANDLER_ALLGATHER, platform="CUDA"
+    )
+    ffi.register_ffi_target(
+        _AMGX_CALL_NAME_ALLGATHER_DOUBLE,
+        _AMGX_HANDLER_ALLGATHER_DOUBLE,
+        platform="CUDA",
+    )
 
 
 def _amgx_allgather_impl(

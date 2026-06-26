@@ -211,16 +211,32 @@ def get_build_config() -> dict:
             return False
 
     amgx_needs_mpi = amgx_requires_mpi()
-    env_enable_mpi = os.environ.get("JAXAMG_ENABLE_MPI", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    mpi_pref = os.environ.get("JAXAMG_ENABLE_MPI", "").strip().lower()
+    env_enable_mpi = mpi_pref in ("1", "true", "yes", "on")
+    env_disable_mpi = mpi_pref in ("0", "false", "no", "off")
 
-    # Auto-enable MPI if AmgX requires it
-    enable_mpi = env_enable_mpi or amgx_needs_mpi
+    # Resolve the MPI build mode:
+    #   JAXAMG_ENABLE_MPI=0/false/no/off -> force a clean non-MPI build, even if
+    #     AmgX itself was built with MPI (no mpi.h, no libmpi linkage, MPI entry
+    #     points raise at runtime).
+    #   JAXAMG_ENABLE_MPI=1/true/yes/on  -> force MPI on.
+    #   unset                            -> auto: on iff AmgX requires MPI.
+    if env_disable_mpi:
+        enable_mpi = False
+    else:
+        enable_mpi = env_enable_mpi or amgx_needs_mpi
 
-    if amgx_needs_mpi and not env_enable_mpi:
+    if env_disable_mpi:
+        print(
+            "\033[1;34m[setup.py] MPI explicitly disabled (JAXAMG_ENABLE_MPI=0)\033[0m"
+        )
+        if amgx_needs_mpi:
+            print(
+                "\033[1;33m[setup.py] Note: linked AmgX (libamgxsh.so) has undefined "
+                "MPI symbols, so libmpi must still be loadable at runtime even though "
+                "jaxamg's own MPI paths are compiled out.\033[0m"
+            )
+    elif amgx_needs_mpi and not env_enable_mpi:
         print(
             "\033[1;33m[setup.py] Auto-detected: AmgX was built with MPI support\033[0m"
         )
@@ -254,15 +270,22 @@ def get_build_config() -> dict:
 
     runtime_library_dirs = list(library_dirs)
 
+    # Compile the MPI code paths only when MPI is enabled. Without this macro the
+    # extension never includes <mpi.h> or references MPI symbols, so it builds and
+    # links cleanly on machines without an MPI development toolchain.
+    define_macros = [("JAXAMG_WITH_MPI", "1")] if enable_mpi else []
+
     print(f"\033[1;34m[setup.py] include_dirs: {include_dirs}\033[0m")
     print(f"\033[1;34m[setup.py] library_dirs: {library_dirs}\033[0m")
     print(f"\033[1;34m[setup.py] libraries: {libraries}\033[0m")
+    print(f"\033[1;34m[setup.py] define_macros: {define_macros}\033[0m")
 
     return {
         "include_dirs": include_dirs,
         "library_dirs": library_dirs,
         "runtime_library_dirs": runtime_library_dirs,
         "libraries": libraries,
+        "define_macros": define_macros,
     }
 
 
@@ -286,6 +309,7 @@ class BuildExt(build_ext):
                 ext.runtime_library_dirs or []
             )
             ext.libraries = cfg["libraries"] + list(ext.libraries)
+            ext.define_macros = list(ext.define_macros or []) + cfg["define_macros"]
         super().build_extensions()
 
 
