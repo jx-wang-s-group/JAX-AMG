@@ -240,6 +240,19 @@ def get_build_config() -> dict:
         print(
             "\033[1;33m[setup.py] Auto-detected: AmgX was built with MPI support\033[0m"
         )
+    elif env_enable_mpi and not amgx_needs_mpi:
+        # MPI was explicitly forced on, but AmgX itself has no MPI. Building MPI
+        # jaxamg against a non-MPI AmgX yields an extension that reports
+        # mpi_enabled=True yet cannot run distributed solves (a non-MPI AmgX
+        # ignores the communicator and solves each rank's partition in isolation
+        # -> silently wrong results). Abort rather than ship that.
+        _fail(
+            "JAXAMG_ENABLE_MPI=1 forces MPI on, but AmgX (libamgxsh.so) has no MPI "
+            "symbols.\n"
+            "  Distributed solves require an MPI-enabled AmgX. Either:\n"
+            "  1. Rebuild AmgX with MPI, or\n"
+            "  2. Set JAXAMG_ENABLE_MPI=0 (or leave it unset) for a single-GPU build."
+        )
 
     if enable_mpi:
         mpicxx_bin = find_mpicxx()
