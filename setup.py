@@ -252,16 +252,27 @@ def get_build_config() -> dict:
             libraries.extend(mpi_libs)
             print("\033[1;32m[setup.py] MPI support enabled\033[0m")
         else:
+            # MPI was requested -- explicitly via JAXAMG_ENABLE_MPI=1, or implied by
+            # an MPI-enabled AmgX -- but no MPI compiler is available. Abort cleanly
+            # here rather than defining JAXAMG_WITH_MPI and letting the build fail
+            # later with a cryptic "mpi.h: No such file or directory". To build
+            # without MPI, set JAXAMG_ENABLE_MPI=0.
             if amgx_needs_mpi:
-                print(
-                    "\033[1;31m[setup.py] ERROR: AmgX requires MPI but mpicxx not found.\n"
-                    "  Please install MPI (e.g., 'apt install libopenmpi-dev') or\n"
-                    "  rebuild AmgX without MPI: cmake .. -DAMGX_NO_MPI=ON\033[0m"
+                _fail(
+                    "AmgX (libamgxsh.so) was built with MPI, but no MPI C++ compiler "
+                    "(mpicxx/mpic++) was found on PATH.\n"
+                    "  Resolve this by one of:\n"
+                    "  1. Install an MPI dev toolchain (e.g. 'apt install libopenmpi-dev'), or\n"
+                    "  2. Set JAXAMG_ENABLE_MPI=0 to compile jaxamg without MPI (libmpi must\n"
+                    "     still be loadable at runtime for the MPI-enabled AmgX), or\n"
+                    "  3. Rebuild AmgX without MPI: cmake .. -DCMAKE_NO_MPI=ON"
                 )
             else:
-                print(
-                    "\033[1;33m[setup.py] WARNING: JAXAMG_ENABLE_MPI=1 but mpicxx not found. "
-                    "Building without MPI linkage.\033[0m"
+                _fail(
+                    "JAXAMG_ENABLE_MPI=1 was set, but no MPI C++ compiler "
+                    "(mpicxx/mpic++) was found on PATH.\n"
+                    "  Install an MPI dev toolchain (e.g. 'apt install libopenmpi-dev'),\n"
+                    "  or set JAXAMG_ENABLE_MPI=0 to build without MPI."
                 )
     else:
         print(
