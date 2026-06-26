@@ -5,4 +5,4 @@ runtime as ``jaxamg.__version__``. Kept in a dependency-free module so the build
 backend can extract it statically without importing the native extension.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
