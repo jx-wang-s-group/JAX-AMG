@@ -105,6 +105,36 @@ def _mpi4jax_allgatherv(
     return jnp.concatenate(result_parts)
 
 
+def local_transpose_nnz(
+    col_indices: ArrayLike, recvcounts_tuple: tuple[int, ...], comm: "Comm"
+) -> int:
+    """This rank's local nonzero count of A^T (for transpose output sizing).
+
+    Rank r's A^T rows receive every A nonzero whose column it owns, so the local
+    nnz of A^T equals the local nnz of A only for structurally symmetric
+    patterns; in general it differs per rank, so the distributed transpose sizes
+    its output by this value rather than the input nnz. Computed once on the host
+    via an ``Alltoall`` of per-destination counts.
+
+    Args:
+        col_indices: This rank's local (global-numbered) CSR column indices.
+        recvcounts_tuple: Rows owned per rank (the row partition).
+        comm: MPI communicator.
+
+    Returns:
+        This rank's local nnz of A^T (a static Python int).
+    """
+    nranks = len(recvcounts_tuple)
+    # Half-open row-block boundaries [0, r0, r0+r1, ..., n_global].
+    row_bounds = np.cumsum(np.array([0, *recvcounts_tuple], dtype=np.int64))
+    cols = np.asarray(col_indices).astype(np.int64)
+    owner = np.clip(np.searchsorted(row_bounds, cols, side="right") - 1, 0, nranks - 1)
+    send_counts = np.bincount(owner, minlength=nranks).astype(np.int32)
+    recv_counts = np.empty(nranks, dtype=np.int32)
+    comm.Alltoall(send_counts, recv_counts)
+    return int(recv_counts.sum())
+
+
 def _mpi4jax_alltoallv_transpose(
     data: jax.Array,
     indices: jax.Array,
@@ -112,6 +142,7 @@ def _mpi4jax_alltoallv_transpose(
     recvcounts_tuple: tuple[int, ...],
     comm: "Comm",
     max_nnz: int,
+    nnz_out: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Pure JAX implementation of distributed matrix transpose using mpi4jax.
@@ -133,7 +164,14 @@ def _mpi4jax_alltoallv_transpose(
         indptr: CSR row pointers
         recvcounts_tuple: Partition sizes (rows per rank)
         comm: MPI communicator
-        max_nnz: Maximum nnz across all ranks for buffer sizing (must be precalculated)
+        max_nnz: Max local nnz of A across ranks, for send-buffer sizing (the
+            send buffers are collective, so all ranks share this size).
+        nnz_out: This rank's local nnz of A^T, the exact output length. Under row
+            partitioning it differs from the input nnz whenever the pattern is
+            structurally nonsymmetric, so it must be provided (see
+            :func:`local_transpose_nnz`). Any slots beyond the actual received
+            count are padded with in-range explicit zeros (a no-op when the count
+            is exact).
     """
     import mpi4jax
 
@@ -252,10 +290,15 @@ def _mpi4jax_alltoallv_transpose(
         -1,  # Invalid positions (will be ignored)
     )
 
-    # Initialize output arrays with size = nnz (same as input for shape compatibility)
-    recv_data_flat = jnp.zeros(nnz, dtype=data.dtype)
-    recv_rows_flat = jnp.zeros(nnz, dtype=jnp.int32)
-    recv_cols_flat = jnp.zeros(nnz, dtype=jnp.int32)
+    # Size the output by nnz_out (this rank's local nnz of A^T), not the input
+    # nnz: they differ per rank for structurally nonsymmetric patterns, and using
+    # the input nnz would drop or strand received entries. real_count is the
+    # runtime count and equals nnz_out, so the scatter fills [0, nnz_out) exactly.
+    real_count = jnp.sum(recv_counts).astype(jnp.int32)
+
+    recv_data_flat = jnp.zeros(nnz_out, dtype=data.dtype)
+    recv_rows_flat = jnp.zeros(nnz_out, dtype=jnp.int32)
+    recv_cols_flat = jnp.zeros(nnz_out, dtype=jnp.int32)
 
     # Scatter valid elements to their positions
     # Use segment_sum pattern: only positions >= 0 are valid
@@ -278,6 +321,14 @@ def _mpi4jax_alltoallv_transpose(
     recv_rows_flat = recv_rows_flat.at[valid_positions].add(masked_rows)
     recv_cols_flat = recv_cols_flat.at[valid_positions].add(masked_cols)
 
+    # Defensive: if nnz_out exceeds the received count, pad the tail slots with an
+    # on-rank explicit zero at (A^T row 0, column my_row_start) -- harmless to
+    # AmgX and a no-op when nnz_out is exact (as from local_transpose_nnz). The
+    # pre-transpose fields map recv_cols -> local row, recv_rows -> global column.
+    pad_mask = jnp.arange(nnz_out, dtype=jnp.int32) >= real_count
+    recv_cols_flat = jnp.where(pad_mask, my_row_start, recv_cols_flat)
+    recv_rows_flat = jnp.where(pad_mask, my_row_start, recv_rows_flat)
+
     # For A^T: recv_cols becomes local row (was column in A), recv_rows becomes col (was row in A)
     at_rows_local = recv_cols_flat - my_row_start  # Local row index in A^T
     at_cols = recv_rows_flat  # Column index in A^T (global row in A)
@@ -297,17 +348,17 @@ def _mpi4jax_alltoallv_transpose(
     c_sorted = at_cols[sort_idx]
     v_sorted = recv_data_flat[sort_idx]
 
-    # Build indptr from row counts
+    # Build indptr from row counts (which sum to nnz_out).
     row_counts_at = jnp.bincount(r_sorted, length=n_local).astype(jnp.int32)
 
     out_indptr = jnp.zeros(n_local + 1, dtype=indptr.dtype)
     out_indptr = out_indptr.at[1:].set(jnp.cumsum(row_counts_at).astype(jnp.int32))
 
-    # Output data and indices (already sorted). For square matrices with
-    # fixed sparsity, transpose preserves nnz, so no padding/truncation needed.
+    # Output data and indices (already sorted); length is nnz_out, this rank's
+    # local nnz(A^T).
     out_data = v_sorted
     out_indices = c_sorted
-    out_indptr = out_indptr.at[-1].set(nnz)
+    out_indptr = out_indptr.at[-1].set(nnz_out)
 
     # Convert output indices to int64
     with temp_enable_x64():

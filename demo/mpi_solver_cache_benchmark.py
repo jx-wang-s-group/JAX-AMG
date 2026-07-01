@@ -97,7 +97,12 @@ def run_benchmark(n_global, n_runs=5):
     # without calling clear_solver_cache() in MPI mode.
     baseline_mpi_caches = [
         jaxamg.cache_mpi_metadata(
-            copy.deepcopy(solver_config), comm, n_global, partition_info, A_local
+            copy.deepcopy(solver_config),
+            comm,
+            n_global,
+            partition_info,
+            A_local,
+            is_symmetric=True,
         )
         for _ in range(n_runs + 1)
     ]
@@ -141,7 +146,7 @@ def run_benchmark(n_global, n_runs=5):
 
     # Single MPI metadata cache reused across iterations for resource cache hits.
     cached_mpi_cache = jaxamg.cache_mpi_metadata(
-        solver_config, comm, n_global, partition_info, A_local
+        solver_config, comm, n_global, partition_info, A_local, is_symmetric=True
     )
 
     if rank == 0:

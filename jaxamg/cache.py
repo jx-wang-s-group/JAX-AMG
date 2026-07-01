@@ -78,6 +78,7 @@ def cache_mpi_metadata(
     nglobal: int,
     partition_info: tuple[int, int],
     A: MatrixOrOperator,
+    is_symmetric: bool = False,
 ) -> dict[str, Any]:
     """
     Pre-compute and cache MPI metadata for JIT-compatible solver usage.
@@ -100,6 +101,10 @@ def cache_mpi_metadata(
         nglobal: Global matrix size (total rows across all ranks)
         partition_info: tuple (row_start, row_end) indicating which rows this rank owns
         A: Matrix or operator to compute max nnz for buffer sizing
+        is_symmetric: If True, the backward pass never transposes, so the
+            transpose output size (`nnz_out`) is left unset (``None``). Should
+            match the `is_symmetric` passed to `with_cache`; the default (False)
+            computes it, which is always safe.
 
     Returns:
         A dictionary containing MPI metadata.
@@ -114,6 +119,8 @@ def cache_mpi_metadata(
         - `nglobal`: Global matrix size
         - `config_str`: Prepared configuration string
         - `max_nnz`: Maximum nnz across all ranks
+        - `nnz_out`: This rank's local nnz(A^T) for the transpose output, or
+          `None` when `is_symmetric` is True
     """
     from mpi4py import MPI
 
@@ -136,10 +143,12 @@ def cache_mpi_metadata(
     # Prepare config string
     config_str = amgx_config.prepare_config(config)
 
-    # Compute max_nnz across all ranks
-    # For sparse matrices (BCSR), get nnz from data array
+    # Compute max_nnz across all ranks, and capture this rank's global column
+    # indices (needed for nnz_out, the transpose output sizing).
+    # For sparse matrices (BCSR), get nnz/indices from the arrays directly.
     if hasattr(A, "data"):
         local_nnz = len(A.data)
+        local_col_indices = np.asarray(A.indices)
     elif callable(A):
         # For distributed operators, we need to use global size for proper materialization
         # The operator shape is (n_local, n_global): takes global vector, returns local portion
@@ -159,6 +168,7 @@ def cache_mpi_metadata(
         )
 
         local_nnz = len(A_materialized.data)
+        local_col_indices = np.asarray(A_materialized.indices)
     else:
         raise TypeError(
             f"Matrix A must be BCSR, BCOO, SciPy sparse, dense array, or callable. "
@@ -168,6 +178,16 @@ def cache_mpi_metadata(
     all_nnz = comm.allgather(local_nnz)
     max_nnz = max(all_nnz)
 
+    # This rank's local nnz(A^T) for the transpose output buffers (backward pass
+    # of non-symmetric solves). Symmetric solves never transpose, so skip it.
+    if is_symmetric:
+        nnz_out = None
+    else:
+        from .mpi_utils import local_transpose_nnz
+
+        recvcounts_tuple = tuple(int(s) for s in all_sizes)
+        nnz_out = local_transpose_nnz(local_col_indices, recvcounts_tuple, comm)
+
     cache_dict = {
         "recvcounts_tuple": tuple(recvcounts.tolist()),
         "displs_tuple": tuple(displs.tolist()),
@@ -176,6 +196,7 @@ def cache_mpi_metadata(
         "nglobal": nglobal,
         "config_str": config_str,
         "max_nnz": max_nnz,
+        "nnz_out": nnz_out,
     }
 
     return cache_dict

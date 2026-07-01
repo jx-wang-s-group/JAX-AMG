@@ -18,6 +18,7 @@ from .mpi_utils import (
     _amgx_allgather_impl,
     _mpi4jax_allgatherv,
     _mpi4jax_alltoallv_transpose,
+    local_transpose_nnz,
 )
 from .utils import *
 
@@ -245,6 +246,7 @@ def _get_solver_primitive_mpi(
     is_symmetric: bool = False,
     recvcounts_tuple: tuple[int, ...] | None = None,
     max_nnz: int | None = None,
+    nnz_out: int | None = None,
     return_stats: bool = False,
 ) -> Callable:
     """
@@ -257,8 +259,11 @@ def _get_solver_primitive_mpi(
     - MPI4JAX_USE_CUDA_MPI=0: Use CPU staging (copies GPU<->CPU for MPI)
 
     Args:
-        max_nnz: Maximum nnz across all ranks for transpose buffer sizing.
-                 Must be provided when using non-symmetric matrices (required for backward pass).
+        max_nnz: Maximum local nnz of A across ranks, for the transpose send
+                 buffers. Required for non-symmetric matrices (backward pass).
+        nnz_out: This rank's local nnz of A^T, for the transpose output buffers.
+                 Differs from the local nnz of A for structurally nonsymmetric
+                 patterns; required for non-symmetric matrices.
     """
 
     from mpi4py import MPI
@@ -346,10 +351,12 @@ def _get_solver_primitive_mpi(
                     "recvcounts_tuple is required for distributed transpose. "
                     "This should be provided automatically when using MPI mode."
                 )
-            if max_nnz is None:
+            if max_nnz is None or nnz_out is None:
                 raise ValueError(
-                    "max_nnz is required for distributed transpose of non-symmetric matrices. "
-                    "Ensure max_nnz is computed when creating the solver (via cache_mpi_metadata or dynamic computation)."
+                    "max_nnz and nnz_out are required for the distributed "
+                    "transpose of non-symmetric matrices. Ensure both are computed "
+                    "when creating the solver (via cache_mpi_metadata or dynamic "
+                    "computation)."
                 )
             # Order the transpose after the forward solve (it otherwise reads
             # only A); without this XLA may interleave their MPI collectives in
@@ -358,7 +365,7 @@ def _get_solver_primitive_mpi(
                 (A.data, A.indices, A.indptr, x)
             )
             at_data, at_indices, at_indptr = _mpi4jax_alltoallv_transpose(
-                a_data, a_indices, a_indptr, recvcounts_tuple, comm, max_nnz
+                a_data, a_indices, a_indptr, recvcounts_tuple, comm, max_nnz, nnz_out
             )
 
             # Reconstruct BCSR for A^T
@@ -487,6 +494,7 @@ def solve(
             # Use pre-cached MPI metadata
             recvcounts_tuple = mpi_cache["recvcounts_tuple"]
             max_nnz = mpi_cache["max_nnz"]  # Always present in cache
+            nnz_out = mpi_cache["nnz_out"]  # None when cached as symmetric
             solver = _get_solver_primitive_mpi(
                 mpi_cache["config_str"],
                 mpi_cache["nglobal"],
@@ -495,6 +503,7 @@ def solve(
                 is_symmetric=is_symmetric,
                 recvcounts_tuple=recvcounts_tuple,
                 max_nnz=max_nnz,
+                nnz_out=nnz_out,
                 return_stats=1 if save_stats_file else 0,
             )
             recvcounts = jnp.array(recvcounts_tuple, dtype=jnp.int32)
@@ -528,8 +537,10 @@ def solve(
             displs = jnp.array(displs_val)
             recvcounts_tuple = tuple(recvcounts_val.tolist())
 
-            # Compute max nnz across all ranks for buffer sizing
+            # max nnz across ranks (transpose send buffers) + this rank's local
+            # nnz(A^T) (its output buffers).
             max_nnz = max(comm.allgather(len(A_csr.data)))
+            nnz_out = local_transpose_nnz(A_csr.indices, recvcounts_tuple, comm)
 
             solver = _get_solver_primitive_mpi(
                 config_str,
@@ -539,6 +550,7 @@ def solve(
                 is_symmetric=is_symmetric,
                 recvcounts_tuple=recvcounts_tuple,
                 max_nnz=max_nnz,
+                nnz_out=nnz_out,
                 return_stats=1 if save_stats_file else 0,
             )
             (x, info), _ = solver(A_csr, b, recvcounts, displs)

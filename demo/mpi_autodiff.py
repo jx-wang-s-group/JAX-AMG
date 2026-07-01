@@ -65,7 +65,7 @@ def main():
 
     # Pre-cache MPI metadata
     mpi_cache = jaxamg.cache_mpi_metadata(
-        config, comm, n_global, (row_start, row_end), A_local
+        config, comm, n_global, (row_start, row_end), A_local, is_symmetric=True
     )
 
     # Attach MPI cache to matrix
