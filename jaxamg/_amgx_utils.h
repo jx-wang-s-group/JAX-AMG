@@ -213,7 +213,7 @@ namespace
     int nnz;
     int mode; // AMGX_Mode (dFFI vs dDDI)
     bool transpose_solve;
-    size_t structure_hash; // FNV-1a of row_ptrs content
+    size_t structure_hash; // FNV-1a of row_ptrs + col_indices content
     std::string config;
 
     bool operator==(const CacheKey &other) const
@@ -227,11 +227,14 @@ namespace
     }
   };
 
-  // FNV-1a hash of byte sequences.
-  inline size_t fnv1a_hash(const void *data, size_t len)
+  // FNV-1a hash of byte sequences. Pass `seed` (the running hash) to continue an
+  // existing digest so several buffers -- e.g. row_ptrs then col_indices -- fold
+  // into a single structure hash.
+  inline size_t fnv1a_hash(const void *data, size_t len,
+                           size_t seed = 14695981039346656037ULL)
   {
     const uint8_t *bytes = static_cast<const uint8_t *>(data);
-    size_t hash = 14695981039346656037ULL;
+    size_t hash = seed;
     for (size_t i = 0; i < len; ++i)
     {
       hash ^= bytes[i];
@@ -243,9 +246,9 @@ namespace
   struct MPICacheKey
   {
     // No device pointers: JAX eager calls get new addresses each time, causing
-    // cache thrashing. Value-based keys + structure_hash (FNV-1a of row_ptrs
-    // content) ensure stable hits and correct structural identity for
-    // AMGX_matrix_replace_coefficients on the cache-hit path.
+    // cache thrashing. Value-based keys + structure_hash (FNV-1a of row_ptrs +
+    // col_indices content) ensure stable hits and correct structural identity
+    // for AMGX_matrix_replace_coefficients on the cache-hit path.
     int n_local;
     int n_global;
     int nnz;

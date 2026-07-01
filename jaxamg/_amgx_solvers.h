@@ -158,29 +158,16 @@ namespace
     const int n_rows = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
     const int nnz = static_cast<int>(values.element_count());
 
-    // Cache the last key to skip the structure hash D2H on repeated calls.
-    static CacheKey last_key = {};
-    static bool last_key_valid = false;
+    // Hash both row_ptrs and col_indices: the cache-hit path only replaces
+    // values (AMGX_matrix_replace_coefficients), so the key must capture the full
+    // sparsity pattern for a changed pattern to miss and trigger a fresh setup.
+    std::vector<int> h_row_ptrs(n_rows + 1);
+    cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+    size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_rows + 1) * sizeof(int));
 
-    size_t structure_hash = 0;
-    bool fast_path = false;
-
-    if (last_key_valid &&
-        last_key.n_rows == n_rows &&
-        last_key.nnz == nnz &&
-        last_key.mode == static_cast<int>(Mode) &&
-        last_key.transpose_solve == (transpose_solve != 0) &&
-        last_key.config == std::string(config))
-    {
-      structure_hash = last_key.structure_hash;
-      fast_path = true;
-    }
-    else
-    {
-      std::vector<int> h_row_ptrs(n_rows + 1);
-      cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost);
-      structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_rows + 1) * sizeof(int));
-    }
+    std::vector<int> h_col_indices(nnz);
+    cudaMemcpy(h_col_indices.data(), col_indices_data, nnz * sizeof(int), cudaMemcpyDeviceToHost);
+    structure_hash = fnv1a_hash(h_col_indices.data(), nnz * sizeof(int), structure_hash);
 
     CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, structure_hash, std::string(config)};
     bool cache_hit = GetSolverCache().get(key, res);
@@ -224,9 +211,6 @@ namespace
 
       reuse_success = true;
     }
-
-    last_key = key;
-    last_key_valid = true;
 
     StatsCaptureGuard capture_guard(return_stats != 0);
 
@@ -427,28 +411,15 @@ namespace
 
     CachedResources res;
 
-    static MPICacheKey mpi_last_key = {};
-    static bool mpi_last_key_valid = false;
+    // Hash row_ptrs and the (global, int64) col_indices; see the single-GPU
+    // path for the rationale.
+    std::vector<int> h_row_ptrs(n_local + 1);
+    cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+    size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_local + 1) * sizeof(int));
 
-    size_t structure_hash = 0;
-
-    if (mpi_last_key_valid &&
-        mpi_last_key.n_local == n_local &&
-        mpi_last_key.n_global == nglobal_host &&
-        mpi_last_key.nnz == nnz &&
-        mpi_last_key.lrank == lrank_host &&
-        mpi_last_key.mode == static_cast<int>(Mode) &&
-        mpi_last_key.comm_ptr == comm_ptr_val &&
-        mpi_last_key.config == std::string(config))
-    {
-      structure_hash = mpi_last_key.structure_hash;
-    }
-    else
-    {
-      std::vector<int> h_row_ptrs(n_local + 1);
-      cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost);
-      structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_local + 1) * sizeof(int));
-    }
+    std::vector<int64_t> h_col_indices(nnz);
+    cudaMemcpy(h_col_indices.data(), col_indices_data, nnz * sizeof(int64_t), cudaMemcpyDeviceToHost);
+    structure_hash = fnv1a_hash(h_col_indices.data(), nnz * sizeof(int64_t), structure_hash);
 
     MPICacheKey key = {
         n_local,
@@ -473,9 +444,6 @@ namespace
       std::vector<T> h_x(n_local, static_cast<T>(0));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
     }
-
-    mpi_last_key = key;
-    mpi_last_key_valid = true;
 
     StatsCaptureGuard capture_guard(return_stats != 0);
 
