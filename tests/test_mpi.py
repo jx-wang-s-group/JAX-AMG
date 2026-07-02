@@ -551,3 +551,100 @@ def test_partition_operator(mpi_context):
     )
 
     jax.config.update("jax_enable_x64", False)
+
+
+@pytest.mark.mpi(min_size=3)
+def test_mpi_subcommunicator(mpi_context):
+    """The differentiable solve must run its backward collectives on the user's
+    communicator, not MPI.COMM_WORLD.
+
+    The solve runs on a subcommunicator that is a proper subset of COMM_WORLD
+    (the last rank stays idle and only rejoins at the fixture's COMM_WORLD
+    barrier). If the backward pass used COMM_WORLD it would deadlock waiting on
+    the idle rank; with the fix it uses the subcommunicator and completes, and
+    the gradient (summed over the subcommunicator) matches finite difference.
+    """
+    from mpi4py import MPI
+
+    comm, rank, nranks = mpi_context
+    jax.config.update("jax_enable_x64", True)
+
+    color = 0 if rank < nranks - 1 else MPI.UNDEFINED
+    sub = comm.Split(color, key=rank)
+    try:
+        if sub != MPI.COMM_NULL:
+            sub_rank, sub_size = sub.Get_rank(), sub.Get_size()
+            n_global = 4 * sub_size
+            b_local, _, _ = partition_vector(
+                jnp.ones(n_global, jnp.float64), sub_rank, sub_size
+            )
+
+            def loss(theta):
+                A, rs, re = tridiagonal_matrix_distributed(
+                    n_global, sub_rank, sub_size, diagonal_value=theta
+                )
+                x, _ = jaxamg.solve(
+                    A,
+                    b_local,
+                    comm=sub,
+                    nglobal=n_global,
+                    partition_info=(rs, re),
+                    solver="CG",
+                )
+                return jnp.sum(x**2)
+
+            theta = 5.0
+            g_total = sub.allreduce(float(jax.grad(loss)(theta)), op=MPI.SUM)
+
+            def total_loss(t):
+                return sub.allreduce(float(loss(t)), op=MPI.SUM)
+
+            eps = 1e-5
+            g_fd = (total_loss(theta + eps) - total_loss(theta - eps)) / (2 * eps)
+            np.testing.assert_allclose(g_total, g_fd, rtol=1e-4, atol=1e-8)
+    finally:
+        if sub != MPI.COMM_NULL:
+            sub.Free()
+        jax.config.update("jax_enable_x64", False)
+
+
+@pytest.mark.mpi(min_size=3)
+def test_mpi_multiple_communicators(mpi_context):
+    """A process may perform AmgX solves on more than one communicator in the
+    same run, and each must receive its own AmgX resources (keyed per
+    communicator) rather than sharing the first communicator's. A COMM_WORLD
+    solve is followed by a proper-subset subcommunicator solve (the last rank
+    idle), with no finalize in between; both must succeed.
+    """
+    from mpi4py import MPI
+
+    comm, rank, nranks = mpi_context
+    config = {
+        "solver": "PCG",
+        "preconditioner": {"solver": "MULTICOLOR_DILU", "max_iters": 100},
+    }
+
+    def dist_solve(c, c_rank, c_size):
+        n = 4 * c_size
+        A, rs, re = tridiagonal_matrix_distributed(n, c_rank, c_size, 4.0)
+        b, _, _ = partition_vector(jnp.ones(n), c_rank, c_size)
+        _, info = jaxamg.solve(
+            A, b, comm=c, nglobal=n, partition_info=(rs, re), config=config
+        )
+        return info
+
+    # 1. Solve on COMM_WORLD -- creates the world communicator's resources.
+    info_world = dist_solve(comm, rank, nranks)
+    assert info_world["status"] == jaxamg.AMGXStatus.SUCCESS
+
+    # 2. Solve on a proper-subset subcommunicator (last rank idle) -- must get its
+    #    own resources rather than reusing the COMM_WORLD ones.
+    color = 0 if rank < nranks - 1 else MPI.UNDEFINED
+    sub = comm.Split(color, key=rank)
+    try:
+        if sub != MPI.COMM_NULL:
+            info_sub = dist_solve(sub, sub.Get_rank(), sub.Get_size())
+            assert info_sub["status"] == jaxamg.AMGXStatus.SUCCESS
+    finally:
+        if sub != MPI.COMM_NULL:
+            sub.Free()

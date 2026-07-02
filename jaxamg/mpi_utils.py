@@ -105,6 +105,30 @@ def _mpi4jax_allgatherv(
     return jnp.concatenate(result_parts)
 
 
+# mpi4py communicators are unhashable, so the differentiable MPI primitive is
+# keyed on the communicator's integer address. This registry maps that address
+# back to the live communicator so the backward pass can run its collectives on
+# the user's communicator (possibly a subcommunicator), not MPI.COMM_WORLD.
+_COMM_BY_PTR: dict[int, "Comm"] = {}
+
+
+def register_comm(comm: "Comm") -> int:
+    """Record `comm` by its address and return that address (see _COMM_BY_PTR)."""
+    from mpi4py import MPI
+
+    ptr = MPI._addressof(comm)
+    _COMM_BY_PTR[ptr] = comm
+    return ptr
+
+
+def resolve_comm(comm_ptr: int) -> "Comm":
+    """Recover the communicator registered under `comm_ptr` (see register_comm),
+    falling back to MPI.COMM_WORLD if it was never registered."""
+    from mpi4py import MPI
+
+    return _COMM_BY_PTR.get(comm_ptr, MPI.COMM_WORLD)
+
+
 def local_transpose_nnz(
     col_indices: ArrayLike, recvcounts_tuple: tuple[int, ...], comm: "Comm"
 ) -> int:

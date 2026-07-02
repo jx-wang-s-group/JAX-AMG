@@ -122,8 +122,6 @@ def cache_mpi_metadata(
         - `nnz_out`: This rank's local nnz(A^T) for the transpose output, or
           `None` when `is_symmetric` is True
     """
-    from mpi4py import MPI
-
     rank = comm.Get_rank()
     row_start, row_end = partition_info
     n_local = row_end - row_start
@@ -135,8 +133,11 @@ def cache_mpi_metadata(
         jnp.int32
     )
 
-    # Get MPI communicator pointer and local rank
-    comm_ptr = MPI._addressof(comm)
+    from .mpi_utils import local_transpose_nnz, register_comm
+
+    # Register the communicator so the cached solver's backward pass can recover
+    # it for its collectives; comm_ptr is its address.
+    comm_ptr = register_comm(comm)
     gpu_count = jax.device_count()
     lrank = rank % gpu_count
 
@@ -183,8 +184,6 @@ def cache_mpi_metadata(
     if is_symmetric:
         nnz_out = None
     else:
-        from .mpi_utils import local_transpose_nnz
-
         recvcounts_tuple = tuple(int(s) for s in all_sizes)
         nnz_out = local_transpose_nnz(local_col_indices, recvcounts_tuple, comm)
 

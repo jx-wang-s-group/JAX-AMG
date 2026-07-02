@@ -19,6 +19,8 @@ from .mpi_utils import (
     _mpi4jax_allgatherv,
     _mpi4jax_alltoallv_transpose,
     local_transpose_nnz,
+    register_comm,
+    resolve_comm,
 )
 from .utils import *
 
@@ -266,9 +268,9 @@ def _get_solver_primitive_mpi(
                  patterns; required for non-symmetric matrices.
     """
 
-    from mpi4py import MPI
-
-    comm = MPI.COMM_WORLD
+    # Backward-pass collectives run on the user's communicator (recovered from
+    # comm_ptr), which may be a subcommunicator -- not MPI.COMM_WORLD.
+    comm = resolve_comm(comm_ptr)
 
     def allgather(
         sendbuf: ArrayLike,
@@ -512,9 +514,9 @@ def solve(
             (x, info), _ = solver(A_csr, b, recvcounts, displs)
         elif comm is not None:
             # Compute metadata dynamically
-            try:
-                from mpi4py import MPI
-            except ImportError:
+            import importlib.util
+
+            if importlib.util.find_spec("mpi4py") is None:
                 raise ImportError(
                     "mpi4py is required for MPI mode. Install it with: pip install mpi4py"
                 )
@@ -522,8 +524,9 @@ def solve(
             # Get MPI rank and compute local GPU assignment
             rank = comm.Get_rank()
             lrank = rank % jax.device_count()
-            # Get MPI communicator pointer
-            comm_ptr = MPI._addressof(comm)
+            # Register the communicator and get its address (so the backward pass
+            # can recover it for its collectives).
+            comm_ptr = register_comm(comm)
 
             # Gather partition sizes from all ranks for gradient allgather operation
             n_local = A_csr.shape[0]
