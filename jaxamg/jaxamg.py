@@ -15,9 +15,9 @@ from jax.typing import ArrayLike
 from . import config as amgx_config
 from ._ext import _amgx
 from .mpi_utils import (
-    _amgx_allgather_impl,
-    _mpi4jax_allgatherv,
     _mpi4jax_alltoallv_transpose,
+    _mpi4jax_halo_gather,
+    build_halo_plan,
     local_transpose_nnz,
     register_comm,
     resolve_comm,
@@ -249,13 +249,14 @@ def _get_solver_primitive_mpi(
     recvcounts_tuple: tuple[int, ...] | None = None,
     max_nnz: int | None = None,
     nnz_out: int | None = None,
+    n_ghost: int = 0,
     return_stats: bool = False,
 ) -> Callable:
     """
     Create cached JAX custom_vjp primitive for MPI AmgX solve.
     Supports automatic differentiation in distributed setting.
 
-    Uses mpi4jax for MPI communication (allgather, transpose).
+    Uses mpi4jax for MPI communication (transpose, backward halo exchange).
     GPU vs CPU MPI is controlled by MPI4JAX_USE_CUDA_MPI environment variable:
     - MPI4JAX_USE_CUDA_MPI=1: Use GPU-aware MPI (requires CUDA-aware MPI library)
     - MPI4JAX_USE_CUDA_MPI=0: Use CPU staging (copies GPU<->CPU for MPI)
@@ -272,24 +273,19 @@ def _get_solver_primitive_mpi(
     # comm_ptr), which may be a subcommunicator -- not MPI.COMM_WORLD.
     comm = resolve_comm(comm_ptr)
 
-    def allgather(
-        sendbuf: ArrayLike,
-        recvcounts: ArrayLike,
-        displs: ArrayLike,
-        comm_ptr_arr: ArrayLike,
-    ) -> jax.Array:
-        # Use mpi4jax for MPI communication
-        if recvcounts_tuple is not None:
-            return _mpi4jax_allgatherv(sendbuf, recvcounts_tuple, comm)
-        # Fallback to FFI-based allgather if recvcounts_tuple not available
-        return _amgx_allgather_impl(
-            sendbuf, recvcounts, displs, comm_ptr_arr, nglobal=nglobal
-        )
-
+    # The backward pass's gradient w.r.t. A needs the solution at the columns
+    # this rank's rows reference. The halo plan (col_to_combined, send_ids,
+    # recv_ghost_slot) is pattern-specific, so it flows as custom_vjp operands
+    # rather than being baked into this memoized factory; only the static ghost
+    # count n_ghost is captured here.
     @jax.custom_vjp
     def solve(
-        A: jsp.BCSR, b: jax.Array, recvcounts: jax.Array, displs: jax.Array
-    ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
+        A: jsp.BCSR,
+        b: jax.Array,
+        col_to_combined: jax.Array,
+        send_ids: jax.Array,
+        recv_ghost_slot: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
         nglobal_arr = jnp.array([nglobal], dtype=jnp.int32)
 
         # Split 64-bit comm_ptr into two int32 values for FFI
@@ -315,50 +311,36 @@ def _get_solver_primitive_mpi(
             return_stats=return_stats,
         )
 
-        return (x, info), comm_ptr_arr
+        return x, info
 
-    def fwd(
-        A: jsp.BCSR, b: jax.Array, recvcounts: jax.Array, displs: jax.Array
-    ) -> tuple[
-        tuple[tuple[jax.Array, jax.Array], jax.Array],
-        tuple[jsp.BCSR, jax.Array, jax.Array, jax.Array, jax.Array],
-    ]:
-        out = solve(A, b, recvcounts, displs)
-        (x, info), comm_ptr_arr = out
+    def fwd(A, b, col_to_combined, send_ids, recv_ghost_slot):
+        out = solve(A, b, col_to_combined, send_ids, recv_ghost_slot)
+        x, info = out
         return out, (
             A,
             x,
-            recvcounts,
-            displs,
-            comm_ptr_arr,
+            col_to_combined,
+            send_ids,
+            recv_ghost_slot,
         )
 
-    def bwd(
-        residuals: tuple[jsp.BCSR, jax.Array, jax.Array, jax.Array, jax.Array],
-        g: tuple[tuple[jax.Array, jax.Array], jax.Array],
-    ) -> tuple[jsp.BCSR, jax.Array, None, None]:
-        (g_x, _), _ = g
-        A, x, recvcounts, displs, comm_ptr_arr = residuals
+    def bwd(residuals, g):
+        g_x, _ = g
+        A, x, col_to_combined, send_ids, recv_ghost_slot = residuals
 
         # Backward solve: A^T @ adj_b = g_x
-
-        # Check if matrix is symmetric
         if is_symmetric:
-            # Skip distributed transpose
-            (adj_b, _), _ = solve(A, g_x, recvcounts, displs)
+            # Symmetric: skip the distributed transpose.
+            adj_b, _ = solve(A, g_x, col_to_combined, send_ids, recv_ghost_slot)
         else:
-            # Use mpi4jax for distributed transpose (JIT-compatible, GPU-direct when MPI4JAX_USE_CUDA_MPI=1)
-            if recvcounts_tuple is None:
+            # Distributed transpose via mpi4jax (JIT-compatible, GPU-direct when
+            # MPI4JAX_USE_CUDA_MPI=1).
+            if recvcounts_tuple is None or max_nnz is None or nnz_out is None:
                 raise ValueError(
-                    "recvcounts_tuple is required for distributed transpose. "
-                    "This should be provided automatically when using MPI mode."
-                )
-            if max_nnz is None or nnz_out is None:
-                raise ValueError(
-                    "max_nnz and nnz_out are required for the distributed "
-                    "transpose of non-symmetric matrices. Ensure both are computed "
-                    "when creating the solver (via cache_mpi_metadata or dynamic "
-                    "computation)."
+                    "recvcounts_tuple, max_nnz, and nnz_out are required for the "
+                    "distributed transpose of non-symmetric matrices. Ensure they "
+                    "are computed when creating the solver (via cache_mpi_metadata "
+                    "or dynamic computation)."
                 )
             # Order the transpose after the forward solve (it otherwise reads
             # only A); without this XLA may interleave their MPI collectives in
@@ -373,15 +355,17 @@ def _get_solver_primitive_mpi(
             # Reconstruct BCSR for A^T
             A_T = jsp.BCSR((at_data, at_indices, at_indptr), shape=A.shape)
 
-            (adj_b, _), _ = solve(A_T, g_x, recvcounts, displs)
+            adj_b, _ = solve(A_T, g_x, col_to_combined, send_ids, recv_ghost_slot)
 
-        # Gather x across all ranks for gradient computation; order it after the
-        # backward solve (same as the transpose above) so all ranks issue MPI
+        # Gradient w.r.t. A: ∂L/∂A_ij = -adj_b[i] * x[j]. Fetch only the solution
+        # entries this rank's rows reference via the halo exchange, ordered after
+        # the backward solve (same as the transpose above) so all ranks issue MPI
         # collectives in a consistent order.
         x_bar, _ = jax.lax.optimization_barrier((x, adj_b))
-        x_global = allgather(x_bar, recvcounts, displs, comm_ptr_arr)
+        x_combined = _mpi4jax_halo_gather(
+            x_bar, send_ids, recv_ghost_slot, n_ghost, comm
+        )
 
-        # Compute ∂L/∂A: ∂L/∂A_ij = -adj_b[i] * x[j]
         n_local = A.shape[0]
         row_lengths = A.indptr[1:] - A.indptr[:-1]
         row_indices = jnp.repeat(
@@ -389,10 +373,10 @@ def _get_solver_primitive_mpi(
             row_lengths,
             total_repeat_length=len(A.data),
         )
-        grad_values = -adj_b[row_indices] * x_global[A.indices.astype(jnp.int32)]
+        grad_values = -adj_b[row_indices] * x_combined[col_to_combined]
         grad_A = jsp.BCSR((grad_values, A.indices, A.indptr), shape=A.shape)
 
-        return grad_A, adj_b, None, None
+        return grad_A, adj_b, None, None, None
 
     solve.defvjp(fwd, bwd)
     return solve
@@ -497,6 +481,7 @@ def solve(
             recvcounts_tuple = mpi_cache["recvcounts_tuple"]
             max_nnz = mpi_cache["max_nnz"]  # Always present in cache
             nnz_out = mpi_cache["nnz_out"]  # None when cached as symmetric
+            halo_plan = mpi_cache["halo_plan"]
             solver = _get_solver_primitive_mpi(
                 mpi_cache["config_str"],
                 mpi_cache["nglobal"],
@@ -506,12 +491,17 @@ def solve(
                 recvcounts_tuple=recvcounts_tuple,
                 max_nnz=max_nnz,
                 nnz_out=nnz_out,
+                n_ghost=halo_plan.n_ghost,
                 return_stats=1 if save_stats_file else 0,
             )
-            recvcounts = jnp.array(recvcounts_tuple, dtype=jnp.int32)
-            displs = jnp.array(mpi_cache["displs_tuple"], dtype=jnp.int32)
 
-            (x, info), _ = solver(A_csr, b, recvcounts, displs)
+            x, info = solver(
+                A_csr,
+                b,
+                jnp.asarray(halo_plan.col_to_combined),
+                jnp.asarray(halo_plan.send_ids_2d),
+                jnp.asarray(halo_plan.recv_ghost_slot_2d),
+            )
         elif comm is not None:
             # Compute metadata dynamically
             import importlib.util
@@ -528,22 +518,29 @@ def solve(
             # can recover it for its collectives).
             comm_ptr = register_comm(comm)
 
-            # Gather partition sizes from all ranks for gradient allgather operation
+            # Gather partition sizes from all ranks (row partition + displacements)
             n_local = A_csr.shape[0]
             all_sizes_list = comm.allgather(n_local)
             recvcounts_val = np.array(all_sizes_list, dtype=np.int32)
             displs_val = np.cumsum(np.concatenate(([0], recvcounts_val[:-1]))).astype(
                 np.int32
             )
-
-            recvcounts = jnp.array(recvcounts_val)
-            displs = jnp.array(displs_val)
             recvcounts_tuple = tuple(recvcounts_val.tolist())
 
             # max nnz across ranks (transpose send buffers) + this rank's local
             # nnz(A^T) (its output buffers).
             max_nnz = max(comm.allgather(len(A_csr.data)))
             nnz_out = local_transpose_nnz(A_csr.indices, recvcounts_tuple, comm)
+
+            # Halo-exchange plan for the backward pass (fetches only the remote
+            # solution entries this rank references, instead of all-gathering).
+            row_start = int(displs_val[rank])
+            halo_plan = build_halo_plan(
+                A_csr.indices,
+                recvcounts_tuple,
+                (row_start, row_start + n_local),
+                comm,
+            )
 
             solver = _get_solver_primitive_mpi(
                 config_str,
@@ -554,9 +551,16 @@ def solve(
                 recvcounts_tuple=recvcounts_tuple,
                 max_nnz=max_nnz,
                 nnz_out=nnz_out,
+                n_ghost=halo_plan.n_ghost,
                 return_stats=1 if save_stats_file else 0,
             )
-            (x, info), _ = solver(A_csr, b, recvcounts, displs)
+            x, info = solver(
+                A_csr,
+                b,
+                jnp.asarray(halo_plan.col_to_combined),
+                jnp.asarray(halo_plan.send_ids_2d),
+                jnp.asarray(halo_plan.recv_ghost_slot_2d),
+            )
 
     else:
         # Single-GPU mode: use int32 indices

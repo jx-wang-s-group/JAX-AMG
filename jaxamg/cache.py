@@ -121,6 +121,8 @@ def cache_mpi_metadata(
         - `max_nnz`: Maximum nnz across all ranks
         - `nnz_out`: This rank's local nnz(A^T) for the transpose output, or
           `None` when `is_symmetric` is True
+        - `halo_plan`: Backward-pass halo-exchange plan for the gradient w.r.t.
+          A (fetches only referenced remote solution entries)
     """
     rank = comm.Get_rank()
     row_start, row_end = partition_info
@@ -133,7 +135,7 @@ def cache_mpi_metadata(
         jnp.int32
     )
 
-    from .mpi_utils import local_transpose_nnz, register_comm
+    from .mpi_utils import build_halo_plan, local_transpose_nnz, register_comm
 
     # Register the communicator so the cached solver's backward pass can recover
     # it for its collectives; comm_ptr is its address.
@@ -179,13 +181,21 @@ def cache_mpi_metadata(
     all_nnz = comm.allgather(local_nnz)
     max_nnz = max(all_nnz)
 
+    recvcounts_tuple = tuple(int(s) for s in all_sizes)
+
     # This rank's local nnz(A^T) for the transpose output buffers (backward pass
     # of non-symmetric solves). Symmetric solves never transpose, so skip it.
     if is_symmetric:
         nnz_out = None
     else:
-        recvcounts_tuple = tuple(int(s) for s in all_sizes)
         nnz_out = local_transpose_nnz(local_col_indices, recvcounts_tuple, comm)
+
+    # Backward-pass halo plan: fetches only the remote solution entries this
+    # rank's rows reference for the gradient w.r.t. A, instead of gathering the
+    # full global solution. Needed for both symmetric and non-symmetric matrices.
+    halo_plan = build_halo_plan(
+        local_col_indices, recvcounts_tuple, partition_info, comm
+    )
 
     cache_dict = {
         "recvcounts_tuple": tuple(recvcounts.tolist()),
@@ -196,6 +206,7 @@ def cache_mpi_metadata(
         "config_str": config_str,
         "max_nnz": max_nnz,
         "nnz_out": nnz_out,
+        "halo_plan": halo_plan,
     }
 
     return cache_dict
