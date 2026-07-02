@@ -27,6 +27,23 @@ namespace ffi = xla::ffi;
 namespace
 {
 
+  // Reused cuSPARSE handle for the single-GPU transpose: created once and reused
+  // (stream rebound per call), avoiding a create/destroy on every backward pass.
+  // Left to be reclaimed at process exit (a single handle, independent of AmgX).
+  inline cusparseHandle_t GetCusparseHandle()
+  {
+    static cusparseHandle_t handle = []()
+    {
+      cusparseHandle_t h = nullptr;
+      if (cusparseCreate(&h) != CUSPARSE_STATUS_SUCCESS)
+      {
+        h = nullptr;
+      }
+      return h;
+    }();
+    return handle;
+  }
+
   template <typename T>
   inline const char *CsrTransposeDevice(cudaStream_t stream,
                                         int n_rows,
@@ -38,14 +55,13 @@ namespace
                                         int *col_indices_t,
                                         T *values_t)
   {
-    cusparseHandle_t handle = nullptr;
-    if (cusparseCreate(&handle) != CUSPARSE_STATUS_SUCCESS)
+    cusparseHandle_t handle = GetCusparseHandle();
+    if (handle == nullptr)
     {
       return "cusparseCreate failed";
     }
     if (cusparseSetStream(handle, stream) != CUSPARSE_STATUS_SUCCESS)
     {
-      cusparseDestroy(handle);
       return "cusparseSetStream failed";
     }
 
@@ -69,14 +85,12 @@ namespace
         &buffer_size);
     if (status != CUSPARSE_STATUS_SUCCESS)
     {
-      cusparseDestroy(handle);
       return "cusparseCsr2cscEx2_bufferSize failed";
     }
 
     void *workspace = nullptr;
     if (buffer_size > 0 && cudaMalloc(&workspace, buffer_size) != cudaSuccess)
     {
-      cusparseDestroy(handle);
       return "cudaMalloc failed for cusparse transpose workspace";
     }
 
@@ -98,7 +112,6 @@ namespace
         workspace);
 
     cudaFree(workspace);
-    cusparseDestroy(handle);
 
     if (status != CUSPARSE_STATUS_SUCCESS)
     {
