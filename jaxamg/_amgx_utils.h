@@ -227,18 +227,36 @@ namespace
     }
   };
 
-  // FNV-1a hash of byte sequences. Pass `seed` (the running hash) to continue an
-  // existing digest so several buffers -- e.g. row_ptrs then col_indices -- fold
-  // into a single structure hash.
+  // Word-wise FNV-1a-style hash: four lanes break the multiply dependency chain
+  // so hashing the structure (row_ptrs + col_indices, hundreds of MB at n~1e7)
+  // isn't a bottleneck on repeated solves. Not canonical FNV-1a but a
+  // deterministic, content-sensitive digest, which is all the cache key needs.
+  // Pass `seed` to chain buffers into one digest; inputs are >=4-byte aligned.
   inline size_t fnv1a_hash(const void *data, size_t len,
                            size_t seed = 14695981039346656037ULL)
   {
+    constexpr size_t PRIME = 1099511628211ULL;
     const uint8_t *bytes = static_cast<const uint8_t *>(data);
-    size_t hash = seed;
-    for (size_t i = 0; i < len; ++i)
+    const uint32_t *words = static_cast<const uint32_t *>(data);
+    const size_t nwords = len / 4;
+    size_t h0 = seed, h1 = seed ^ 0x9e3779b97f4a7c15ULL,
+           h2 = seed + 1ULL, h3 = seed ^ 0xff51afd7ed558ccdULL;
+    size_t i = 0;
+    for (; i + 4 <= nwords; i += 4)
     {
-      hash ^= bytes[i];
-      hash *= 1099511628211ULL;
+      h0 = (h0 ^ words[i]) * PRIME;
+      h1 = (h1 ^ words[i + 1]) * PRIME;
+      h2 = (h2 ^ words[i + 2]) * PRIME;
+      h3 = (h3 ^ words[i + 3]) * PRIME;
+    }
+    size_t hash = (h0 * PRIME) ^ (h1 * PRIME) ^ (h2 * PRIME) ^ (h3 * PRIME);
+    for (; i < nwords; ++i)
+    {
+      hash = (hash ^ words[i]) * PRIME;
+    }
+    for (size_t b = nwords * 4; b < len; ++b)
+    {
+      hash = (hash ^ bytes[b]) * PRIME;
     }
     return hash;
   }

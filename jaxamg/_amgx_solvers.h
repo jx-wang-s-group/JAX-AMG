@@ -171,15 +171,21 @@ namespace
     const int n_rows = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
     const int nnz = static_cast<int>(values.element_count());
 
-    // Hash both row_ptrs and col_indices: the cache-hit path only replaces
-    // values (AMGX_matrix_replace_coefficients), so the key must capture the full
-    // sparsity pattern for a changed pattern to miss and trigger a fresh setup.
-    std::vector<int> h_row_ptrs(n_rows + 1);
-    cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+    // The cache-hit path only replaces coefficient values, so the key must
+    // capture the full sparsity pattern (row_ptrs + col_indices) for a changed
+    // pattern to miss and trigger a fresh setup. Reuse host buffers across calls
+    // to avoid reallocating these large arrays on every solve.
+    static thread_local std::vector<int> h_row_ptrs, h_col_indices;
+    if (static_cast<int>(h_row_ptrs.size()) < n_rows + 1)
+      h_row_ptrs.resize(n_rows + 1);
+    if (static_cast<int>(h_col_indices.size()) < nnz)
+      h_col_indices.resize(nnz);
+    cudaMemcpyAsync(h_row_ptrs.data(), row_ptrs_data,
+                    (n_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_col_indices.data(), col_indices_data,
+                    nnz * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
     size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_rows + 1) * sizeof(int));
-
-    std::vector<int> h_col_indices(nnz);
-    cudaMemcpy(h_col_indices.data(), col_indices_data, nnz * sizeof(int), cudaMemcpyDeviceToHost);
     structure_hash = fnv1a_hash(h_col_indices.data(), nnz * sizeof(int), structure_hash);
 
     CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, structure_hash, std::string(config)};
@@ -425,13 +431,20 @@ namespace
     CachedResources res;
 
     // Hash row_ptrs and the (global, int64) col_indices; see the single-GPU
-    // path for the rationale.
-    std::vector<int> h_row_ptrs(n_local + 1);
-    cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+    // path for the rationale. Reuse host buffers across calls to avoid
+    // reallocating these large arrays on every solve.
+    static thread_local std::vector<int> h_row_ptrs;
+    static thread_local std::vector<int64_t> h_col_indices;
+    if (static_cast<int>(h_row_ptrs.size()) < n_local + 1)
+      h_row_ptrs.resize(n_local + 1);
+    if (static_cast<int>(h_col_indices.size()) < nnz)
+      h_col_indices.resize(nnz);
+    cudaMemcpyAsync(h_row_ptrs.data(), row_ptrs_data,
+                    (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_col_indices.data(), col_indices_data,
+                    nnz * sizeof(int64_t), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
     size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_local + 1) * sizeof(int));
-
-    std::vector<int64_t> h_col_indices(nnz);
-    cudaMemcpy(h_col_indices.data(), col_indices_data, nnz * sizeof(int64_t), cudaMemcpyDeviceToHost);
     structure_hash = fnv1a_hash(h_col_indices.data(), nnz * sizeof(int64_t), structure_hash);
 
     MPICacheKey key = {
