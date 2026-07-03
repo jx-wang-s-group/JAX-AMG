@@ -648,3 +648,116 @@ def test_mpi_multiple_communicators(mpi_context):
     finally:
         if sub != MPI.COMM_NULL:
             sub.Free()
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_amg_preconditioner(mpi_context):
+    """Distributed solve with the classical-AMG preconditioner.
+
+    Covers the distributed classical-AMG upload path (an explicit contiguous
+    partition vector plus the 32-bit global-index upload,
+    ``AMGX_matrix_upload_all_global_32``) that a correct multi-rank classical-AMG
+    hierarchy requires. The other MPI tests use DILU/Jacobi/plain-CG, which do not
+    build the AMG halo this path sets up, so this is the only coverage of it.
+    A single AMG solve, so it does not depend on any AmgX-internal repeated-solve
+    behavior.
+    """
+    comm, rank, nranks = mpi_context
+
+    grid_size = 16
+    n = grid_size**2
+
+    A_local, row_start, row_end = poisson_matrix_distributed(
+        grid_size, grid_size, rank, nranks
+    )
+    b_global = rhs_linear(n)
+    b_local, _, _ = partition_vector(b_global, rank, nranks)
+
+    x_local, info = jaxamg.solve(
+        A_local,
+        b_local,
+        comm=comm,
+        nglobal=n,
+        partition_info=(row_start, row_end),
+        solver="PCG",
+        preconditioner={"solver": "AMG"},
+        tolerance=1e-8,
+        max_iters=200,
+    )
+    x = gather_vector(x_local, comm, root=0)
+
+    assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+    if rank == 0:
+        A_global = poisson_matrix(grid_size)
+        # float32 AMG: residual plateaus near single precision, so 1e-4.
+        np.testing.assert_allclose(A_global @ x, b_global, atol=1e-4)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_repeated_solve_warm_cache(mpi_context):
+    """Repeated distributed solves of the same sparsity pattern reuse the cached
+    per-communicator matrix structure and solver (the warm path:
+    ``AMGX_matrix_replace_coefficients`` + ``AMGX_solver_resetup`` over cache-owned
+    structure buffers). Two invariants:
+
+    1. Solving the identical system three times returns the same correct solution
+       every time (the warm path must be deterministic; no cross-solve drift).
+    2. Solving a value-scaled system with the same pattern (a cache hit) must
+       install the new coefficients, so 2A x = b gives x scaled by 1/2 -- not a
+       silent reuse of the previous matrix.
+
+    Uses a non-AMG preconditioner and a small matrix, so it exercises the JAX
+    warm-path logic without depending on any AmgX-internal behavior.
+    """
+    import jax.experimental.sparse as jsp
+
+    comm, rank, nranks = mpi_context
+
+    grid_size = 16
+    n = grid_size**2
+    A_local, row_start, row_end = poisson_matrix_distributed(
+        grid_size, grid_size, rank, nranks
+    )
+    b_global = rhs_linear(n)
+    b_local, _, _ = partition_vector(b_global, rank, nranks)
+
+    solve_kwargs = dict(
+        comm=comm,
+        nglobal=n,
+        partition_info=(row_start, row_end),
+        solver="PCG",
+        preconditioner={"solver": "MULTICOLOR_DILU", "max_iters": 50},
+        tolerance=1e-8,
+        max_iters=300,
+    )
+
+    # (1) Identical system solved three times -> warm-path (cache-hit) reuse must
+    #     be correct and deterministic across repeats.
+    solutions = []
+    for _ in range(3):
+        x_local, info = jaxamg.solve(A_local, b_local, **solve_kwargs)
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+        solutions.append(gather_vector(x_local, comm, root=0))
+
+    # (2) Same pattern, scaled values (still a cache hit) -> replace_coefficients
+    #     must install the new values, so the solution scales by 1/2.
+    A_scaled = jsp.BCSR(
+        (A_local.data * 2.0, A_local.indices, A_local.indptr), shape=A_local.shape
+    )
+    x_local, info = jaxamg.solve(A_scaled, b_local, **solve_kwargs)
+    assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+    x_scaled = gather_vector(x_local, comm, root=0)
+
+    if rank == 0:
+        A_global = poisson_matrix(grid_size)
+        # float32 residuals plateau near single precision, so 1e-4.
+        for x in solutions:
+            np.testing.assert_allclose(A_global @ x, b_global, atol=1e-4)
+        # No warm-path drift: repeats agree far tighter than any real drift
+        # (the corruption this guards against changes the solution by O(1)).
+        np.testing.assert_allclose(solutions[1], solutions[0], atol=1e-5)
+        np.testing.assert_allclose(solutions[2], solutions[0], atol=1e-5)
+        # New coefficients really took effect: (2A) x = b  =>  A x = b / 2, and
+        # x = x0 / 2 rather than a silent reuse of the first matrix.
+        np.testing.assert_allclose(A_global @ x_scaled, 0.5 * b_global, atol=1e-4)
+        np.testing.assert_allclose(x_scaled, 0.5 * solutions[0], atol=1e-4)
