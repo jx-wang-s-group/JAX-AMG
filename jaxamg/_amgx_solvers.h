@@ -461,7 +461,11 @@ namespace
 
     if (cache_hit)
     {
-      cudaMemcpy(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice);
+      // Warm path: replace coefficients and re-setup, reusing the cached
+      // structure and AMG hierarchy. The D2D copy is asynchronous; synchronize
+      // before AMGX reads values_buf.
+      cudaMemcpyAsync(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+      cudaStreamSynchronize(stream);
       AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
           res.A, n_local, nnz, res.values_buf, nullptr));
 
@@ -495,19 +499,47 @@ namespace
       AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, Mode, res.cfg));
 
-      if (cudaMalloc(&res.values_buf, nnz * sizeof(T)) != cudaSuccess)
+      // Copy the matrix into cache-owned buffers. The cached distributed matrix
+      // and the warm-path AMGX_matrix_replace_coefficients reference these across
+      // solves, whereas the XLA inputs are released after this call. col_indices
+      // is narrowed to int32 (the low 4 bytes of each int64; valid since global
+      // indices are < nglobal_host, an int) for the 32-bit upload path below.
+      if (cudaMalloc(&res.values_buf, nnz * sizeof(T)) != cudaSuccess ||
+          cudaMalloc(&res.row_ptrs_buf, (n_local + 1) * sizeof(int)) != cudaSuccess ||
+          cudaMalloc(&res.col_indices_buf, nnz * sizeof(int)) != cudaSuccess)
       {
-        return ffi::Error::Internal("cudaMalloc for values buffer failed");
+        return ffi::Error::Internal("cudaMalloc for MPI matrix buffers failed");
       }
-      cudaMemcpy(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice);
+      cudaMemcpyAsync(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(res.row_ptrs_buf, row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpy2DAsync(res.col_indices_buf, sizeof(int), col_indices_data, sizeof(int64_t),
+                        sizeof(int), nnz, cudaMemcpyDeviceToDevice, stream);
+      cudaStreamSynchronize(stream);
 
+      // Contiguous row partition (owning rank per global row), required for AMGX
+      // to build the multi-ring halo (classical AMG uses 2 rings).
+      int nranks_host = 1;
+      MPI_Comm_size(*mpi_comm, &nranks_host);
+      std::vector<int> counts(nranks_host);
+      int n_local_send = n_local;
+      if (MPI_Allgather(&n_local_send, 1, MPI_INT, counts.data(), 1, MPI_INT,
+                        *mpi_comm) != MPI_SUCCESS)
+        return ffi::Error::Internal("MPI_Allgather of local sizes failed");
+      std::vector<int> partition_vector(nglobal_host);
+      for (int r = 0, off = 0; r < nranks_host; ++r)
+        for (int i = 0; i < counts[r] && off < nglobal_host; ++i)
+          partition_vector[off++] = r;
+
+      // 32-bit index upload path; the 64-bit AMGX_matrix_upload_all_global
+      // produces a diverging AMG hierarchy at >= 4 ranks.
       int nrings = 1;
       AMGX_SAFE_CALL(AMGX_config_get_default_number_of_rings(res.cfg, &nrings));
-
-      AMGX_SAFE_CALL(AMGX_matrix_upload_all_global(
+      AMGX_SAFE_CALL(AMGX_matrix_upload_all_global_32(
           res.A, nglobal_host, n_local, nnz, 1, 1,
-          row_ptrs_data, col_indices_data, static_cast<T *>(res.values_buf), nullptr,
-          nrings, nrings, nullptr));
+          static_cast<int *>(res.row_ptrs_buf),
+          static_cast<int *>(res.col_indices_buf),
+          static_cast<T *>(res.values_buf), nullptr,
+          nrings, nrings, partition_vector.data()));
 
       AMGX_SAFE_CALL(AMGX_vector_create(&res.x_vec, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_vector_create(&res.b_vec, res.rsrc, Mode));

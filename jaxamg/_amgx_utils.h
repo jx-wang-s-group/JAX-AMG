@@ -342,6 +342,8 @@ namespace
     AMGX_vector_handle x_vec = nullptr;
     AMGX_vector_handle b_vec = nullptr;
     void *values_buf = nullptr;            // MPI replace_coefficients buffer (null for non-MPI)
+    void *row_ptrs_buf = nullptr;          // MPI: cache-owned copy of local row_ptrs (see cold path)
+    void *col_indices_buf = nullptr;       // MPI: cache-owned int32 copy of local global col_indices
     void *transpose_row_ptrs = nullptr;    // transpose_solve mode only
     void *transpose_col_indices = nullptr; // transpose_solve mode only
     void *transpose_values = nullptr;      // transpose_solve mode only
@@ -415,6 +417,8 @@ namespace
       // owned by Global{MPI}Resources and destroyed in its Destroy().
       // Non-founding configs are tiny and cleaned up at process exit.
       if (res.values_buf) cudaFree(res.values_buf);
+      if (res.row_ptrs_buf) cudaFree(res.row_ptrs_buf);
+      if (res.col_indices_buf) cudaFree(res.col_indices_buf);
       if (res.transpose_row_ptrs) cudaFree(res.transpose_row_ptrs);
       if (res.transpose_col_indices) cudaFree(res.transpose_col_indices);
       if (res.transpose_values) cudaFree(res.transpose_values);
