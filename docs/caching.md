@@ -87,6 +87,13 @@ This setup-reuse path is substantially cheaper than a cold start while remaining
 correct for any change in coefficient values, making cache reuse safe for workloads
 where coefficients change between solves (including optimization and time-stepping).
 
+For repeated solves where reusing the existing AMG hierarchy is acceptable, pass
+`reuse_setup=True` to `jaxamg.solve(...)`. This still refreshes the fine-level
+matrix values, but skips `AMGX_solver_resetup` on cache hits. It can reduce the
+per-solve cost further, but the reused hierarchy may be less effective for the
+new values; if coefficients change enough, convergence may require more
+iterations or become less robust. If that happens, call
+`jaxamg.clear_solver_cache()` to force the next solve to build a fresh hierarchy.
 
 ## Cache inspection
 
