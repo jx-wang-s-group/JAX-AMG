@@ -5,13 +5,17 @@ This module provides common sparse matrix patterns and right-hand-side
 vector generators for testing and demonstration purposes.
 """
 
+import tarfile
 from collections.abc import Callable
+from pathlib import Path
 from typing import cast
+from urllib.request import urlretrieve
 
 import jax
 import jax.experimental.sparse as jsp
 import jax.numpy as jnp
 import numpy as np
+import scipy.io
 import scipy.sparse as sp
 from jax.typing import DTypeLike
 
@@ -779,3 +783,64 @@ def rhs_random(n: int, seed: int = 0, dtype: DTypeLike | None = None) -> jax.Arr
     """
     key = jax.random.PRNGKey(seed)
     return jax.random.normal(key, (n,), dtype=dtype)
+
+
+def download_suitesparse_matrix(
+    name: str,
+    group: str | None = None,
+    cache_dir: str | Path | None = None,
+    dtype: DTypeLike | None = None,
+    base_url: str = "https://sparse.tamu.edu/MM",
+) -> sp.csr_matrix:
+    """Download a SuiteSparse Matrix Collection matrix and return it as CSR.
+
+    Args:
+        name: Matrix name, or ``"group/name"``.
+        group: SuiteSparse group name. Optional if included in ``name``.
+        cache_dir: Directory for downloaded archives and extracted files.
+        dtype: Optional dtype for matrix values.
+        base_url: SuiteSparse Matrix Market archive base URL.
+
+    Returns:
+        SciPy CSR matrix.
+    """
+    if group is None:
+        if "/" not in name:
+            raise ValueError("Pass group='...' or use name='group/matrix'.")
+        group, name = name.split("/", 1)
+
+    cache_root = (
+        Path(cache_dir).expanduser()
+        if cache_dir is not None
+        else Path.home() / ".cache" / "jaxamg" / "suitesparse"
+    )
+    matrix_dir = cache_root / group / name
+    archive_path = matrix_dir / f"{name}.tar.gz"
+    matrix_path = matrix_dir / f"{name}.mtx"
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+
+    if not matrix_path.exists():
+        if not archive_path.exists():
+            url = f"{base_url.rstrip('/')}/{group}/{name}.tar.gz"
+            urlretrieve(url, archive_path)
+
+        with tarfile.open(archive_path, "r:gz") as archive:
+            member = next(
+                (m for m in archive.getmembers() if Path(m.name).name == f"{name}.mtx"),
+                None,
+            )
+            if member is None:
+                raise FileNotFoundError(f"{name}.mtx not found in {archive_path}")
+            source = archive.extractfile(member)
+            if source is None:
+                raise FileNotFoundError(f"{name}.mtx could not be read from archive")
+            with matrix_path.open("wb") as target:
+                target.write(source.read())
+
+    matrix = scipy.io.mmread(matrix_path)
+    if not sp.issparse(matrix):
+        matrix = sp.coo_matrix(matrix)
+    matrix = matrix.tocsr()
+    if dtype is not None:
+        matrix = matrix.astype(dtype)
+    return matrix
