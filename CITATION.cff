@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software in your work, please cite the following paper."
+title: "JAX-AMG"
+authors:
+  - family-names: Liu
+    given-names: Yi
+  - family-names: Fan
+    given-names: Xiantao
+  - family-names: Wang
+    given-names: Jian-Xun
+preferred-citation:
+  type: article
+  title: "JAX-AMG: A GPU-Accelerated Differentiable Sparse Linear Solver Library for JAX"
+  authors:
+    - family-names: Liu
+      given-names: Yi
+    - family-names: Fan
+      given-names: Xiantao
+    - family-names: Wang
+      given-names: Jian-Xun
+  year: 2026
+  doi: "10.48550/arXiv.2606.09001"
+  url: "https://arxiv.org/abs/2606.09001"
