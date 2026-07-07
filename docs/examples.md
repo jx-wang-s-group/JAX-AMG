@@ -498,7 +498,7 @@ mpirun -n <num_procs> python your_script.py
     ```python
     from mpi4py import MPI
     import jaxamg
-    from jaxamg.mpi_utils import partition_vector, gather_solution
+    from jaxamg.mpi_utils import partition_vector, gather_vector
     from jaxamg.matrices import poisson_matrix_distributed, rhs_ones
 
     comm = MPI.COMM_WORLD
@@ -522,7 +522,7 @@ mpirun -n <num_procs> python your_script.py
         },
     )
 
-    x_global = gather_solution(x_local, comm, root=0)
+    x_global = gather_vector(x_local, comm, root=0)
     if rank == 0:
         print(f"Solution: {x_global}")
         print(f"Iterations: {info['iterations']}")
@@ -554,7 +554,7 @@ Each rank computes local loss/gradient, then uses MPI reductions to form global 
     from mpi4py import MPI
     import jaxamg
     from jaxamg.matrices import tridiagonal_matrix_distributed, rhs_ones, rhs_linear
-    from jaxamg.mpi_utils import gather_solution
+    from jaxamg.mpi_utils import gather_vector
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -598,7 +598,7 @@ Each rank computes local loss/gradient, then uses MPI reductions to form global 
 
     comm.Barrier()
     x_loc, _ = jaxamg.solve(A_loc, b_loc)
-    x_global = gather_solution(x_loc, comm, root=0)
+    x_global = gather_vector(x_loc, comm, root=0)
     if rank == 0:
         print(f"Relative error: {jnp.linalg.norm(x_global - x_target_global) / jnp.linalg.norm(x_target_global)}")
 

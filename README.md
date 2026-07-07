@@ -72,7 +72,7 @@ A distributed 2D Poisson system can be solved with GPU-aware MPI as:
 ```python
 from mpi4py import MPI
 import jaxamg
-from jaxamg.mpi_utils import partition_vector, gather_solution
+from jaxamg.mpi_utils import partition_vector, gather_vector
 from jaxamg.matrices import poisson_matrix_distributed, rhs_ones
 
 comm = MPI.COMM_WORLD
@@ -98,7 +98,7 @@ x_local, info = jaxamg.solve(
 )
 
 # Gather solution at root rank
-x_global = gather_solution(x_local, comm, root=0)
+x_global = gather_vector(x_local, comm, root=0)
 if rank == 0: print(x_global)
 ```
 

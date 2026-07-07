@@ -39,7 +39,7 @@ Example:
 from mpi4py import MPI
 import jaxamg
 from jaxamg.matrices import poisson_matrix_distributed, rhs_ones
-from jaxamg.mpi_utils import partition_vector, gather_solution
+from jaxamg.mpi_utils import partition_vector, gather_vector
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
@@ -67,7 +67,7 @@ x_local, info = jaxamg.solve(
 )
 
 # Gather solution
-x_global = gather_solution(x_local, comm, root=0)
+x_global = gather_vector(x_local, comm, root=0)
 if rank == 0: print(f"Soluton: {x_global}")
 
 # Finalization
