@@ -1,5 +1,5 @@
 """
-Deo: MPI-distributed automatic differentiation.
+Demo: MPI-distributed automatic differentiation.
 
 Demonstrates that gradients computed via MPI-distributed solver match
 the single-GPU reference implementation.

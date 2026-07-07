@@ -5,6 +5,7 @@ import jax.experimental.sparse as jsp
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import scipy.io
 import scipy.sparse.linalg as spla
 
 import jaxamg
@@ -13,6 +14,7 @@ from jaxamg import config as amgx_config
 from jaxamg.jaxamg import _amgx_solve_impl
 from jaxamg.matrices import (
     convection_diffusion_matrix_2d,
+    download_suitesparse_matrix,
     poisson_matrix,
     rhs_ones,
     tridiagonal_matrix,
@@ -462,3 +464,32 @@ class TestSolver:
         # Each solution must satisfy its own system.
         np.testing.assert_allclose(A1 @ np.asarray(x1), np.asarray(b), atol=1e-4)
         np.testing.assert_allclose(A2 @ np.asarray(x2), np.asarray(b), atol=1e-4)
+
+    def test_download_suitesparse_matrix_from_cache(self, tmp_path):
+        """SuiteSparse helper should load a cached Matrix Market tarball."""
+        import tarfile
+
+        group = "TestGroup"
+        name = "toy"
+        matrix_dir = tmp_path / group / name
+        matrix_dir.mkdir(parents=True)
+
+        A = scipy.sparse.csr_matrix(
+            np.array([[2.0, 0.0, -1.0], [0.0, 3.0, 4.0]], dtype=np.float64)
+        )
+        source_dir = tmp_path / "source" / name
+        source_dir.mkdir(parents=True)
+        source_mtx = source_dir / f"{name}.mtx"
+        scipy.io.mmwrite(source_mtx, A)
+
+        archive_path = matrix_dir / f"{name}.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            archive.add(source_mtx, arcname=f"{name}/{name}.mtx")
+
+        loaded = download_suitesparse_matrix(
+            f"{group}/{name}", cache_dir=tmp_path, dtype=np.float32
+        )
+
+        assert scipy.sparse.isspmatrix_csr(loaded)
+        assert loaded.dtype == np.float32
+        np.testing.assert_allclose(loaded.toarray(), A.astype(np.float32).toarray())
