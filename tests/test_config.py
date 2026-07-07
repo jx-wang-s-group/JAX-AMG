@@ -157,3 +157,86 @@ def test_prepare_config_nested_kwargs_override():
     )
     solver_cfg = json.loads(cfg)["solver"]
     assert solver_cfg["max_iters"] == 7
+
+
+def test_prepare_config_rejects_mpi_dilu_tiny_coarse_grid():
+    """Catch the distributed DILU/deep-coarsening config before AmgX crashes."""
+    config = {
+        "solver": "FGMRES",
+        "preconditioner": {
+            "solver": "AMG",
+            "smoother": {"solver": "MULTICOLOR_DILU"},
+        },
+    }
+
+    with pytest.raises(ValueError, match="MULTICOLOR_DILU"):
+        prepare_config(config, mpi=True)
+
+    # The same config remains allowed for single-GPU mode.
+    prepare_config(config, mpi=False)
+
+
+def test_prepare_config_allows_mpi_dilu_with_coarse_floor():
+    """A non-degenerate coarse floor avoids the known distributed DILU failure."""
+    cfg = prepare_config(
+        {
+            "solver": "FGMRES",
+            "preconditioner": {
+                "solver": "AMG",
+                "smoother": {"solver": "MULTICOLOR_DILU"},
+                "dense_lu_num_rows": 64,
+                "min_coarse_rows": 64,
+            },
+        },
+        mpi=True,
+    )
+    p = json.loads(cfg)["solver"]["preconditioner"]
+
+    assert p["smoother"]["solver"] == "MULTICOLOR_DILU"
+    assert p["dense_lu_num_rows"] == 64
+
+
+@pytest.mark.parametrize(
+    "config, message",
+    [
+        ({"communicator": "BAD"}, "communicator"),
+        ({"max_iters": 0}, "max_iters"),
+        ({"tolerance": 0.0}, "tolerance"),
+        (
+            {"solver": "GMRES", "gmres_n_restart": 0},
+            "gmres_n_restart",
+        ),
+        (
+            {"preconditioner": {"solver": "AMG", "max_levels": 0}},
+            "max_levels",
+        ),
+        (
+            {"preconditioner": {"solver": "AMG", "presweeps": -1}},
+            "presweeps",
+        ),
+        (
+            {"preconditioner": {"solver": "AMG", "smoother": ["JACOBI_L1"]}},
+            "smoother",
+        ),
+    ],
+)
+def test_prepare_config_rejects_invalid_config_values(config, message):
+    """Config validation should catch common malformed values before AmgX."""
+    with pytest.raises((TypeError, ValueError), match=message):
+        prepare_config(config)
+
+
+def test_prepare_config_rejects_mpi_dilu_tiny_min_coarse_rows():
+    """DILU MPI validation also catches an explicit degenerate min_coarse_rows."""
+    config = {
+        "solver": "FGMRES",
+        "preconditioner": {
+            "solver": "AMG",
+            "smoother": {"solver": "MULTICOLOR_DILU"},
+            "dense_lu_num_rows": 64,
+            "min_coarse_rows": 1,
+        },
+    }
+
+    with pytest.raises(ValueError, match="MULTICOLOR_DILU"):
+        prepare_config(config, mpi=True)

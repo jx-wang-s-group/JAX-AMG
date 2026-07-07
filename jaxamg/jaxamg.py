@@ -463,7 +463,10 @@ def solve(
         config_str = mpi_cache["config_str"]
     else:
         config_str = amgx_config.prepare_config(
-            config, save_stats=(save_stats_file is not None), **kwargs
+            config,
+            save_stats=(save_stats_file is not None),
+            mpi=(comm is not None),
+            **kwargs,
         )
 
     # Detect desired precision

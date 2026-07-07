@@ -144,7 +144,7 @@ def cache_mpi_metadata(
     lrank = rank % gpu_count
 
     # Prepare config string
-    config_str = amgx_config.prepare_config(config)
+    config_str = amgx_config.prepare_config(config, mpi=True)
 
     # Compute max_nnz across all ranks, and capture this rank's global column
     # indices (needed for nnz_out, the transpose output sizing).
