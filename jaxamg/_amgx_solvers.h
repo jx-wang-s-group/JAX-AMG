@@ -140,7 +140,8 @@ namespace
                                       ffi::ResultBuffer<DType> stats,
                                       std::string_view config,
                                       int32_t transpose_solve,
-                                      int32_t return_stats)
+                                      int32_t return_stats,
+                                      int32_t reuse_setup)
   {
     EnsureAmgxInitialized();
 
@@ -224,7 +225,9 @@ namespace
             res.A, n_rows, (int)values.element_count(), values_data, nullptr));
       }
 
-      AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
+      // reuse_setup keeps the existing hierarchy while still refreshing the fine matrix.
+      if (!reuse_setup)
+        AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
       AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
 
@@ -383,7 +386,8 @@ namespace
                                          ffi::ResultBuffer<DType> stats,
                                          std::string_view config,
                                          int32_t transpose_solve,
-                                         int32_t return_stats)
+                                         int32_t return_stats,
+                                         int32_t reuse_setup)
   {
     if (transpose_solve != 0)
     {
@@ -461,15 +465,16 @@ namespace
 
     if (cache_hit)
     {
-      // Warm path: replace coefficients and re-setup, reusing the cached
-      // structure and AMG hierarchy. The D2D copy is asynchronous; synchronize
-      // before AMGX reads values_buf.
+      // Refresh the cached matrix values. The D2D copy is asynchronous;
+      // synchronize before AMGX reads values_buf.
       cudaMemcpyAsync(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice, stream);
       cudaStreamSynchronize(stream);
       AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
           res.A, n_local, nnz, res.values_buf, nullptr));
 
-      AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
+      // reuse_setup keeps the existing hierarchy while still refreshing the fine matrix.
+      if (!reuse_setup)
+        AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
       std::vector<T> h_x(n_local, static_cast<T>(0));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
@@ -602,10 +607,11 @@ namespace
                                   ffi::ResultBuffer<ffi::DataType::F32> stats,
                                   std::string_view config,
                                   int32_t transpose_solve,
-                                  int32_t return_stats)
+                                  int32_t return_stats,
+                                  int32_t reuse_setup)
   {
     return AmgxSolveInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats);
+        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats, reuse_setup);
   }
 
   // Double implementation
@@ -618,10 +624,11 @@ namespace
                                         ffi::ResultBuffer<ffi::DataType::F64> stats,
                                         std::string_view config,
                                         int32_t transpose_solve,
-                                        int32_t return_stats)
+                                        int32_t return_stats,
+                                        int32_t reuse_setup)
   {
     return AmgxSolveInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats);
+        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats, reuse_setup);
   }
 
 #ifdef JAXAMG_WITH_MPI
@@ -638,10 +645,11 @@ namespace
                                      ffi::ResultBuffer<ffi::DataType::F32> stats,
                                      std::string_view config,
                                      int32_t transpose_solve,
-                                     int32_t return_stats)
+                                     int32_t return_stats,
+                                     int32_t reuse_setup)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats);
+        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup);
   }
 
   // MPI Double implementation
@@ -657,10 +665,11 @@ namespace
                                            ffi::ResultBuffer<ffi::DataType::F64> stats,
                                            std::string_view config,
                                            int32_t transpose_solve,
-                                           int32_t return_stats)
+                                           int32_t return_stats,
+                                           int32_t reuse_setup)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats);
+        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup);
   }
 
   // -------------------------------------------------------------------------

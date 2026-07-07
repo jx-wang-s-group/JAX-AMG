@@ -8,6 +8,7 @@ import pytest
 import scipy.sparse.linalg as spla
 
 import jaxamg
+import jaxamg.jaxamg as jaxamg_module
 from jaxamg import config as amgx_config
 from jaxamg.jaxamg import _amgx_solve_impl
 from jaxamg.matrices import (
@@ -274,6 +275,53 @@ class TestSolver:
 
         assert info_backend[2] == info_explicit[2] == jaxamg.AMGXStatus.SUCCESS
         np.testing.assert_allclose(lam_backend, lam_explicit)
+
+    def test_reuse_setup_forwards_to_adjoint_solve(self, monkeypatch):
+        """The VJP must use the same reuse_setup mode as the forward solve."""
+        calls = []
+
+        def fake_amgx_solve(
+            row_ptrs,
+            col_indices,
+            values,
+            b,
+            config_str="",
+            transpose_solve=False,
+            return_stats=False,
+            reuse_setup=False,
+        ):
+            calls.append(
+                {
+                    "transpose_solve": bool(transpose_solve),
+                    "reuse_setup": bool(reuse_setup),
+                }
+            )
+            return b, jnp.array([0, 0, 0], dtype=b.dtype)
+
+        monkeypatch.setattr(jaxamg_module, "_amgx_solve_impl", fake_amgx_solve)
+        jaxamg_module._get_solver_primitive.cache_clear()
+
+        try:
+            A = poisson_matrix(2, skew=0.7)
+            b = rhs_ones(A.shape[0])
+            solver = jaxamg_module._get_solver_primitive(
+                "test-config", reuse_setup=True
+            )
+
+            def loss(rhs):
+                x, _ = solver(A, rhs)
+                return jnp.sum(x)
+
+            grad_b = jax.grad(loss)(b)
+
+            assert grad_b.shape == b.shape
+            assert calls[0] == {"transpose_solve": False, "reuse_setup": True}
+            assert any(
+                call == {"transpose_solve": True, "reuse_setup": True}
+                for call in calls[1:]
+            )
+        finally:
+            jaxamg_module._get_solver_primitive.cache_clear()
 
     def test_save_stats_file(self, tmp_path):
         """Test that jaxamg.solve generates a stats file correctly."""

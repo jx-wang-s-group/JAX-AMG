@@ -86,6 +86,7 @@ def _amgx_solve_impl(
     config_str: str = "",
     transpose_solve: bool = False,
     return_stats: bool = False,
+    reuse_setup: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX solver (non-differentiable)."""
 
@@ -115,6 +116,7 @@ def _amgx_solve_impl(
         config=config_str,
         transpose_solve=np.int32(transpose_solve),
         return_stats=np.int32(return_stats),
+        reuse_setup=np.int32(reuse_setup),
     )
 
     return cast(tuple, results)
@@ -131,6 +133,7 @@ def _amgx_solve_mpi_impl(
     config_str: str = "",
     transpose_solve: bool = False,
     return_stats: bool = False,
+    reuse_setup: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX MPI solver (non-differentiable)."""
 
@@ -163,6 +166,7 @@ def _amgx_solve_mpi_impl(
         config=config_str,
         transpose_solve=np.int32(transpose_solve),
         return_stats=np.int32(return_stats),
+        reuse_setup=np.int32(reuse_setup),
     )
 
     return cast(tuple, results)
@@ -170,11 +174,16 @@ def _amgx_solve_mpi_impl(
 
 @functools.lru_cache(maxsize=32)
 def _get_solver_primitive(
-    config_str: str, is_symmetric: bool = False, return_stats: bool = False
+    config_str: str,
+    is_symmetric: bool = False,
+    return_stats: bool = False,
+    reuse_setup: bool = False,
 ) -> Callable:
     """
     Returns a JAX custom_vjp primitive for AmgX solve with a specific configuration.
     Cached to avoid recompilation for identical configurations.
+
+    reuse_setup: Skip warm AMGX resetup and keep the cached hierarchy.
     """
 
     @jax.custom_vjp
@@ -186,6 +195,7 @@ def _get_solver_primitive(
             b,
             config_str=config_str,
             return_stats=return_stats,
+            reuse_setup=reuse_setup,
         )
         return x, info
 
@@ -203,7 +213,12 @@ def _get_solver_primitive(
         A, x = residuals
 
         # Solve A^T λ = g_x
-        solver = _get_solver_primitive(config_str, is_symmetric, return_stats=False)
+        solver = _get_solver_primitive(
+            config_str,
+            is_symmetric,
+            return_stats=False,
+            reuse_setup=reuse_setup,
+        )
 
         # Check if matrix is symmetric
         if is_symmetric:
@@ -218,6 +233,7 @@ def _get_solver_primitive(
                     g_x,
                     config_str=config_str,
                     transpose_solve=True,
+                    reuse_setup=reuse_setup,
                 )
             except Exception:
                 A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
@@ -251,6 +267,7 @@ def _get_solver_primitive_mpi(
     nnz_out: int | None = None,
     n_ghost: int = 0,
     return_stats: bool = False,
+    reuse_setup: bool = False,
 ) -> Callable:
     """
     Create cached JAX custom_vjp primitive for MPI AmgX solve.
@@ -309,6 +326,7 @@ def _get_solver_primitive_mpi(
             lrank_arr,
             config_str=config_str,
             return_stats=return_stats,
+            reuse_setup=reuse_setup,
         )
 
         return x, info
@@ -407,6 +425,7 @@ def solve(
     nglobal: int | None = None,
     partition_info: tuple[int, int] | None = None,
     save_stats_file: str | os.PathLike | None = None,
+    reuse_setup: bool = False,
     **kwargs: Any,
 ) -> tuple[jax.Array, dict]:
     """Solve `Ax=b` using the AmgX backend. See [Examples](examples.md) for usage.
@@ -419,6 +438,7 @@ def solve(
         nglobal: Global matrix row count for MPI mode. Required when `comm` is provided and MPI metadata is not pre-attached to `A`.
         partition_info: `(row_start, row_end)` owned by this rank in MPI mode.  Required when `comm` is provided and MPI metadata is not pre-attached to `A`.
         save_stats_file: Optional file path to save detailed AmgX solver statistics.  If None, no file is created.
+        reuse_setup: For repeated solves with the same sparsity pattern, skip warm `AMGX_solver_resetup` and keep the cached hierarchy. This is cheaper per solve but may require more iterations if matrix coefficients change significantly.
         **kwargs: Additional AmgX config parameters. These override values in `config` when both are provided.
 
     Returns:
@@ -493,6 +513,7 @@ def solve(
                 nnz_out=nnz_out,
                 n_ghost=halo_plan.n_ghost,
                 return_stats=1 if save_stats_file else 0,
+                reuse_setup=reuse_setup,
             )
 
             x, info = solver(
@@ -553,6 +574,7 @@ def solve(
                 nnz_out=nnz_out,
                 n_ghost=halo_plan.n_ghost,
                 return_stats=1 if save_stats_file else 0,
+                reuse_setup=reuse_setup,
             )
             x, info = solver(
                 A_csr,
@@ -570,6 +592,7 @@ def solve(
             config_str,
             is_symmetric=is_symmetric,
             return_stats=1 if save_stats_file else 0,
+            reuse_setup=reuse_setup,
         )
 
         x, info = solver(A_csr, b)
