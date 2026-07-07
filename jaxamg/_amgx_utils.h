@@ -213,7 +213,7 @@ namespace
     int nnz;
     int mode; // AMGX_Mode (dFFI vs dDDI)
     bool transpose_solve;
-    size_t structure_hash; // FNV-1a of row_ptrs content
+    size_t structure_hash; // FNV-1a of row_ptrs + col_indices content
     std::string config;
 
     bool operator==(const CacheKey &other) const
@@ -227,15 +227,36 @@ namespace
     }
   };
 
-  // FNV-1a hash of byte sequences.
-  inline size_t fnv1a_hash(const void *data, size_t len)
+  // Word-wise FNV-1a-style hash: four lanes break the multiply dependency chain
+  // so hashing the structure (row_ptrs + col_indices, hundreds of MB at n~1e7)
+  // isn't a bottleneck on repeated solves. Not canonical FNV-1a but a
+  // deterministic, content-sensitive digest, which is all the cache key needs.
+  // Pass `seed` to chain buffers into one digest; inputs are >=4-byte aligned.
+  inline size_t fnv1a_hash(const void *data, size_t len,
+                           size_t seed = 14695981039346656037ULL)
   {
+    constexpr size_t PRIME = 1099511628211ULL;
     const uint8_t *bytes = static_cast<const uint8_t *>(data);
-    size_t hash = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; ++i)
+    const uint32_t *words = static_cast<const uint32_t *>(data);
+    const size_t nwords = len / 4;
+    size_t h0 = seed, h1 = seed ^ 0x9e3779b97f4a7c15ULL,
+           h2 = seed + 1ULL, h3 = seed ^ 0xff51afd7ed558ccdULL;
+    size_t i = 0;
+    for (; i + 4 <= nwords; i += 4)
     {
-      hash ^= bytes[i];
-      hash *= 1099511628211ULL;
+      h0 = (h0 ^ words[i]) * PRIME;
+      h1 = (h1 ^ words[i + 1]) * PRIME;
+      h2 = (h2 ^ words[i + 2]) * PRIME;
+      h3 = (h3 ^ words[i + 3]) * PRIME;
+    }
+    size_t hash = (h0 * PRIME) ^ (h1 * PRIME) ^ (h2 * PRIME) ^ (h3 * PRIME);
+    for (; i < nwords; ++i)
+    {
+      hash = (hash ^ words[i]) * PRIME;
+    }
+    for (size_t b = nwords * 4; b < len; ++b)
+    {
+      hash = (hash ^ bytes[b]) * PRIME;
     }
     return hash;
   }
@@ -243,9 +264,9 @@ namespace
   struct MPICacheKey
   {
     // No device pointers: JAX eager calls get new addresses each time, causing
-    // cache thrashing. Value-based keys + structure_hash (FNV-1a of row_ptrs
-    // content) ensure stable hits and correct structural identity for
-    // AMGX_matrix_replace_coefficients on the cache-hit path.
+    // cache thrashing. Value-based keys + structure_hash (FNV-1a of row_ptrs +
+    // col_indices content) ensure stable hits and correct structural identity
+    // for AMGX_matrix_replace_coefficients on the cache-hit path.
     int n_local;
     int n_global;
     int nnz;
@@ -321,6 +342,8 @@ namespace
     AMGX_vector_handle x_vec = nullptr;
     AMGX_vector_handle b_vec = nullptr;
     void *values_buf = nullptr;            // MPI replace_coefficients buffer (null for non-MPI)
+    void *row_ptrs_buf = nullptr;          // MPI: cache-owned copy of local row_ptrs (see cold path)
+    void *col_indices_buf = nullptr;       // MPI: cache-owned int32 copy of local global col_indices
     void *transpose_row_ptrs = nullptr;    // transpose_solve mode only
     void *transpose_col_indices = nullptr; // transpose_solve mode only
     void *transpose_values = nullptr;      // transpose_solve mode only
@@ -394,6 +417,8 @@ namespace
       // owned by Global{MPI}Resources and destroyed in its Destroy().
       // Non-founding configs are tiny and cleaned up at process exit.
       if (res.values_buf) cudaFree(res.values_buf);
+      if (res.row_ptrs_buf) cudaFree(res.row_ptrs_buf);
+      if (res.col_indices_buf) cudaFree(res.col_indices_buf);
       if (res.transpose_row_ptrs) cudaFree(res.transpose_row_ptrs);
       if (res.transpose_col_indices) cudaFree(res.transpose_col_indices);
       if (res.transpose_values) cudaFree(res.transpose_values);
@@ -445,10 +470,11 @@ namespace
   };
 
 #ifdef JAXAMG_WITH_MPI
-  // Singleton for global MPI AmgX resource management. Shares one
-  // AMGX_resources_handle across all MPI cache entries so multiple
-  // matrix/solver pairs can coexist on the same communicator.
-  // Owns the founding config handle (same reason as GlobalResources).
+  // Singleton for global MPI AmgX resource management. Keeps one
+  // AMGX_resources_handle per communicator: solves on the same communicator
+  // share it, distinct communicators each get their own (one handle reused
+  // across communicators would run AmgX's collectives on the wrong one). Owns
+  // the founding config handle per communicator (as GlobalResources does).
   class GlobalMPIResources {
   public:
       static GlobalMPIResources& Get() {
@@ -459,31 +485,37 @@ namespace
       AMGX_resources_handle GetHandle(AMGX_config_handle cfg,
                                        MPI_Comm *comm, int ndevs, int *devs) {
           std::lock_guard<std::mutex> lock(mutex_);
-          if (!handle_) {
-              AMGX_SAFE_CALL_VOID(AMGX_resources_create(&handle_, cfg, comm, ndevs, devs));
-              cfg_ = cfg;
+          // Key on the communicator's identity (the same pointer Python passes as
+          // comm_ptr), so each communicator gets its own resources handle.
+          uint64_t key = reinterpret_cast<uint64_t>(comm);
+          auto it = handles_.find(key);
+          if (it != handles_.end()) {
+              return it->second.handle;
           }
-          return handle_;
+          AMGX_resources_handle handle = nullptr;
+          AMGX_SAFE_CALL_VOID(AMGX_resources_create(&handle, cfg, comm, ndevs, devs));
+          handles_[key] = {handle, cfg};
+          return handle;
       }
 
       void Destroy() {
           std::lock_guard<std::mutex> lock(mutex_);
-          if (handle_) {
-              AMGX_SAFE_CALL_VOID(AMGX_resources_destroy(handle_));
-              handle_ = nullptr;
+          for (auto &kv : handles_) {
+              if (kv.second.handle) AMGX_SAFE_CALL_VOID(AMGX_resources_destroy(kv.second.handle));
+              if (kv.second.cfg) AMGX_SAFE_CALL_VOID(AMGX_config_destroy(kv.second.cfg));
           }
-          if (cfg_) {
-              AMGX_SAFE_CALL_VOID(AMGX_config_destroy(cfg_));
-              cfg_ = nullptr;
-          }
+          handles_.clear();
       }
 
   private:
-      GlobalMPIResources() : handle_(nullptr), cfg_(nullptr) {}
+      struct Entry {
+          AMGX_resources_handle handle = nullptr;
+          AMGX_config_handle cfg = nullptr;
+      };
+      GlobalMPIResources() {}
       ~GlobalMPIResources() { Destroy(); }
 
-      AMGX_resources_handle handle_;
-      AMGX_config_handle cfg_;
+      std::unordered_map<uint64_t, Entry> handles_;
       std::mutex mutex_;
   };
 #endif // JAXAMG_WITH_MPI

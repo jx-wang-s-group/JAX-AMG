@@ -63,6 +63,7 @@ namespace
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
+          .Attr<int32_t>("reuse_setup")             // skip warm resetup
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -79,6 +80,7 @@ namespace
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
+          .Attr<int32_t>("reuse_setup")             // skip warm resetup
   );
 
 #ifdef JAXAMG_WITH_MPI
@@ -100,6 +102,7 @@ namespace
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
+          .Attr<int32_t>("reuse_setup")             // skip warm resetup
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -119,6 +122,7 @@ namespace
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
+          .Attr<int32_t>("reuse_setup")             // skip warm resetup
   );
 
   XLA_FFI_DEFINE_HANDLER(

@@ -27,6 +27,23 @@ namespace ffi = xla::ffi;
 namespace
 {
 
+  // Reused cuSPARSE handle for the single-GPU transpose: created once and reused
+  // (stream rebound per call), avoiding a create/destroy on every backward pass.
+  // Left to be reclaimed at process exit (a single handle, independent of AmgX).
+  inline cusparseHandle_t GetCusparseHandle()
+  {
+    static cusparseHandle_t handle = []()
+    {
+      cusparseHandle_t h = nullptr;
+      if (cusparseCreate(&h) != CUSPARSE_STATUS_SUCCESS)
+      {
+        h = nullptr;
+      }
+      return h;
+    }();
+    return handle;
+  }
+
   template <typename T>
   inline const char *CsrTransposeDevice(cudaStream_t stream,
                                         int n_rows,
@@ -38,14 +55,13 @@ namespace
                                         int *col_indices_t,
                                         T *values_t)
   {
-    cusparseHandle_t handle = nullptr;
-    if (cusparseCreate(&handle) != CUSPARSE_STATUS_SUCCESS)
+    cusparseHandle_t handle = GetCusparseHandle();
+    if (handle == nullptr)
     {
       return "cusparseCreate failed";
     }
     if (cusparseSetStream(handle, stream) != CUSPARSE_STATUS_SUCCESS)
     {
-      cusparseDestroy(handle);
       return "cusparseSetStream failed";
     }
 
@@ -69,14 +85,12 @@ namespace
         &buffer_size);
     if (status != CUSPARSE_STATUS_SUCCESS)
     {
-      cusparseDestroy(handle);
       return "cusparseCsr2cscEx2_bufferSize failed";
     }
 
     void *workspace = nullptr;
     if (buffer_size > 0 && cudaMalloc(&workspace, buffer_size) != cudaSuccess)
     {
-      cusparseDestroy(handle);
       return "cudaMalloc failed for cusparse transpose workspace";
     }
 
@@ -98,7 +112,6 @@ namespace
         workspace);
 
     cudaFree(workspace);
-    cusparseDestroy(handle);
 
     if (status != CUSPARSE_STATUS_SUCCESS)
     {
@@ -127,7 +140,8 @@ namespace
                                       ffi::ResultBuffer<DType> stats,
                                       std::string_view config,
                                       int32_t transpose_solve,
-                                      int32_t return_stats)
+                                      int32_t return_stats,
+                                      int32_t reuse_setup)
   {
     EnsureAmgxInitialized();
 
@@ -158,29 +172,22 @@ namespace
     const int n_rows = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
     const int nnz = static_cast<int>(values.element_count());
 
-    // Cache the last key to skip the structure hash D2H on repeated calls.
-    static CacheKey last_key = {};
-    static bool last_key_valid = false;
-
-    size_t structure_hash = 0;
-    bool fast_path = false;
-
-    if (last_key_valid &&
-        last_key.n_rows == n_rows &&
-        last_key.nnz == nnz &&
-        last_key.mode == static_cast<int>(Mode) &&
-        last_key.transpose_solve == (transpose_solve != 0) &&
-        last_key.config == std::string(config))
-    {
-      structure_hash = last_key.structure_hash;
-      fast_path = true;
-    }
-    else
-    {
-      std::vector<int> h_row_ptrs(n_rows + 1);
-      cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost);
-      structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_rows + 1) * sizeof(int));
-    }
+    // The cache-hit path only replaces coefficient values, so the key must
+    // capture the full sparsity pattern (row_ptrs + col_indices) for a changed
+    // pattern to miss and trigger a fresh setup. Reuse host buffers across calls
+    // to avoid reallocating these large arrays on every solve.
+    static thread_local std::vector<int> h_row_ptrs, h_col_indices;
+    if (static_cast<int>(h_row_ptrs.size()) < n_rows + 1)
+      h_row_ptrs.resize(n_rows + 1);
+    if (static_cast<int>(h_col_indices.size()) < nnz)
+      h_col_indices.resize(nnz);
+    cudaMemcpyAsync(h_row_ptrs.data(), row_ptrs_data,
+                    (n_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_col_indices.data(), col_indices_data,
+                    nnz * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_rows + 1) * sizeof(int));
+    structure_hash = fnv1a_hash(h_col_indices.data(), nnz * sizeof(int), structure_hash);
 
     CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, structure_hash, std::string(config)};
     bool cache_hit = GetSolverCache().get(key, res);
@@ -218,15 +225,14 @@ namespace
             res.A, n_rows, (int)values.element_count(), values_data, nullptr));
       }
 
-      AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
+      // reuse_setup keeps the existing hierarchy while still refreshing the fine matrix.
+      if (!reuse_setup)
+        AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
       AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
 
       reuse_success = true;
     }
-
-    last_key = key;
-    last_key_valid = true;
 
     StatsCaptureGuard capture_guard(return_stats != 0);
 
@@ -380,7 +386,8 @@ namespace
                                          ffi::ResultBuffer<DType> stats,
                                          std::string_view config,
                                          int32_t transpose_solve,
-                                         int32_t return_stats)
+                                         int32_t return_stats,
+                                         int32_t reuse_setup)
   {
     if (transpose_solve != 0)
     {
@@ -427,28 +434,22 @@ namespace
 
     CachedResources res;
 
-    static MPICacheKey mpi_last_key = {};
-    static bool mpi_last_key_valid = false;
-
-    size_t structure_hash = 0;
-
-    if (mpi_last_key_valid &&
-        mpi_last_key.n_local == n_local &&
-        mpi_last_key.n_global == nglobal_host &&
-        mpi_last_key.nnz == nnz &&
-        mpi_last_key.lrank == lrank_host &&
-        mpi_last_key.mode == static_cast<int>(Mode) &&
-        mpi_last_key.comm_ptr == comm_ptr_val &&
-        mpi_last_key.config == std::string(config))
-    {
-      structure_hash = mpi_last_key.structure_hash;
-    }
-    else
-    {
-      std::vector<int> h_row_ptrs(n_local + 1);
-      cudaMemcpy(h_row_ptrs.data(), row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost);
-      structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_local + 1) * sizeof(int));
-    }
+    // Hash row_ptrs and the (global, int64) col_indices; see the single-GPU
+    // path for the rationale. Reuse host buffers across calls to avoid
+    // reallocating these large arrays on every solve.
+    static thread_local std::vector<int> h_row_ptrs;
+    static thread_local std::vector<int64_t> h_col_indices;
+    if (static_cast<int>(h_row_ptrs.size()) < n_local + 1)
+      h_row_ptrs.resize(n_local + 1);
+    if (static_cast<int>(h_col_indices.size()) < nnz)
+      h_col_indices.resize(nnz);
+    cudaMemcpyAsync(h_row_ptrs.data(), row_ptrs_data,
+                    (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_col_indices.data(), col_indices_data,
+                    nnz * sizeof(int64_t), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_local + 1) * sizeof(int));
+    structure_hash = fnv1a_hash(h_col_indices.data(), nnz * sizeof(int64_t), structure_hash);
 
     MPICacheKey key = {
         n_local,
@@ -464,18 +465,20 @@ namespace
 
     if (cache_hit)
     {
-      cudaMemcpy(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice);
+      // Refresh the cached matrix values. The D2D copy is asynchronous;
+      // synchronize before AMGX reads values_buf.
+      cudaMemcpyAsync(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+      cudaStreamSynchronize(stream);
       AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
           res.A, n_local, nnz, res.values_buf, nullptr));
 
-      AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
+      // reuse_setup keeps the existing hierarchy while still refreshing the fine matrix.
+      if (!reuse_setup)
+        AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
       std::vector<T> h_x(n_local, static_cast<T>(0));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
     }
-
-    mpi_last_key = key;
-    mpi_last_key_valid = true;
 
     StatsCaptureGuard capture_guard(return_stats != 0);
 
@@ -501,19 +504,47 @@ namespace
       AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, Mode, res.cfg));
 
-      if (cudaMalloc(&res.values_buf, nnz * sizeof(T)) != cudaSuccess)
+      // Copy the matrix into cache-owned buffers. The cached distributed matrix
+      // and the warm-path AMGX_matrix_replace_coefficients reference these across
+      // solves, whereas the XLA inputs are released after this call. col_indices
+      // is narrowed to int32 (the low 4 bytes of each int64; valid since global
+      // indices are < nglobal_host, an int) for the 32-bit upload path below.
+      if (cudaMalloc(&res.values_buf, nnz * sizeof(T)) != cudaSuccess ||
+          cudaMalloc(&res.row_ptrs_buf, (n_local + 1) * sizeof(int)) != cudaSuccess ||
+          cudaMalloc(&res.col_indices_buf, nnz * sizeof(int)) != cudaSuccess)
       {
-        return ffi::Error::Internal("cudaMalloc for values buffer failed");
+        return ffi::Error::Internal("cudaMalloc for MPI matrix buffers failed");
       }
-      cudaMemcpy(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice);
+      cudaMemcpyAsync(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpyAsync(res.row_ptrs_buf, row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToDevice, stream);
+      cudaMemcpy2DAsync(res.col_indices_buf, sizeof(int), col_indices_data, sizeof(int64_t),
+                        sizeof(int), nnz, cudaMemcpyDeviceToDevice, stream);
+      cudaStreamSynchronize(stream);
 
+      // Contiguous row partition (owning rank per global row), required for AMGX
+      // to build the multi-ring halo (classical AMG uses 2 rings).
+      int nranks_host = 1;
+      MPI_Comm_size(*mpi_comm, &nranks_host);
+      std::vector<int> counts(nranks_host);
+      int n_local_send = n_local;
+      if (MPI_Allgather(&n_local_send, 1, MPI_INT, counts.data(), 1, MPI_INT,
+                        *mpi_comm) != MPI_SUCCESS)
+        return ffi::Error::Internal("MPI_Allgather of local sizes failed");
+      std::vector<int> partition_vector(nglobal_host);
+      for (int r = 0, off = 0; r < nranks_host; ++r)
+        for (int i = 0; i < counts[r] && off < nglobal_host; ++i)
+          partition_vector[off++] = r;
+
+      // 32-bit index upload path; the 64-bit AMGX_matrix_upload_all_global
+      // produces a diverging AMG hierarchy at >= 4 ranks.
       int nrings = 1;
       AMGX_SAFE_CALL(AMGX_config_get_default_number_of_rings(res.cfg, &nrings));
-
-      AMGX_SAFE_CALL(AMGX_matrix_upload_all_global(
+      AMGX_SAFE_CALL(AMGX_matrix_upload_all_global_32(
           res.A, nglobal_host, n_local, nnz, 1, 1,
-          row_ptrs_data, col_indices_data, static_cast<T *>(res.values_buf), nullptr,
-          nrings, nrings, nullptr));
+          static_cast<int *>(res.row_ptrs_buf),
+          static_cast<int *>(res.col_indices_buf),
+          static_cast<T *>(res.values_buf), nullptr,
+          nrings, nrings, partition_vector.data()));
 
       AMGX_SAFE_CALL(AMGX_vector_create(&res.x_vec, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_vector_create(&res.b_vec, res.rsrc, Mode));
@@ -576,10 +607,11 @@ namespace
                                   ffi::ResultBuffer<ffi::DataType::F32> stats,
                                   std::string_view config,
                                   int32_t transpose_solve,
-                                  int32_t return_stats)
+                                  int32_t return_stats,
+                                  int32_t reuse_setup)
   {
     return AmgxSolveInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats);
+        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats, reuse_setup);
   }
 
   // Double implementation
@@ -592,10 +624,11 @@ namespace
                                         ffi::ResultBuffer<ffi::DataType::F64> stats,
                                         std::string_view config,
                                         int32_t transpose_solve,
-                                        int32_t return_stats)
+                                        int32_t return_stats,
+                                        int32_t reuse_setup)
   {
     return AmgxSolveInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats);
+        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats, reuse_setup);
   }
 
 #ifdef JAXAMG_WITH_MPI
@@ -612,10 +645,11 @@ namespace
                                      ffi::ResultBuffer<ffi::DataType::F32> stats,
                                      std::string_view config,
                                      int32_t transpose_solve,
-                                     int32_t return_stats)
+                                     int32_t return_stats,
+                                     int32_t reuse_setup)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats);
+        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup);
   }
 
   // MPI Double implementation
@@ -631,10 +665,11 @@ namespace
                                            ffi::ResultBuffer<ffi::DataType::F64> stats,
                                            std::string_view config,
                                            int32_t transpose_solve,
-                                           int32_t return_stats)
+                                           int32_t return_stats,
+                                           int32_t reuse_setup)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats);
+        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup);
   }
 
   // -------------------------------------------------------------------------

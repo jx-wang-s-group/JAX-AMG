@@ -40,6 +40,7 @@ def main():
             "convergence": "RELATIVE_MAX",
         },
     )
+    x.block_until_ready()
     solve_time = time.time() - t_start
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)
     print(
@@ -58,6 +59,7 @@ def main():
             "convergence": "RELATIVE_MAX",
         },
     )
+    x.block_until_ready()
     solve_time = time.time() - t_start
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)
     print(
@@ -67,6 +69,7 @@ def main():
     # Solve with JAX (CG)
     t_start = time.time()
     x, _ = cg(A, b, tol=tolerance, maxiter=max_iters)
+    x.block_until_ready()
     solve_time = time.time() - t_start
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)
     print(
@@ -76,6 +79,7 @@ def main():
     # Solve with JAX (BiCGSTAB)
     t_start = time.time()
     x, _ = bicgstab(A, b, tol=tolerance, maxiter=max_iters)
+    x.block_until_ready()
     solve_time = time.time() - t_start
     residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)
     print(
@@ -101,11 +105,12 @@ def main():
     grad_fn = jax.jit(jax.grad(loss_fn))
 
     t_start = time.time()
-    grad_fn(b)
+    grad_fn(b).block_until_ready()
     warmup_time = time.time() - t_start
 
     t_start = time.time()
     grad = grad_fn(b)
+    grad.block_until_ready()
     compute_time = time.time() - t_start
     print(
         f"JAX-AMG (CG):        warmup time: {warmup_time:6.2f}s, compute time: {compute_time:.2f}s, grad norm: {jnp.linalg.norm(grad):.2e}"
@@ -128,11 +133,12 @@ def main():
     grad_fn = jax.jit(jax.grad(loss_fn))
 
     t_start = time.time()
-    grad_fn(b)
+    grad_fn(b).block_until_ready()
     warmup_time = time.time() - t_start
 
     t_start = time.time()
     grad = grad_fn(b)
+    grad.block_until_ready()
     compute_time = time.time() - t_start
     print(
         f"JAX-AMG (BiCGSTAB):  warmup time: {warmup_time:6.2f}s, compute time: {compute_time:.2f}s, grad norm: {jnp.linalg.norm(grad):.2e}"
@@ -146,11 +152,12 @@ def main():
     grad_fn = jax.jit(jax.grad(loss_fn))
 
     t_start = time.time()
-    grad_fn(b)
+    grad_fn(b).block_until_ready()
     warmup_time = time.time() - t_start
 
     t_start = time.time()
     grad = grad_fn(b)
+    grad.block_until_ready()
     compute_time = time.time() - t_start
     print(
         f"JAX     (CG):        warmup time: {warmup_time:6.2f}s, compute time: {compute_time:.2f}s, grad norm: {jnp.linalg.norm(grad):.2e}"
@@ -164,11 +171,12 @@ def main():
     grad_fn = jax.jit(jax.grad(loss_fn))
 
     t_start = time.time()
-    grad_fn(b)
+    grad_fn(b).block_until_ready()
     warmup_time = time.time() - t_start
 
     t_start = time.time()
     grad = grad_fn(b)
+    grad.block_until_ready()
     compute_time = time.time() - t_start
     print(
         f"JAX     (BiCGSTAB):  warmup time: {warmup_time:6.2f}s, compute time: {compute_time:.2f}s, grad norm: {jnp.linalg.norm(grad):.2e}"
@@ -200,6 +208,7 @@ def main():
     for _ in range(n_epochs):
         g = grad_fn(b_opt)
         b_opt = b_opt - lr * g
+    b_opt.block_until_ready()
     opt_time = time.time() - t_start
     print(f"JAX-AMG (CG):        opt time: {opt_time:.2f}s ({n_epochs} epochs)")
 
@@ -224,6 +233,7 @@ def main():
     for _ in range(n_epochs):
         g = grad_fn(b_opt)
         b_opt = b_opt - lr * g
+    b_opt.block_until_ready()
     opt_time = time.time() - t_start
     print(f"JAX-AMG (BiCGSTAB):  opt time: {opt_time:.2f}s ({n_epochs} epochs)")
 
@@ -239,6 +249,7 @@ def main():
     for _ in range(n_epochs):
         g = grad_fn(b_opt)
         b_opt = b_opt - lr * g
+    b_opt.block_until_ready()
     opt_time = time.time() - t_start
     print(f"JAX     (CG):        opt time: {opt_time:.2f}s ({n_epochs} epochs)")
 
@@ -254,6 +265,7 @@ def main():
     for _ in range(n_epochs):
         g = grad_fn(b_opt)
         b_opt = b_opt - lr * g
+    b_opt.block_until_ready()
     opt_time = time.time() - t_start
     print(f"JAX     (BiCGSTAB):  opt time: {opt_time:.2f}s ({n_epochs} epochs)")
 

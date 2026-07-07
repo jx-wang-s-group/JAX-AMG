@@ -82,7 +82,7 @@ def main():
     )
 
     mpi_cache = jaxamg.cache_mpi_metadata(
-        config, comm, n_global, (row_start, row_end), dummy_A
+        config, comm, n_global, (row_start, row_end), dummy_A, is_symmetric=True
     )
 
     # Define loss function

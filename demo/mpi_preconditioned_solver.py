@@ -45,6 +45,10 @@ def mpi_bicgstab(
     maxiter,
 ):
     def matvec_local(x_local):
+        # Illustrative: all-gather the full global vector, then apply the local
+        # rows. Only the columns A_local references (this rank's halo) are
+        # actually needed; for large or many-rank runs, exchange just those with
+        # a halo exchange (build_halo_plan + _mpi4jax_halo_gather) instead.
         x_global = _mpi4jax_allgatherv(x_local, recvcounts_tuple, comm)
         return A_local @ x_global
 

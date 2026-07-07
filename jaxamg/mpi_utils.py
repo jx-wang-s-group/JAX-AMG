@@ -1,7 +1,7 @@
 """MPI utilities for distributed AmgX solving."""
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 import jax
 import jax.experimental.sparse as jsp
@@ -105,6 +105,196 @@ def _mpi4jax_allgatherv(
     return jnp.concatenate(result_parts)
 
 
+# mpi4py communicators are unhashable, so the differentiable MPI primitive is
+# keyed on the communicator's integer address. This registry maps that address
+# back to the live communicator so the backward pass can run its collectives on
+# the user's communicator (possibly a subcommunicator), not MPI.COMM_WORLD.
+_COMM_BY_PTR: dict[int, "Comm"] = {}
+
+
+def register_comm(comm: "Comm") -> int:
+    """Record `comm` by its address and return that address (see _COMM_BY_PTR)."""
+    from mpi4py import MPI
+
+    ptr = MPI._addressof(comm)
+    _COMM_BY_PTR[ptr] = comm
+    return ptr
+
+
+def resolve_comm(comm_ptr: int) -> "Comm":
+    """Recover the communicator registered under `comm_ptr` (see register_comm),
+    falling back to MPI.COMM_WORLD if it was never registered."""
+    from mpi4py import MPI
+
+    return _COMM_BY_PTR.get(comm_ptr, MPI.COMM_WORLD)
+
+
+def local_transpose_nnz(
+    col_indices: ArrayLike, recvcounts_tuple: tuple[int, ...], comm: "Comm"
+) -> int:
+    """This rank's local nonzero count of A^T (for transpose output sizing).
+
+    Rank r's A^T rows receive every A nonzero whose column it owns, so the local
+    nnz of A^T equals the local nnz of A only for structurally symmetric
+    patterns; in general it differs per rank, so the distributed transpose sizes
+    its output by this value rather than the input nnz. Computed once on the host
+    via an ``Alltoall`` of per-destination counts.
+
+    Args:
+        col_indices: This rank's local (global-numbered) CSR column indices.
+        recvcounts_tuple: Rows owned per rank (the row partition).
+        comm: MPI communicator.
+
+    Returns:
+        This rank's local nnz of A^T (a static Python int).
+    """
+    nranks = len(recvcounts_tuple)
+    # Half-open row-block boundaries [0, r0, r0+r1, ..., n_global].
+    row_bounds = np.cumsum(np.array([0, *recvcounts_tuple], dtype=np.int64))
+    cols = np.asarray(col_indices).astype(np.int64)
+    owner = np.clip(np.searchsorted(row_bounds, cols, side="right") - 1, 0, nranks - 1)
+    send_counts = np.bincount(owner, minlength=nranks).astype(np.int32)
+    recv_counts = np.empty(nranks, dtype=np.int32)
+    comm.Alltoall(send_counts, recv_counts)
+    return int(recv_counts.sum())
+
+
+class HaloPlan(NamedTuple):
+    """Static communication plan for the backward pass halo exchange.
+
+    The gradient ``dL/dA_ij = -adj_b[i] * x[j]`` needs ``x[j]`` only for the
+    global columns ``j`` this rank's local rows reference. Those split into
+    locally owned columns (already in ``x_local``) and a small set of remote
+    "ghost" columns owned by other ranks. This plan, built once from the fixed
+    sparsity pattern, fetches only the ghost values instead of all-gathering the
+    entire global solution.
+
+    Fields (all static, captured at setup):
+        n_local: Rows owned by this rank.
+        n_ghost: Distinct remote columns this rank references.
+        max_per_rank: Padded per-rank chunk size for the ``alltoall`` (a global
+            max, so every rank uses the same buffer size).
+        col_to_combined: For each local nonzero, its index into the combined
+            ``[x_local | x_ghost]`` vector (length nnz).
+        send_ids_2d: Local ``x`` indices to send to each rank, padded
+            ``(nranks, max_per_rank)``.
+        recv_ghost_slot_2d: Ghost slot each received value fills, padded
+            ``(nranks, max_per_rank)`` with ``n_ghost`` as an ignored sentinel.
+    """
+
+    n_local: int
+    n_ghost: int
+    max_per_rank: int
+    col_to_combined: np.ndarray
+    send_ids_2d: np.ndarray
+    recv_ghost_slot_2d: np.ndarray
+
+
+def build_halo_plan(
+    local_col_indices: ArrayLike,
+    recvcounts_tuple: tuple[int, ...],
+    partition_info: tuple[int, int],
+    comm: "Comm",
+) -> HaloPlan:
+    """Build the backward-pass halo-exchange plan (see :class:`HaloPlan`).
+
+    Determines which remote solution entries this rank needs for its local
+    gradient and the reciprocal entries it must supply to other ranks, via two
+    small host-side collectives (``Alltoall`` of counts, ``Alltoallv`` of the
+    requested global indices). The sparsity pattern is fixed, so this runs once.
+    """
+    from mpi4py import MPI
+
+    nranks = len(recvcounts_tuple)
+    row_start, row_end = partition_info
+    n_local = row_end - row_start
+    row_bounds = np.cumsum(np.array([0, *recvcounts_tuple], dtype=np.int64))
+
+    cols = np.asarray(local_col_indices).astype(np.int64)
+    uniq = np.unique(cols)
+    is_remote = (uniq < row_start) | (uniq >= row_end)
+    ghost_global_ids = uniq[is_remote]  # sorted (np.unique is sorted)
+    n_ghost = int(ghost_global_ids.size)
+
+    # Owner rank of each ghost column, and how many ghosts this rank needs from
+    # each owner (recv_counts). The reciprocal send_counts come from an Alltoall.
+    ghost_owner = np.clip(
+        np.searchsorted(row_bounds, ghost_global_ids, side="right") - 1, 0, nranks - 1
+    ).astype(np.int32)
+    recv_counts = np.bincount(ghost_owner, minlength=nranks).astype(np.int32)
+    send_counts = np.empty(nranks, dtype=np.int32)
+    comm.Alltoall(recv_counts, send_counts)
+
+    recv_displs = np.insert(np.cumsum(recv_counts[:-1]), 0, 0).astype(np.int32)
+    send_displs = np.insert(np.cumsum(send_counts[:-1]), 0, 0).astype(np.int32)
+
+    # Group this rank's requests by owner (stable keeps ghost order within owner),
+    # then tell each owner which global ids we want and learn which ids others
+    # want from us.
+    order = np.argsort(ghost_owner, kind="stable")
+    ghost_ids_by_owner = ghost_global_ids[order].astype(np.int64)
+    ghost_slot_by_owner = order.astype(np.int32)
+
+    requested_ids = np.empty(int(send_counts.sum()), dtype=np.int64)
+    comm.Alltoallv(
+        [ghost_ids_by_owner, recv_counts, recv_displs, MPI.INT64_T],
+        [requested_ids, send_counts, send_displs, MPI.INT64_T],
+    )
+    send_local_ids = (requested_ids - row_start).astype(np.int32)
+
+    # alltoall needs one shared chunk size across all ranks.
+    max_per_rank = int(
+        comm.allreduce(int(max(send_counts.max(), recv_counts.max())), op=MPI.MAX)
+    )
+    max_per_rank = max(max_per_rank, 1)
+
+    send_ids_2d = np.zeros((nranks, max_per_rank), dtype=np.int32)
+    recv_ghost_slot_2d = np.full((nranks, max_per_rank), n_ghost, dtype=np.int32)
+    for p in range(nranks):
+        sc = int(send_counts[p])
+        if sc:
+            send_ids_2d[p, :sc] = send_local_ids[send_displs[p] : send_displs[p] + sc]
+        rc = int(recv_counts[p])
+        if rc:
+            recv_ghost_slot_2d[p, :rc] = ghost_slot_by_owner[
+                recv_displs[p] : recv_displs[p] + rc
+            ]
+
+    # Map each local nonzero to its slot in the combined [x_local | x_ghost].
+    local_mask = (cols >= row_start) & (cols < row_end)
+    ghost_pos = np.clip(np.searchsorted(ghost_global_ids, cols), 0, max(n_ghost - 1, 0))
+    col_to_combined = np.where(
+        local_mask, cols - row_start, n_local + ghost_pos
+    ).astype(np.int32)
+
+    return HaloPlan(
+        n_local, n_ghost, max_per_rank, col_to_combined, send_ids_2d, recv_ghost_slot_2d
+    )
+
+
+def _mpi4jax_halo_gather(
+    x_local: jax.Array,
+    send_ids: jax.Array,
+    recv_ghost_slot: jax.Array,
+    n_ghost: int,
+    comm: "Comm",
+) -> jax.Array:
+    """Assemble ``[x_local | x_ghost]`` by exchanging only the needed remote
+    solution entries (see :class:`HaloPlan` for the plan arrays). ``send_ids``
+    and ``recv_ghost_slot`` are the padded ``(nranks, max_per_rank)`` plan
+    arrays; ``n_ghost`` is a static ghost count. JIT-compatible, GPU-direct."""
+    import mpi4jax
+
+    send_buf = x_local[send_ids]  # (nranks, max_per_rank); padded slots gather x[0]
+    recv_buf = mpi4jax.alltoall(send_buf, comm=comm)
+
+    # Scatter valid received values into ghost slots; padded slots hit the
+    # sentinel index n_ghost, which is sliced off.
+    x_ghost = jnp.zeros(n_ghost + 1, dtype=x_local.dtype)
+    x_ghost = x_ghost.at[recv_ghost_slot.reshape(-1)].set(recv_buf.reshape(-1))
+    return jnp.concatenate([x_local, x_ghost[:n_ghost]])
+
+
 def _mpi4jax_alltoallv_transpose(
     data: jax.Array,
     indices: jax.Array,
@@ -112,6 +302,7 @@ def _mpi4jax_alltoallv_transpose(
     recvcounts_tuple: tuple[int, ...],
     comm: "Comm",
     max_nnz: int,
+    nnz_out: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
     Pure JAX implementation of distributed matrix transpose using mpi4jax.
@@ -133,7 +324,14 @@ def _mpi4jax_alltoallv_transpose(
         indptr: CSR row pointers
         recvcounts_tuple: Partition sizes (rows per rank)
         comm: MPI communicator
-        max_nnz: Maximum nnz across all ranks for buffer sizing (must be precalculated)
+        max_nnz: Max local nnz of A across ranks, for send-buffer sizing (the
+            send buffers are collective, so all ranks share this size).
+        nnz_out: This rank's local nnz of A^T, the exact output length. Under row
+            partitioning it differs from the input nnz whenever the pattern is
+            structurally nonsymmetric, so it must be provided (see
+            :func:`local_transpose_nnz`). Any slots beyond the actual received
+            count are padded with in-range explicit zeros (a no-op when the count
+            is exact).
     """
     import mpi4jax
 
@@ -252,10 +450,15 @@ def _mpi4jax_alltoallv_transpose(
         -1,  # Invalid positions (will be ignored)
     )
 
-    # Initialize output arrays with size = nnz (same as input for shape compatibility)
-    recv_data_flat = jnp.zeros(nnz, dtype=data.dtype)
-    recv_rows_flat = jnp.zeros(nnz, dtype=jnp.int32)
-    recv_cols_flat = jnp.zeros(nnz, dtype=jnp.int32)
+    # Size the output by nnz_out (this rank's local nnz of A^T), not the input
+    # nnz: they differ per rank for structurally nonsymmetric patterns, and using
+    # the input nnz would drop or strand received entries. real_count is the
+    # runtime count and equals nnz_out, so the scatter fills [0, nnz_out) exactly.
+    real_count = jnp.sum(recv_counts).astype(jnp.int32)
+
+    recv_data_flat = jnp.zeros(nnz_out, dtype=data.dtype)
+    recv_rows_flat = jnp.zeros(nnz_out, dtype=jnp.int32)
+    recv_cols_flat = jnp.zeros(nnz_out, dtype=jnp.int32)
 
     # Scatter valid elements to their positions
     # Use segment_sum pattern: only positions >= 0 are valid
@@ -278,6 +481,14 @@ def _mpi4jax_alltoallv_transpose(
     recv_rows_flat = recv_rows_flat.at[valid_positions].add(masked_rows)
     recv_cols_flat = recv_cols_flat.at[valid_positions].add(masked_cols)
 
+    # Defensive: if nnz_out exceeds the received count, pad the tail slots with an
+    # on-rank explicit zero at (A^T row 0, column my_row_start) -- harmless to
+    # AmgX and a no-op when nnz_out is exact (as from local_transpose_nnz). The
+    # pre-transpose fields map recv_cols -> local row, recv_rows -> global column.
+    pad_mask = jnp.arange(nnz_out, dtype=jnp.int32) >= real_count
+    recv_cols_flat = jnp.where(pad_mask, my_row_start, recv_cols_flat)
+    recv_rows_flat = jnp.where(pad_mask, my_row_start, recv_rows_flat)
+
     # For A^T: recv_cols becomes local row (was column in A), recv_rows becomes col (was row in A)
     at_rows_local = recv_cols_flat - my_row_start  # Local row index in A^T
     at_cols = recv_rows_flat  # Column index in A^T (global row in A)
@@ -297,17 +508,17 @@ def _mpi4jax_alltoallv_transpose(
     c_sorted = at_cols[sort_idx]
     v_sorted = recv_data_flat[sort_idx]
 
-    # Build indptr from row counts
+    # Build indptr from row counts (which sum to nnz_out).
     row_counts_at = jnp.bincount(r_sorted, length=n_local).astype(jnp.int32)
 
     out_indptr = jnp.zeros(n_local + 1, dtype=indptr.dtype)
     out_indptr = out_indptr.at[1:].set(jnp.cumsum(row_counts_at).astype(jnp.int32))
 
-    # Output data and indices (already sorted). For square matrices with
-    # fixed sparsity, transpose preserves nnz, so no padding/truncation needed.
+    # Output data and indices (already sorted); length is nnz_out, this rank's
+    # local nnz(A^T).
     out_data = v_sorted
     out_indices = c_sorted
-    out_indptr = out_indptr.at[-1].set(nnz)
+    out_indptr = out_indptr.at[-1].set(nnz_out)
 
     # Convert output indices to int64
     with temp_enable_x64():
