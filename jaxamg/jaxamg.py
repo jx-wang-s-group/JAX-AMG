@@ -551,6 +551,29 @@ def solve(
             )
             recvcounts_tuple = tuple(recvcounts_val.tolist())
 
+            # Validate partition_info against the partition actually implied by
+            # the local matrix shapes (which is what AmgX uses). Reduce first so
+            # every rank raises together -- a rank-divergent raise would leave
+            # the other ranks deadlocked in the collectives below.
+            from mpi4py import MPI
+
+            row_start = int(displs_val[rank])
+            derived_partition = (row_start, row_start + n_local)
+            mismatch = tuple(partition_info) != derived_partition
+            if comm.allreduce(mismatch, op=MPI.LOR):
+                detail = (
+                    f"rank {rank}: partition_info {tuple(partition_info)} != "
+                    f"derived {derived_partition}"
+                    if mismatch
+                    else f"rank {rank} is consistent, but another rank's is not"
+                )
+                raise ValueError(
+                    "partition_info does not match the row partition derived "
+                    f"from the local matrix shapes ({detail}). Each rank must "
+                    "pass its own (row_start, row_end) matching its local "
+                    "partition."
+                )
+
             # max nnz across ranks (transpose send buffers) + this rank's local
             # nnz(A^T) (its output buffers).
             max_nnz = max(comm.allgather(len(A_csr.data)))
@@ -558,7 +581,6 @@ def solve(
 
             # Halo-exchange plan for the backward pass (fetches only the remote
             # solution entries this rank references, instead of all-gathering).
-            row_start = int(displs_val[rank])
             halo_plan = build_halo_plan(
                 A_csr.indices,
                 recvcounts_tuple,
