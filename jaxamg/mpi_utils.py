@@ -546,7 +546,7 @@ def partition_csr_matrix(
         Preserves input dtype (float32/float64). Avoids unnecessary conversions
         by using matrix attributes directly.
     """
-    is_scipy = hasattr(A_global, "todense")
+    is_scipy = sp.issparse(A_global)
 
     if hasattr(A_global, "indptr"):
         indptr, indices, data = A_global.indptr, A_global.indices, A_global.data
