@@ -1,6 +1,7 @@
 import functools
 import json
 import os
+import warnings
 from collections.abc import Callable
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, cast
@@ -460,16 +461,33 @@ def solve(
 
     # Prepare configuration string/file (skip if using mpi_cache which already has config_str)
     if mpi_cache is not None:
+        if config is not None or kwargs:
+            warnings.warn(
+                "A carries cached MPI metadata (with_cache(..., mpi=...)); the "
+                "config/kwargs passed to solve() are ignored in favor of the "
+                "cached config. Pass the config to cache_mpi_metadata() instead.",
+                stacklevel=2,
+            )
         config_str = mpi_cache["config_str"]
+        if save_stats_file is not None and '"print_solve_stats"' not in config_str:
+            warnings.warn(
+                "save_stats_file was passed, but the cached MPI config was "
+                "prepared without stats output; the stats file will be missing "
+                "solver statistics. Pass save_stats=True to cache_mpi_metadata().",
+                stacklevel=2,
+            )
     else:
         config_str = amgx_config.prepare_config(
-            config, save_stats=(save_stats_file is not None), **kwargs
+            config,
+            save_stats=(save_stats_file is not None),
+            mpi=(comm is not None),
+            **kwargs,
         )
 
-    # Detect desired precision
+    # Detect desired precision (non-float RHS dtypes are promoted to float32)
     target_dtype = get_preferred_dtype(A, b)
-    if target_dtype == jnp.float64 and b.dtype != jnp.float64:
-        b = b.astype(jnp.float64)
+    if b.dtype != target_dtype:
+        b = b.astype(target_dtype)
 
     # Check for symmetry attribute on A
     is_symmetric = getattr(A, "_is_symmetric", False)
@@ -548,6 +566,29 @@ def solve(
             )
             recvcounts_tuple = tuple(recvcounts_val.tolist())
 
+            # Validate partition_info against the partition actually implied by
+            # the local matrix shapes (which is what AmgX uses). Reduce first so
+            # every rank raises together -- a rank-divergent raise would leave
+            # the other ranks deadlocked in the collectives below.
+            from mpi4py import MPI
+
+            row_start = int(displs_val[rank])
+            derived_partition = (row_start, row_start + n_local)
+            mismatch = tuple(partition_info) != derived_partition
+            if comm.allreduce(mismatch, op=MPI.LOR):
+                detail = (
+                    f"rank {rank}: partition_info {tuple(partition_info)} != "
+                    f"derived {derived_partition}"
+                    if mismatch
+                    else f"rank {rank} is consistent, but another rank's is not"
+                )
+                raise ValueError(
+                    "partition_info does not match the row partition derived "
+                    f"from the local matrix shapes ({detail}). Each rank must "
+                    "pass its own (row_start, row_end) matching its local "
+                    "partition."
+                )
+
             # max nnz across ranks (transpose send buffers) + this rank's local
             # nnz(A^T) (its output buffers).
             max_nnz = max(comm.allgather(len(A_csr.data)))
@@ -555,7 +596,6 @@ def solve(
 
             # Halo-exchange plan for the backward pass (fetches only the remote
             # solution entries this rank references, instead of all-gathering).
-            row_start = int(displs_val[rank])
             halo_plan = build_halo_plan(
                 A_csr.indices,
                 recvcounts_tuple,
@@ -597,24 +637,26 @@ def solve(
 
         x, info = solver(A_csr, b)
 
-    try:
-        info_dict = {
-            "iterations": int(info[0]),
-            "residual": float(info[1]),
-            "status": AMGXStatus(int(info[2])),
-        }
-        if save_stats_file is not None:
-            try:
-                stats_str = _amgx.get_stats_string()
-                _format_and_save_stats(
-                    stats_str, save_stats_file, comm=comm, mpi_cache=mpi_cache
-                )
-            except AttributeError:
-                pass
-        return x, info_dict
-    except Exception:
-        # Inside JIT: info elements are tracers; return them as-is.
+    if isinstance(info, jax.core.Tracer):
+        # Inside JIT (or another trace): info elements are tracers; return as-is.
         return x, {"iterations": info[0], "residual": info[1], "status": info[2]}
+
+    info_dict = {
+        "iterations": int(info[0]),
+        "residual": float(info[1]),
+        "status": AMGXStatus(int(info[2])),
+    }
+    if save_stats_file is not None:
+        try:
+            stats_str = _amgx.get_stats_string()
+        except AttributeError:
+            # Older extension without stats capture; nothing to save.
+            stats_str = None
+        if stats_str is not None:
+            _format_and_save_stats(
+                stats_str, save_stats_file, comm=comm, mpi_cache=mpi_cache
+            )
+    return x, info_dict
 
 
 def clear_solver_cache() -> None:

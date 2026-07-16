@@ -112,8 +112,130 @@ def _format_config(config: dict | None) -> str:
     return json.dumps(config, sort_keys=True, separators=(",", ":"))
 
 
+def _as_upper(value: Any) -> str:
+    return str(value).upper() if value is not None else ""
+
+
+def _as_int(value: Any, default: int | None = None) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _amg_blocks(solver_block: Any) -> list[dict]:
+    if not isinstance(solver_block, dict):
+        return []
+
+    blocks = []
+    if _as_upper(solver_block.get("solver")) == "AMG":
+        blocks.append(solver_block)
+
+    preconditioner = solver_block.get("preconditioner")
+    if (
+        isinstance(preconditioner, dict)
+        and _as_upper(preconditioner.get("solver")) == "AMG"
+    ):
+        blocks.append(preconditioner)
+
+    return blocks
+
+
+def _require_positive(block: dict, key: str, path: str) -> None:
+    if key not in block:
+        return
+    value = _as_float(block[key])
+    if value is None or value <= 0:
+        raise ValueError(f"Invalid AmgX config: {path}.{key} must be positive.")
+
+
+def _require_nonnegative(block: dict, key: str, path: str) -> None:
+    if key not in block:
+        return
+    value = _as_float(block[key])
+    if value is None or value < 0:
+        raise ValueError(f"Invalid AmgX config: {path}.{key} must be nonnegative.")
+
+
+def _validate_smoother(amg: dict, path: str) -> str:
+    smoother = amg.get("smoother")
+    if smoother is None:
+        return ""
+    if isinstance(smoother, str):
+        return _as_upper(smoother)
+    if isinstance(smoother, dict):
+        return _as_upper(smoother.get("solver"))
+    raise TypeError(
+        f"Invalid AmgX config: {path}.smoother must be a string or dictionary."
+    )
+
+
+def validate_config(config: dict, *, mpi: bool = False) -> None:
+    """Validate a prepared AmgX config for known unsupported combinations.
+
+    The validator is intentionally conservative: it catches configurations that
+    are known to trigger opaque AmgX/CUDA failures before entering the native
+    solver, but otherwise leaves AmgX's own config handling in charge.
+    """
+    solver_block = config.get("solver", config)
+    if not isinstance(solver_block, dict):
+        return
+
+    communicator = solver_block.get("communicator")
+    if communicator is not None and _as_upper(communicator) not in {
+        "MPI",
+        "MPI_DIRECT",
+    }:
+        raise ValueError(
+            "Invalid AmgX config: solver.communicator must be 'MPI' or 'MPI_DIRECT'."
+        )
+
+    _require_positive(solver_block, "max_iters", "solver")
+    _require_positive(solver_block, "tolerance", "solver")
+
+    solver_name = _as_upper(solver_block.get("solver"))
+    if solver_name in {"GMRES", "FGMRES"} and "gmres_n_restart" in solver_block:
+        _require_positive(solver_block, "gmres_n_restart", "solver")
+
+    for amg in _amg_blocks(solver_block):
+        path = "solver" if amg is solver_block else "solver.preconditioner"
+        _require_positive(amg, "max_iters", path)
+        _require_positive(amg, "max_levels", path)
+        _require_positive(amg, "dense_lu_num_rows", path)
+        _require_positive(amg, "min_coarse_rows", path)
+        _require_nonnegative(amg, "presweeps", path)
+        _require_nonnegative(amg, "postsweeps", path)
+
+        smoother_solver = _validate_smoother(amg, path)
+        if not mpi or smoother_solver != "MULTICOLOR_DILU":
+            continue
+
+        dense_lu_num_rows = _as_int(amg.get("dense_lu_num_rows"), default=1)
+        min_coarse_rows = _as_int(amg.get("min_coarse_rows"))
+        dense_lu_too_small = dense_lu_num_rows is not None and dense_lu_num_rows <= 1
+        min_coarse_too_small = min_coarse_rows is not None and min_coarse_rows <= 1
+        if dense_lu_too_small or min_coarse_too_small:
+            raise ValueError(
+                "Invalid MPI AmgX config: AMG with MULTICOLOR_DILU and "
+                "a tiny coarse-grid floor can coarsen to degenerate distributed "
+                "levels and fail inside AmgX's DILU halo setup. Set "
+                "dense_lu_num_rows and min_coarse_rows to larger values (for "
+                "example 64), or use a smoother such as BLOCK_JACOBI."
+            )
+
+
 def prepare_config(
-    user_config: dict | None = None, save_stats: bool = False, **kwargs: Any
+    user_config: dict | None = None,
+    save_stats: bool = False,
+    mpi: bool = False,
+    **kwargs: Any,
 ) -> str:
     """
     Prepare the final configuration string for AmgX.
@@ -161,5 +283,7 @@ def prepare_config(
 
         _inject_amg_stats(target_dict)
         _inject_amg_stats(target_dict.get("preconditioner", {}))
+
+    validate_config(merged_config, mpi=mpi)
 
     return _format_config(merged_config)

@@ -4,7 +4,7 @@
 
 ## Features
 
-- **GPU-Accelerated Solvers**: Leverages NVIDIA AmgX for a broad range of GPU-accelerated sparse linear solvers, including algebraic multigrid (AMG), Krylov methods, and various variants, with flexible configuraiton options for solvers, smoothers, and preconditioners.
+- **GPU-Accelerated Solvers**: Leverages NVIDIA AmgX for a broad range of GPU-accelerated sparse linear solvers, including algebraic multigrid (AMG), Krylov methods, and various variants, with flexible configuration options for solvers, smoothers, and preconditioners.
 - **Automatic Differentiation**: Supports adjoint-based gradient computation and integrates seamlessly with JAX for end-to-end differentiable workflows.
 - **JIT Compilation**: Built as a native JAX primitive, fully compatible with Just-in-Time compilation (`jax.jit`) for efficient, low-overhead execution.
 - **MPI Support**: Enables distributed linear solves across multiple GPUs, with GPU-aware MPI support.
@@ -30,14 +30,14 @@ JAX-AMG compiles a native extension against your CUDA toolkit and a source build
 ```python
 import jax
 import jax.numpy as jnp
-import jax.scipy.sparse as jsp
+import jax.experimental.sparse as jsp
 import jaxamg
 
 # Create a sparse matrix
 N = 100
-rows, cols = ...
-data = ...
-A = jsp.BCOO((data, (rows, cols)), shape=(N, N))
+rows, cols = ...  # (nnz,) row and column indices
+data = ...        # (nnz,) nonzero values
+A = jsp.BCOO((data, jnp.stack([rows, cols], axis=1)), shape=(N, N))
 b = jnp.ones(N)
 
 # Solve Ax = b
@@ -47,6 +47,8 @@ print(f"Solution: {x}")
 print(f"Iterations: {info['iterations']}")
 print(f"Residual: {info['residual']}")
 ```
+
+`A` can be any sparse matrix (`jax.experimental.sparse` BCSR/BCOO, SciPy sparse), a dense array, or a matrix-free callable operator.
 
 Refer to [Examples](examples.md) for additional usage examples.
 

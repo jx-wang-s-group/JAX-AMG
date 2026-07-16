@@ -103,9 +103,13 @@ def get_preferred_dtype(A: MatrixOrOperator, b: ArrayLike) -> DTypeLike:
     - Default is float32.
     - If b is float64, use float64.
     - If A provides float64 data, use float64 (promoting b if necessary).
+    - Non-float b dtypes (int, bool) are treated as float32, so an integer RHS
+      is promoted rather than truncating the matrix values.
     """
 
     target_dtype = getattr(b, "dtype", jnp.float32)
+    if target_dtype not in (jnp.float32, jnp.float64):
+        target_dtype = jnp.float32
 
     a_dtype = getattr(A, "dtype", None)
     a_data = getattr(A, "data", None)
@@ -233,11 +237,10 @@ def to_bcsr_matrix(
         # Determine shape
         if cached_info is not None:
             shape = cached_info[4]
-            # CHANGED
-            # if shape[0] != n_rows:
-            #     raise ValueError(
-            #         f"Cached operator has {shape[0]} rows, but RHS b has {n_rows} elements."
-            #     )
+            if shape[0] != n_rows:
+                raise ValueError(
+                    f"Cached operator has {shape[0]} rows, but RHS b has {n_rows} elements."
+                )
         else:
             shape = (n_rows, n_rows)
 
@@ -257,10 +260,7 @@ def to_bcsr_matrix(
             # attaches `_coloring_info` to A for reuse.
             cached_info = cache_coloring(A, shape)
 
-        rows, cols, column_colors, n_colors, cached_shape = cached_info
-
-        if shape != cached_shape:
-            raise ValueError(f"Operator shape changed from {cached_shape} to {shape}.")
+        rows, cols, column_colors, n_colors, _ = cached_info
 
         # Materialize using graph coloring (works efficiently inside JIT)
         # Note: materialize_sparse_matrix already returns a BCSR

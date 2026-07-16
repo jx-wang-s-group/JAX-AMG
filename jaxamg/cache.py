@@ -7,7 +7,6 @@ This module provides functions to cache metadata, enabling efficient usage with 
 from typing import TYPE_CHECKING, Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
 from . import config as amgx_config
@@ -79,6 +78,7 @@ def cache_mpi_metadata(
     partition_info: tuple[int, int],
     A: MatrixOrOperator,
     is_symmetric: bool = False,
+    save_stats: bool = False,
 ) -> dict[str, Any]:
     """
     Pre-compute and cache MPI metadata for JIT-compatible solver usage.
@@ -105,6 +105,9 @@ def cache_mpi_metadata(
             transpose output size (`nnz_out`) is left unset (``None``). Should
             match the `is_symmetric` passed to `with_cache`; the default (False)
             computes it, which is always safe.
+        save_stats: If True, prepare the config with solver statistics output
+            enabled, so a later `solve(..., save_stats_file=...)` on the cached
+            matrix produces a complete stats file.
 
     Returns:
         A dictionary containing MPI metadata.
@@ -113,7 +116,6 @@ def cache_mpi_metadata(
         The returned dictionary includes the following keys:
 
         - `recvcounts_tuple`: Tuple of row counts per rank
-        - `displs_tuple`: Tuple of displacement offsets
         - `comm_ptr`: MPI communicator pointer
         - `lrank`: Local GPU rank
         - `nglobal`: Global matrix size
@@ -130,10 +132,6 @@ def cache_mpi_metadata(
 
     # Compute MPI communication metadata
     all_sizes = comm.allgather(n_local)
-    recvcounts = jnp.array(all_sizes, dtype=jnp.int32)
-    displs = jnp.cumsum(jnp.concatenate([jnp.array([0]), recvcounts[:-1]])).astype(
-        jnp.int32
-    )
 
     from .mpi_utils import build_halo_plan, local_transpose_nnz, register_comm
 
@@ -144,7 +142,7 @@ def cache_mpi_metadata(
     lrank = rank % gpu_count
 
     # Prepare config string
-    config_str = amgx_config.prepare_config(config)
+    config_str = amgx_config.prepare_config(config, save_stats=save_stats, mpi=True)
 
     # Compute max_nnz across all ranks, and capture this rank's global column
     # indices (needed for nnz_out, the transpose output sizing).
@@ -198,8 +196,7 @@ def cache_mpi_metadata(
     )
 
     cache_dict = {
-        "recvcounts_tuple": tuple(recvcounts.tolist()),
-        "displs_tuple": tuple(displs.tolist()),
+        "recvcounts_tuple": recvcounts_tuple,
         "comm_ptr": comm_ptr,
         "lrank": lrank,
         "nglobal": nglobal,

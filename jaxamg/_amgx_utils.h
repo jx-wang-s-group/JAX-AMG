@@ -429,6 +429,23 @@ namespace
     }
   }
 
+  // Cleans up freshly created (not-yet-cached) resources on any early return
+  // -- AMGX_SAFE_CALL failures, allocation failures, or a failed solve. Arm it
+  // when entering the fresh-creation path and disarm just before the resources
+  // are handed to the cache; cache-owned entries are never destroyed here.
+  struct FreshResourceGuard
+  {
+    CachedResources *res;
+    bool armed = false;
+    ~FreshResourceGuard()
+    {
+      if (armed && res)
+      {
+        DestroyResources(*res);
+      }
+    }
+  };
+
   // Singleton for global AmgX resource management.
   // Owns the founding AMGX_config_handle that the resources were created with,
   // because the resources handle internally references it.
@@ -567,26 +584,6 @@ namespace
 #ifdef JAXAMG_WITH_MPI
     GlobalMPIResources::Get().Destroy();
 #endif
-  }
-
-  // Check if CUDA-aware MPI should be used (respects MPI4JAX convention)
-  inline bool use_cuda_aware_mpi()
-  {
-    static int cached = -1;
-    if (cached == -1)
-    {
-      const char *env = std::getenv("MPI4JAX_USE_CUDA_MPI");
-      if (env != nullptr)
-      {
-        cached = (std::string(env) == "1" || std::string(env) == "true") ? 1 : 0;
-      }
-      else
-      {
-        // Default: use host-staged MPI (safer, works with all MPI implementations)
-        cached = 0;
-      }
-    }
-    return cached == 1;
   }
 
 } // namespace

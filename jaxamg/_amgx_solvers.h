@@ -192,6 +192,10 @@ namespace
     CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, structure_hash, std::string(config)};
     bool cache_hit = GetSolverCache().get(key, res);
 
+    // Destroys freshly created resources on any early return below (armed only
+    // on the cache-miss path; disarmed once the cache takes ownership).
+    FreshResourceGuard fresh_guard{&res};
+
     bool reuse_success = false;
 
     if (cache_hit)
@@ -238,6 +242,7 @@ namespace
 
     if (!cache_hit)
     {
+      fresh_guard.armed = true;
 
       AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
 
@@ -261,23 +266,14 @@ namespace
       {
         if (cudaMalloc(&res.transpose_row_ptrs, (n_rows + 1) * sizeof(int)) != cudaSuccess)
         {
-          DestroyResources(res);
           return ffi::Error::Internal("cudaMalloc failed for transpose row_ptrs");
         }
         if (cudaMalloc(&res.transpose_col_indices, nnz * sizeof(int)) != cudaSuccess)
         {
-          cudaFree(res.transpose_row_ptrs);
-          res.transpose_row_ptrs = nullptr;
-          DestroyResources(res);
           return ffi::Error::Internal("cudaMalloc failed for transpose col_indices");
         }
         if (cudaMalloc(&res.transpose_values, nnz * sizeof(T)) != cudaSuccess)
         {
-          cudaFree(res.transpose_row_ptrs);
-          cudaFree(res.transpose_col_indices);
-          res.transpose_row_ptrs = nullptr;
-          res.transpose_col_indices = nullptr;
-          DestroyResources(res);
           return ffi::Error::Internal("cudaMalloc failed for transpose values");
         }
 
@@ -293,7 +289,6 @@ namespace
             static_cast<T *>(res.transpose_values));
         if (transpose_err != nullptr)
         {
-          DestroyResources(res);
           return ffi::Error::Internal(transpose_err);
         }
 
@@ -336,6 +331,7 @@ namespace
 
     if (status == AMGX_SOLVE_FAILED)
     {
+      // fresh_guard destroys not-yet-cached resources; cached entries stay.
       return ffi::Error::Internal("AmgX solve failed");
     }
 
@@ -358,11 +354,18 @@ namespace
 
     AMGX_SAFE_CALL(AMGX_vector_download(res.x_vec, x_data));
 
-    // 7. Store in Cache (if new)
+    // 7. Store in Cache (if new); the cache takes ownership from the guard.
     if (!cache_hit)
     {
+      fresh_guard.armed = false;
       GetSolverCache().put(key, res, DestroyResources);
     }
+
+    // AMGX_vector_download copies x with a plain cudaMemcpy on the legacy
+    // default stream, which is NOT ordered against XLA's non-blocking stream.
+    // Without this sync XLA can consume the output buffer before the copy
+    // lands (stale zeros/garbage under GPU contention). Mirrors the MPI path.
+    cudaDeviceSynchronize();
 
     return ffi::Error::Success();
   }
@@ -463,6 +466,10 @@ namespace
         std::string(config)};
     bool cache_hit = GetMPISolverCache().get(key, res);
 
+    // Destroys freshly created resources on any early return below (armed only
+    // on the cache-miss path; disarmed once the cache takes ownership).
+    FreshResourceGuard fresh_guard{&res};
+
     if (cache_hit)
     {
       // Refresh the cached matrix values. The D2D copy is asynchronous;
@@ -488,6 +495,8 @@ namespace
       // resources handle while stale distributed resources are still alive.
       // This avoids communicator setup crashes under small cache capacities.
       GetMPISolverCache().evict_lru_if_needed(1, DestroyResources);
+
+      fresh_guard.armed = true;
 
       AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
 
@@ -564,10 +573,7 @@ namespace
 
     if (status == AMGX_SOLVE_FAILED)
     {
-      if (!cache_hit)
-      {
-        DestroyResources(res);
-      }
+      // fresh_guard destroys not-yet-cached resources; cached entries stay.
       return ffi::Error::Internal("AmgX MPI solve failed");
     }
 
@@ -587,6 +593,7 @@ namespace
 
     if (!cache_hit)
     {
+      fresh_guard.armed = false;
       GetMPISolverCache().put(key, res, DestroyResources);
     }
 
@@ -672,90 +679,6 @@ namespace
         stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup);
   }
 
-  // -------------------------------------------------------------------------
-  // MPI AllGather Custom Call
-  // -------------------------------------------------------------------------
-
-  template <typename T, ffi::DataType DType>
-  inline ffi::Error AmgxAllGatherInternal(cudaStream_t stream,
-                                          ffi::Buffer<DType> sendbuf,
-                                          ffi::Buffer<ffi::DataType::S32> recvcounts,
-                                          ffi::Buffer<ffi::DataType::S32> displs,
-                                          ffi::Buffer<ffi::DataType::S32> comm_ptr_buf,
-                                          ffi::ResultBuffer<DType> recvbuf)
-  {
-    cudaStreamSynchronize(stream);
-
-    int comm_ptr_parts[2];
-    cudaMemcpy(comm_ptr_parts, comm_ptr_buf.typed_data(), 2 * sizeof(int), cudaMemcpyDeviceToHost);
-    uint64_t comm_ptr_val = (static_cast<uint64_t>(static_cast<uint32_t>(comm_ptr_parts[1])) << 32) |
-                            static_cast<uint64_t>(static_cast<uint32_t>(comm_ptr_parts[0]));
-    MPI_Comm *mpi_comm = reinterpret_cast<MPI_Comm *>(comm_ptr_val);
-    size_t nranks = recvcounts.element_count();
-    std::vector<int> counts_h(nranks);
-    std::vector<int> displs_h(nranks);
-
-    cudaMemcpy(counts_h.data(), recvcounts.typed_data(), nranks * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(displs_h.data(), displs.typed_data(), nranks * sizeof(int), cudaMemcpyDeviceToHost);
-
-    int send_count = static_cast<int>(sendbuf.element_count());
-    int total_recv_count = displs_h.back() + counts_h.back();
-    MPI_Datatype mpi_type = (sizeof(T) == 8) ? MPI_DOUBLE : MPI_FLOAT;
-
-    int err;
-    if (use_cuda_aware_mpi())
-    {
-      // CUDA-aware MPI: pass GPU pointers directly
-      err = MPI_Allgatherv(
-          const_cast<T *>(sendbuf.typed_data()), send_count, mpi_type,
-          recvbuf->typed_data(), counts_h.data(), displs_h.data(), mpi_type,
-          *mpi_comm);
-    }
-    else
-    {
-      // Host-staged MPI (default, compatible with all MPI implementations)
-      std::vector<T> send_host(send_count);
-      std::vector<T> recv_host(total_recv_count);
-
-      cudaMemcpy(send_host.data(), sendbuf.typed_data(), send_count * sizeof(T), cudaMemcpyDeviceToHost);
-
-      err = MPI_Allgatherv(send_host.data(), send_count, mpi_type,
-                           recv_host.data(), counts_h.data(), displs_h.data(), mpi_type,
-                           *mpi_comm);
-
-      if (err == MPI_SUCCESS)
-      {
-        cudaMemcpy(recvbuf->typed_data(), recv_host.data(), total_recv_count * sizeof(T), cudaMemcpyHostToDevice);
-      }
-    }
-
-    if (err != MPI_SUCCESS)
-    {
-      return ffi::Error::Internal("MPI_Allgatherv failed");
-    }
-
-    return ffi::Error::Success();
-  }
-
-  inline ffi::Error AmgxAllGatherImpl(cudaStream_t stream,
-                                      ffi::Buffer<ffi::DataType::F32> sendbuf,
-                                      ffi::Buffer<ffi::DataType::S32> recvcounts,
-                                      ffi::Buffer<ffi::DataType::S32> displs,
-                                      ffi::Buffer<ffi::DataType::S32> comm_ptr,
-                                      ffi::ResultBuffer<ffi::DataType::F32> recvbuf)
-  {
-    return AmgxAllGatherInternal<float, ffi::DataType::F32>(stream, sendbuf, recvcounts, displs, comm_ptr, recvbuf);
-  }
-
-  inline ffi::Error AmgxAllGatherImplDouble(cudaStream_t stream,
-                                            ffi::Buffer<ffi::DataType::F64> sendbuf,
-                                            ffi::Buffer<ffi::DataType::S32> recvcounts,
-                                            ffi::Buffer<ffi::DataType::S32> displs,
-                                            ffi::Buffer<ffi::DataType::S32> comm_ptr,
-                                            ffi::ResultBuffer<ffi::DataType::F64> recvbuf)
-  {
-    return AmgxAllGatherInternal<double, ffi::DataType::F64>(stream, sendbuf, recvcounts, displs, comm_ptr, recvbuf);
-  }
 #endif // JAXAMG_WITH_MPI
 
 } // namespace
