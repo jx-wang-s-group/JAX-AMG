@@ -21,6 +21,9 @@ from jaxamg.matrices import (
 )
 from jaxamg.utils import to_scipy
 
+# Every test here calls the native AmgX solver (skip logic in conftest.py).
+pytestmark = pytest.mark.gpu
+
 
 class TestSolver:
     """Test basic solver functionality."""
@@ -373,28 +376,93 @@ class TestSolver:
             assert info_batched["status"][i] == jaxamg.AMGXStatus.SUCCESS
 
     def test_vmap_batched_solve(self):
-        """Test that jax.vmap works with batched matrices."""
+        """Test that jax.vmap works with batched matrices and routes each batch
+        member's data to the right lane (distinct matrices and RHS per lane)."""
         n = 8
-        A = tridiagonal_matrix(n)
-        b = rhs_ones(n)
+        A1 = tridiagonal_matrix(n, diagonal_value=2.0)
+        A2 = tridiagonal_matrix(n, diagonal_value=4.0)
+        b1 = rhs_ones(n)
+        b2 = 2.0 * rhs_ones(n)
 
         A_batched = jsp.BCSR(
             (
-                jnp.stack([A.data, A.data]),
-                jnp.stack([A.indices, A.indices]),
-                jnp.stack([A.indptr, A.indptr]),
+                jnp.stack([A1.data, A2.data]),
+                jnp.stack([A1.indices, A2.indices]),
+                jnp.stack([A1.indptr, A2.indptr]),
             ),
             shape=(2, n, n),
         )
-        b_batched = jnp.stack([b, b])
+        b_batched = jnp.stack([b1, b2])
 
         # Vmap over the 0th axis of A_batched and b_batched
         vmap_solve = jax.vmap(jaxamg.solve, in_axes=(0, 0))
 
         # This should NOT raise ValueError because inside vmap A is not batched
-        x_batched, _ = vmap_solve(A_batched, b_batched)
+        x_batched, info_batched = vmap_solve(A_batched, b_batched)
 
         assert x_batched.shape == (2, n)
+        for i, (A, b) in enumerate(((A1, b1), (A2, b2))):
+            x_expected = jnp.linalg.solve(A.todense(), b)
+            np.testing.assert_allclose(x_batched[i], x_expected, rtol=1e-4, atol=1e-5)
+            assert info_batched["status"][i] == jaxamg.AMGXStatus.SUCCESS
+
+    def test_get_solver_cache_info(self):
+        """get_solver_cache_info reports the cached solver with a parsed config."""
+        jaxamg.clear_solver_cache()
+        n = 16
+        A = tridiagonal_matrix(n)
+        b = rhs_ones(n)
+        jaxamg.solve(A, b)
+
+        info = jaxamg.get_solver_cache_info()
+        assert set(info) >= {"single_gpu", "mpi", "isolated_mode"}
+        if info["isolated_mode"]:
+            pytest.skip("JAXAMG_CACHE_SIZE=0: nothing is cached in isolated mode")
+
+        single = info["single_gpu"]
+        assert single["size"] == len(single["entries"]) == 1
+        assert single["capacity"] >= 1
+        entry = single["entries"][0]
+        assert entry["n_rows"] == n
+        assert entry["nnz"] == 3 * n - 2
+        assert entry["mode"] == "float32"
+        # The config string must round-trip to the prepared default config.
+        assert isinstance(entry["config"], dict)
+        assert entry["config"]["solver"]["solver"] == "PBICGSTAB"
+
+    def test_jitted_iterative_solve_matches_eager(self):
+        """Regression test for the missing device sync after AmgX solves.
+
+        An FFI solve inside a jitted loop feeds XLA kernels immediately; before
+        the trailing ``cudaDeviceSynchronize`` in the native handler, those
+        consumers could read the solution buffer before AmgX's download landed
+        (stale zeros/garbage under GPU contention). The jitted Richardson
+        iteration must match the identical iteration run eagerly, where
+        ``block_until_ready`` guarantees every download has completed.
+        """
+        n = 8
+        steps = 20
+        A = poisson_matrix(n)
+        b = rhs_ones(n * n)
+        apply = jaxamg.make_preconditioner(A)
+
+        @jax.jit
+        def richardson(v):
+            def body(_, x):
+                return x + apply(v - A @ x)
+
+            return jax.lax.fori_loop(0, steps, body, jnp.zeros_like(v))
+
+        x_ref = jnp.zeros_like(b)
+        for _ in range(steps):
+            z = apply(b - A @ x_ref)
+            z.block_until_ready()
+            x_ref = x_ref + z
+
+        x_jit = richardson(b)
+        np.testing.assert_allclose(
+            np.asarray(x_jit), np.asarray(x_ref), rtol=1e-4, atol=1e-4
+        )
 
     def test_batched_matrix_error(self):
         """Test that passing a batched matrix directly raises ValueError."""

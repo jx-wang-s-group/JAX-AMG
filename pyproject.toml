@@ -94,6 +94,13 @@ version = { attr = "jaxamg._version.__version__" }
 [tool.setuptools.package-data]
 jaxamg = ["py.typed", "*.pyi"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: tests that run the native AmgX solver (skipped without a GPU JAX backend)",
+    "mpi: distributed tests; run under mpirun with pytest-mpi's --only-mpi flag",
+]
+
 [tool.ruff]
 line-length = 88
 target-version = "py312"

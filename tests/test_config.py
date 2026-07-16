@@ -17,6 +17,7 @@ def linear_system():
     return A, b
 
 
+@pytest.mark.gpu
 def test_config_defaults(linear_system):
     """Test that default configuration works."""
     A, b = linear_system
@@ -25,6 +26,7 @@ def test_config_defaults(linear_system):
     assert info["status"] == jaxamg.AMGXStatus.SUCCESS
 
 
+@pytest.mark.gpu
 def test_config_flat_dict(linear_system):
     """Test simple flat dictionary configuration."""
     A, b = linear_system
@@ -34,6 +36,7 @@ def test_config_flat_dict(linear_system):
     assert info["status"] == jaxamg.AMGXStatus.SUCCESS
 
 
+@pytest.mark.gpu
 def test_config_kwargs_override(linear_system):
     """Test that kwargs override default and config values."""
     A, b = linear_system
@@ -60,6 +63,7 @@ def test_config_kwargs_override(linear_system):
     assert info["iterations"] == 2
 
 
+@pytest.mark.gpu
 def test_config_nested(linear_system):
     """Test nested dictionary configuration."""
     A, b = linear_system

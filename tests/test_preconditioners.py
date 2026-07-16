@@ -119,6 +119,7 @@ def test_make_preconditioner_nested_config_merge(monkeypatch):
 
 
 @pytest.mark.parametrize("skew", [0.0, 1.0, 2.0])
+@pytest.mark.gpu
 def test_make_preconditioner_with_native_jax_bicgstab(skew):
     """Test that a preconditioner created by `make_preconditioner` can be used with `jax.scipy.sparse.linalg.bicgstab` to solve a skewed Poisson problem."""
 
@@ -196,6 +197,7 @@ def test_make_lineax_preconditioner_tag_override_and_validation(monkeypatch):
 
 
 @pytest.mark.parametrize("skew", [0.0, 2.0])
+@pytest.mark.gpu
 def test_make_lineax_preconditioner_with_lineax_solver(skew):
     """End-to-end: an AMG preconditioner built from a Lineax operator accelerates a
     Lineax Krylov solve of a (possibly skewed) Poisson problem."""

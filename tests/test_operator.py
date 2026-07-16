@@ -2,6 +2,7 @@
 
 import jax
 import numpy as np
+import pytest
 
 import jaxamg
 from jaxamg.matrices import (
@@ -11,6 +12,9 @@ from jaxamg.matrices import (
     tridiagonal_matrix,
     tridiagonal_operator,
 )
+
+# Every test here calls the native AmgX solver (skip logic in conftest.py).
+pytestmark = pytest.mark.gpu
 
 
 class TestOperator:

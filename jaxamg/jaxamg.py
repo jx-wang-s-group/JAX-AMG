@@ -14,7 +14,6 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from . import config as amgx_config
-from ._ext import _amgx
 from .mpi_utils import (
     _mpi4jax_alltoallv_transpose,
     _mpi4jax_halo_gather,
@@ -33,25 +32,41 @@ _AMGX_CALL_NAME_DOUBLE = "amgx_solve_double"
 _AMGX_CALL_NAME_MPI = "amgx_solve_mpi"
 _AMGX_CALL_NAME_MPI_DOUBLE = "amgx_solve_mpi_double"
 
+# The native extension is loaded lazily on first use, so importing jaxamg
+# (for sparsity tracing, matrix helpers, config handling, or on a CPU-only
+# machine such as a CI runner) does not require the AmgX/CUDA libraries.
+_amgx: Any = None
+
 # Whether the native extension was compiled with MPI support (JAXAMG_WITH_MPI).
-# A non-MPI build omits the MPI FFI handlers entirely, so the single-GPU path
-# below must be the only thing registered at import time.
-HAS_MPI = bool(getattr(_amgx, "mpi_enabled", False))
+# A non-MPI build omits the MPI FFI handlers entirely. Set by _ensure_backend().
+HAS_MPI = False
 
-# Get the handler from C++ and register for CUDA platform
-_AMGX_HANDLER = _amgx.get_amgx_solve_handler()
-_AMGX_HANDLER_DOUBLE = _amgx.get_amgx_solve_double_handler()
 
-ffi.register_ffi_target(_AMGX_CALL_NAME, _AMGX_HANDLER, platform="CUDA")
-ffi.register_ffi_target(_AMGX_CALL_NAME_DOUBLE, _AMGX_HANDLER_DOUBLE, platform="CUDA")
+def _ensure_backend() -> Any:
+    """Load the native AmgX extension and register its FFI targets (once)."""
+    global _amgx, HAS_MPI
+    if _amgx is not None:
+        return _amgx
+    from ._ext import _amgx as ext
 
-if HAS_MPI:
-    _AMGX_HANDLER_MPI = _amgx.get_amgx_solve_mpi_handler()
-    _AMGX_HANDLER_MPI_DOUBLE = _amgx.get_amgx_solve_mpi_double_handler()
-    ffi.register_ffi_target(_AMGX_CALL_NAME_MPI, _AMGX_HANDLER_MPI, platform="CUDA")
+    HAS_MPI = bool(getattr(ext, "mpi_enabled", False))
     ffi.register_ffi_target(
-        _AMGX_CALL_NAME_MPI_DOUBLE, _AMGX_HANDLER_MPI_DOUBLE, platform="CUDA"
+        _AMGX_CALL_NAME, ext.get_amgx_solve_handler(), platform="CUDA"
     )
+    ffi.register_ffi_target(
+        _AMGX_CALL_NAME_DOUBLE, ext.get_amgx_solve_double_handler(), platform="CUDA"
+    )
+    if HAS_MPI:
+        ffi.register_ffi_target(
+            _AMGX_CALL_NAME_MPI, ext.get_amgx_solve_mpi_handler(), platform="CUDA"
+        )
+        ffi.register_ffi_target(
+            _AMGX_CALL_NAME_MPI_DOUBLE,
+            ext.get_amgx_solve_mpi_double_handler(),
+            platform="CUDA",
+        )
+    _amgx = ext
+    return ext
 
 
 class AMGXStatus(IntEnum):
@@ -91,6 +106,7 @@ def _amgx_solve_impl(
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX solver (non-differentiable)."""
 
+    _ensure_backend()
     b = jnp.asarray(b)
 
     out_spec = (
@@ -138,6 +154,7 @@ def _amgx_solve_mpi_impl(
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX MPI solver (non-differentiable)."""
 
+    _ensure_backend()
     b = jnp.asarray(b)
 
     out_spec = (
@@ -456,6 +473,9 @@ def solve(
             "Please ensure you have a CUDA-enabled GPU and JAX is installed with CUDA support."
         )
 
+    # Load the native extension and register FFI targets (sets HAS_MPI).
+    _ensure_backend()
+
     # MPI cache may be pre-attached to A via `with_cache`
     mpi_cache = getattr(A, "_mpi_cache", None)
 
@@ -648,7 +668,7 @@ def solve(
     }
     if save_stats_file is not None:
         try:
-            stats_str = _amgx.get_stats_string()
+            stats_str = _ensure_backend().get_stats_string()
         except AttributeError:
             # Older extension without stats capture; nothing to save.
             stats_str = None
@@ -664,7 +684,7 @@ def clear_solver_cache() -> None:
     Clear the internal C++ AmgX solver cache.
     This releases all cached AmgX resources (matrices, solvers, vectors).
     """
-    _amgx.clear_solver_cache()
+    _ensure_backend().clear_solver_cache()
 
 
 def get_solver_cache_info() -> dict[str, Any]:
@@ -676,7 +696,7 @@ def get_solver_cache_info() -> dict[str, Any]:
         for single-GPU and MPI caches, plus whether isolated mode
         (`JAXAMG_CACHE_SIZE=0`) is active.
     """
-    solver_info = _amgx.get_solver_cache_info()
+    solver_info = _ensure_backend().get_solver_cache_info()
 
     # Convert config strings to JSON
     solver_info["single_gpu"]["entries"] = [
@@ -698,4 +718,4 @@ def finalize() -> None:
     Normally only needed to be called manually in MPI mode to avoid shutdown-time resource warnings.
     """
     clear_solver_cache()
-    _amgx.finalize()
+    _ensure_backend().finalize()

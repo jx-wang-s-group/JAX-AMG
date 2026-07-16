@@ -7,6 +7,9 @@ import jaxamg
 from jaxamg.matrices import rhs_ones, tridiagonal_matrix
 from jaxamg.utils import to_scipy
 
+# Every test here calls the native AmgX solver (skip logic in conftest.py).
+pytestmark = pytest.mark.gpu
+
 
 class TestMatrixFormats:
     """Test solver accepts various matrix formats."""
