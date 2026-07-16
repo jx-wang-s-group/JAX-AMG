@@ -673,7 +673,10 @@ def gather_vector(x_local: ArrayLike, comm: "Comm", root: int = 0) -> ArrayLike 
     from mpi4py import MPI
 
     rank = comm.Get_rank()
-    x_local_np = np.array(x_local, dtype=np.float64)
+    # Preserve float32/float64; promote any other dtype to float64.
+    x_local_np = np.ascontiguousarray(x_local)
+    if x_local_np.dtype not in (np.float32, np.float64):
+        x_local_np = x_local_np.astype(np.float64)
     n_local = len(x_local_np)
     all_sizes = comm.gather(n_local, root=root)
     all_sizes = cast(list, all_sizes)
