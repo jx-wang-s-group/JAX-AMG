@@ -469,10 +469,10 @@ def solve(
             **kwargs,
         )
 
-    # Detect desired precision
+    # Detect desired precision (non-float RHS dtypes are promoted to float32)
     target_dtype = get_preferred_dtype(A, b)
-    if target_dtype == jnp.float64 and b.dtype != jnp.float64:
-        b = b.astype(jnp.float64)
+    if b.dtype != target_dtype:
+        b = b.astype(target_dtype)
 
     # Check for symmetry attribute on A
     is_symmetric = getattr(A, "_is_symmetric", False)

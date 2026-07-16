@@ -103,9 +103,13 @@ def get_preferred_dtype(A: MatrixOrOperator, b: ArrayLike) -> DTypeLike:
     - Default is float32.
     - If b is float64, use float64.
     - If A provides float64 data, use float64 (promoting b if necessary).
+    - Non-float b dtypes (int, bool) are treated as float32, so an integer RHS
+      is promoted rather than truncating the matrix values.
     """
 
     target_dtype = getattr(b, "dtype", jnp.float32)
+    if target_dtype not in (jnp.float32, jnp.float64):
+        target_dtype = jnp.float32
 
     a_dtype = getattr(A, "dtype", None)
     a_data = getattr(A, "data", None)
