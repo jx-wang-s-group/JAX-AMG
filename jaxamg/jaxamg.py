@@ -600,24 +600,26 @@ def solve(
 
         x, info = solver(A_csr, b)
 
-    try:
-        info_dict = {
-            "iterations": int(info[0]),
-            "residual": float(info[1]),
-            "status": AMGXStatus(int(info[2])),
-        }
-        if save_stats_file is not None:
-            try:
-                stats_str = _amgx.get_stats_string()
-                _format_and_save_stats(
-                    stats_str, save_stats_file, comm=comm, mpi_cache=mpi_cache
-                )
-            except AttributeError:
-                pass
-        return x, info_dict
-    except Exception:
-        # Inside JIT: info elements are tracers; return them as-is.
+    if isinstance(info, jax.core.Tracer):
+        # Inside JIT (or another trace): info elements are tracers; return as-is.
         return x, {"iterations": info[0], "residual": info[1], "status": info[2]}
+
+    info_dict = {
+        "iterations": int(info[0]),
+        "residual": float(info[1]),
+        "status": AMGXStatus(int(info[2])),
+    }
+    if save_stats_file is not None:
+        try:
+            stats_str = _amgx.get_stats_string()
+        except AttributeError:
+            # Older extension without stats capture; nothing to save.
+            stats_str = None
+        if stats_str is not None:
+            _format_and_save_stats(
+                stats_str, save_stats_file, comm=comm, mpi_cache=mpi_cache
+            )
+    return x, info_dict
 
 
 def clear_solver_cache() -> None:
