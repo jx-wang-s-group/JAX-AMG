@@ -5,11 +5,13 @@ This module provides common sparse matrix patterns and right-hand-side
 vector generators for testing and demonstration purposes.
 """
 
+import shutil
 import tarfile
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
-from urllib.request import urlretrieve
+from typing import IO, cast
+from urllib.request import urlopen
 
 import jax
 import jax.experimental.sparse as jsp
@@ -763,12 +765,31 @@ def rhs_random(n: int, seed: int = 0, dtype: DTypeLike | None = None) -> jax.Arr
     return jax.random.normal(key, (n,), dtype=dtype)
 
 
+def _stream_to_path(source: IO[bytes], dest: Path) -> None:
+    """Stream ``source`` into ``dest`` via a unique temp file + atomic rename.
+
+    An interrupted write can therefore never leave a partial file at ``dest``
+    (which would permanently poison the cache), and concurrent writers (e.g.
+    MPI ranks) each write their own temp file instead of interleaving.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=dest.parent, suffix=".part")
+    tmp_path = Path(tmp_name)
+    try:
+        with open(fd, "wb") as target:
+            shutil.copyfileobj(source, target)
+        tmp_path.replace(dest)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def download_suitesparse_matrix(
     name: str,
     group: str | None = None,
     cache_dir: str | Path | None = None,
     dtype: DTypeLike | None = None,
     base_url: str = "https://sparse.tamu.edu/MM",
+    timeout: float = 60.0,
 ) -> sp.csr_matrix:
     """Download a SuiteSparse Matrix Collection matrix and return it as CSR.
 
@@ -778,6 +799,7 @@ def download_suitesparse_matrix(
         cache_dir: Directory for downloaded archives and extracted files.
         dtype: Optional dtype for matrix values.
         base_url: SuiteSparse Matrix Market archive base URL.
+        timeout: Socket timeout in seconds for the download.
 
     Returns:
         SciPy CSR matrix.
@@ -800,7 +822,8 @@ def download_suitesparse_matrix(
     if not matrix_path.exists():
         if not archive_path.exists():
             url = f"{base_url.rstrip('/')}/{group}/{name}.tar.gz"
-            urlretrieve(url, archive_path)
+            with urlopen(url, timeout=timeout) as response:
+                _stream_to_path(response, archive_path)
 
         with tarfile.open(archive_path, "r:gz") as archive:
             member = next(
@@ -812,8 +835,8 @@ def download_suitesparse_matrix(
             source = archive.extractfile(member)
             if source is None:
                 raise FileNotFoundError(f"{name}.mtx could not be read from archive")
-            with matrix_path.open("wb") as target:
-                target.write(source.read())
+            with source:
+                _stream_to_path(source, matrix_path)
 
     matrix = scipy.io.mmread(matrix_path)
     if not sp.issparse(matrix):
