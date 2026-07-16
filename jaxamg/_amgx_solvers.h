@@ -361,6 +361,12 @@ namespace
       GetSolverCache().put(key, res, DestroyResources);
     }
 
+    // AMGX_vector_download copies x with a plain cudaMemcpy on the legacy
+    // default stream, which is NOT ordered against XLA's non-blocking stream.
+    // Without this sync XLA can consume the output buffer before the copy
+    // lands (stale zeros/garbage under GPU contention). Mirrors the MPI path.
+    cudaDeviceSynchronize();
+
     return ffi::Error::Success();
   }
 
