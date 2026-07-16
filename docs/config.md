@@ -33,18 +33,25 @@ If you do not provide a config, JAX-AMG uses:
         "algorithm": "CLASSICAL",
         "selector": "PMIS",
         "interpolator": "D2",
-        "smoother": "BLOCK_JACOBI",
+        "smoother": {
+            "solver": "BLOCK_JACOBI",
+            "relaxation_factor": 0.9,
+        },
         "presweeps": 1,
         "postsweeps": 1,
-        "coarse_solver": "DENSE_LU_SOLVER",
-        "strength_threshold": 0.5,
         "max_levels": 100,
+        "strength_threshold": 0.5,
+        "dense_lu_num_rows": 1,
+        "aggressive_levels": 0,
+        "coarse_solver": "DENSE_LU_SOLVER",
+        "max_iters": 1,
         "cycle": "V",
     },
     "convergence": "RELATIVE_INI",
     "tolerance": 1e-6,
     "max_iters": 1000,
     "norm": "L2",
+    "exact_coarse_solve": 1,
 }
 ```
 

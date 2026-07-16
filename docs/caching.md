@@ -58,7 +58,7 @@ When to use each option:
 Set with environment variable:
 
 ```bash
-export JAXAMG_CACHE_SIZE=2 # Defualt is 1
+export JAXAMG_CACHE_SIZE=2 # Default is 1
 ```
 
 Behavior (two modes):

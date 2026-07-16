@@ -40,7 +40,7 @@ CUDA_VISIBLE_DEVICES=0 python -m pytest tests/
 ### MPI tests
 
 The MPI tests (`tests/test_mpi.py`) must be launched under `mpirun` and enabled
-with the `--with-mpi` flag provided by `pytest-mpi`. Most need at least two
+with the `--only-mpi` flag provided by `pytest-mpi`. Most need at least two
 ranks; assign a distinct GPU to each via `CUDA_VISIBLE_DEVICES`:
 
 ```bash

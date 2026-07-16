@@ -54,6 +54,12 @@ This page documents the public API of JAX-AMG.
 
 ## Runtime Utilities
 
+::: jaxamg.get_solver_cache_info
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
 ::: jaxamg.clear_solver_cache
     options:
         show_root_heading: true
