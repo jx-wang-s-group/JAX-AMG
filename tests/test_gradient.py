@@ -20,6 +20,9 @@ from jaxamg.matrices import (
 )
 from jaxamg.utils import to_scipy
 
+# Every test here calls the native AmgX solver (skip logic in conftest.py).
+pytestmark = pytest.mark.gpu
+
 
 def l2_loss(A, b, config={"solver": "CG"}):
     """Compute L(b) = ||A^{-1} b||^2."""

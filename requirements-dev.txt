@@ -7,10 +7,11 @@
 pytest>=7.0.0
 pytest-mpi>=0.6
 
-# Code quality
-black
-mypy
-ruff
+# Code quality (pinned so local, pre-commit, and CI lint agree;
+# keep in sync with .pre-commit-config.yaml)
+black==26.5.1
+mypy==2.3.0
+ruff==0.15.22
 pre-commit
 
 # Documentation

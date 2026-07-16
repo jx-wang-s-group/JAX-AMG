@@ -2,21 +2,22 @@
 # Install: pre-commit install
 # Run manually: pre-commit run --all-files
 
+# Tool versions are kept in sync with requirements-dev.txt and the CI lint job.
 repos:
   - repo: https://github.com/psf/black
-    rev: 25.1.0
+    rev: 26.5.1
     hooks:
       - id: black
         language_version: python3
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.0
+    rev: v0.15.22
     hooks:
       - id: ruff-check
         args: [--fix]
 
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.16.1
+    rev: v2.3.0
     hooks:
       - id: mypy
         additional_dependencies: [numpy, scipy, jax]
