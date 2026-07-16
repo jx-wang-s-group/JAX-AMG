@@ -5,11 +5,13 @@ This module provides common sparse matrix patterns and right-hand-side
 vector generators for testing and demonstration purposes.
 """
 
+import shutil
 import tarfile
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
-from urllib.request import urlretrieve
+from typing import IO, cast
+from urllib.request import urlopen
 
 import jax
 import jax.experimental.sparse as jsp
@@ -340,31 +342,26 @@ def tridiagonal_matrix_distributed(
     # Row-based partitioning
     row_start, row_end, n_local = get_partition_info(n_global, rank, nranks)
 
-    data, indices, indptr = [], [], [0]
+    # Each row's stencil in column order: (g-1, -1), (g, diag), (g+1, -1),
+    # with off-matrix neighbors masked out. Boolean masking with the concrete
+    # (n_local, 3) mask yields row-major CSR data with sorted columns.
+    global_rows = np.arange(row_start, row_end)
+    stencil_cols = global_rows[:, None] + np.array([-1, 0, 1])
+    valid = (stencil_cols >= 0) & (stencil_cols < n_global)
 
-    for local_i in range(n_local):
-        global_i = row_start + local_i
-
-        # Lower diagonal
-        if global_i > 0:
-            data.append(-1.0)
-            indices.append(global_i - 1)
-
-        # Main diagonal
-        data.append(diagonal_value)
-        indices.append(global_i)
-
-        # Upper diagonal
-        if global_i < n_global - 1:
-            data.append(-1.0)
-            indices.append(global_i + 1)
-
-        indptr.append(len(data))
+    # Values go through jnp, not NumPy: diagonal_value may be a tracer
+    # (e.g. when differentiating through the matrix build).
+    stencil_vals = jnp.broadcast_to(
+        jnp.array([-1.0, diagonal_value, -1.0], dtype=dtype), (n_local, 3)
+    )
+    data = stencil_vals[valid]
+    indices = stencil_cols[valid]
+    indptr = np.concatenate(([0], np.cumsum(valid.sum(axis=1))))
 
     # Indices are int32 by default; converted to int64 by _ensure_bcsr_properties if needed for MPI
     A_local = jsp.BCSR(
         (
-            jnp.array(data, dtype=dtype),
+            data,
             jnp.array(indices, dtype=jnp.int32),
             jnp.array(indptr, dtype=jnp.int32),
         ),
@@ -402,57 +399,42 @@ def poisson_matrix_distributed(
     # Row-based partitioning
     row_start, row_end, n_local = get_partition_info(n, rank, nranks)
 
-    rows, cols, vals = [], [], []
+    global_rows = np.arange(row_start, row_end)
+    ix = global_rows % nx
+    iy = global_rows // nx
 
-    for local_i in range(n_local):
-        global_i = row_start + local_i
-        ix = global_i % nx
-        iy = global_i // nx
-
-        # Diagonal entry
-        rows.append(local_i)
-        cols.append(global_i)
-        vals.append(4.0)
-
-        # Left neighbor
-        if ix > 0:
-            rows.append(local_i)
-            cols.append(global_i - 1)
-            vals.append(-1.0 - skew / 2.0)
-
-        # Right neighbor
-        if ix < nx - 1:
-            rows.append(local_i)
-            cols.append(global_i + 1)
-            vals.append(-1.0 + skew / 2.0)
-
-        # Bottom neighbor
-        if iy > 0:
-            rows.append(local_i)
-            cols.append(global_i - nx)
-            vals.append(-1.0 - skew / 2.0)
-
-        # Top neighbor
-        if iy < ny - 1:
-            rows.append(local_i)
-            cols.append(global_i + nx)
-            vals.append(-1.0 + skew / 2.0)
-
-    # Convert JAX dtype to NumPy dtype
-    np_dtype: type = np.float32 if dtype == jnp.float32 else np.float64
-
-    A_local_scipy = sp.csr_matrix(
-        (vals, (rows, cols)),
-        shape=(n_local, n),
-        dtype=np_dtype,
+    # Each row's 5-point stencil in column order: bottom (g-nx), left (g-1),
+    # diagonal (g), right (g+1), top (g+nx), with off-grid neighbors masked
+    # out. Boolean masking on the C-ordered (n_local, 5) arrays yields
+    # row-major CSR data with sorted columns.
+    stencil_cols = global_rows[:, None] + np.array([-nx, -1, 0, 1, nx])
+    stencil_vals = np.broadcast_to(
+        np.array(
+            [
+                -1.0 - skew / 2.0,  # bottom
+                -1.0 - skew / 2.0,  # left
+                4.0,  # diagonal
+                -1.0 + skew / 2.0,  # right
+                -1.0 + skew / 2.0,  # top
+            ]
+        ),
+        (n_local, 5),
     )
+    valid = np.stack(
+        [iy > 0, ix > 0, np.ones(n_local, dtype=bool), ix < nx - 1, iy < ny - 1],
+        axis=1,
+    )
+
+    data = stencil_vals[valid]
+    indices = stencil_cols[valid]
+    indptr = np.concatenate(([0], np.cumsum(valid.sum(axis=1))))
 
     # Indices are int32 by default; converted to int64 by _ensure_bcsr_properties if needed for MPI
     A_local = jsp.BCSR(
         (
-            jnp.array(A_local_scipy.data, dtype=dtype),
-            jnp.array(A_local_scipy.indices, dtype=jnp.int32),
-            jnp.array(A_local_scipy.indptr, dtype=jnp.int32),
+            jnp.array(data, dtype=dtype),
+            jnp.array(indices, dtype=jnp.int32),
+            jnp.array(indptr, dtype=jnp.int32),
         ),
         shape=(n_local, n),
     )
@@ -783,12 +765,31 @@ def rhs_random(n: int, seed: int = 0, dtype: DTypeLike | None = None) -> jax.Arr
     return jax.random.normal(key, (n,), dtype=dtype)
 
 
+def _stream_to_path(source: IO[bytes], dest: Path) -> None:
+    """Stream ``source`` into ``dest`` via a unique temp file + atomic rename.
+
+    An interrupted write can therefore never leave a partial file at ``dest``
+    (which would permanently poison the cache), and concurrent writers (e.g.
+    MPI ranks) each write their own temp file instead of interleaving.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=dest.parent, suffix=".part")
+    tmp_path = Path(tmp_name)
+    try:
+        with open(fd, "wb") as target:
+            shutil.copyfileobj(source, target)
+        tmp_path.replace(dest)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def download_suitesparse_matrix(
     name: str,
     group: str | None = None,
     cache_dir: str | Path | None = None,
     dtype: DTypeLike | None = None,
     base_url: str = "https://sparse.tamu.edu/MM",
+    timeout: float = 60.0,
 ) -> sp.csr_matrix:
     """Download a SuiteSparse Matrix Collection matrix and return it as CSR.
 
@@ -798,6 +799,7 @@ def download_suitesparse_matrix(
         cache_dir: Directory for downloaded archives and extracted files.
         dtype: Optional dtype for matrix values.
         base_url: SuiteSparse Matrix Market archive base URL.
+        timeout: Socket timeout in seconds for the download.
 
     Returns:
         SciPy CSR matrix.
@@ -820,7 +822,8 @@ def download_suitesparse_matrix(
     if not matrix_path.exists():
         if not archive_path.exists():
             url = f"{base_url.rstrip('/')}/{group}/{name}.tar.gz"
-            urlretrieve(url, archive_path)
+            with urlopen(url, timeout=timeout) as response:
+                _stream_to_path(response, archive_path)
 
         with tarfile.open(archive_path, "r:gz") as archive:
             member = next(
@@ -832,8 +835,8 @@ def download_suitesparse_matrix(
             source = archive.extractfile(member)
             if source is None:
                 raise FileNotFoundError(f"{name}.mtx could not be read from archive")
-            with matrix_path.open("wb") as target:
-                target.write(source.read())
+            with source:
+                _stream_to_path(source, matrix_path)
 
     matrix = scipy.io.mmread(matrix_path)
     if not sp.issparse(matrix):

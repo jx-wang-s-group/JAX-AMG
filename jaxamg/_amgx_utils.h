@@ -347,6 +347,8 @@ namespace
     void *transpose_row_ptrs = nullptr;    // transpose_solve mode only
     void *transpose_col_indices = nullptr; // transpose_solve mode only
     void *transpose_values = nullptr;      // transpose_solve mode only
+    void *transpose_workspace = nullptr;   // cusparse csr2csc scratch (transpose_solve only)
+    size_t transpose_workspace_size = 0;
     bool owns_resources = false;           // true if isolated (JAXAMG_CACHE_SIZE=0)
   };
 
@@ -422,6 +424,7 @@ namespace
       if (res.transpose_row_ptrs) cudaFree(res.transpose_row_ptrs);
       if (res.transpose_col_indices) cudaFree(res.transpose_col_indices);
       if (res.transpose_values) cudaFree(res.transpose_values);
+      if (res.transpose_workspace) cudaFree(res.transpose_workspace);
     }
     catch (...)
     {

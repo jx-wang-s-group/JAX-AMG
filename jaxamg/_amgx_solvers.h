@@ -44,6 +44,11 @@ namespace
     return handle;
   }
 
+  // The scratch workspace lives in the solver-cache entry (workspace_slot /
+  // workspace_size_slot) and is only (re)allocated when the required size
+  // grows: the transpose reruns on every backward solve whose values changed,
+  // and a per-call cudaMalloc/cudaFree pair is comparatively expensive
+  // (cudaFree also implicitly synchronizes the device).
   template <typename T>
   inline const char *CsrTransposeDevice(cudaStream_t stream,
                                         int n_rows,
@@ -53,7 +58,9 @@ namespace
                                         const T *values,
                                         int *row_ptrs_t,
                                         int *col_indices_t,
-                                        T *values_t)
+                                        T *values_t,
+                                        void **workspace_slot,
+                                        size_t *workspace_size_slot)
   {
     cusparseHandle_t handle = GetCusparseHandle();
     if (handle == nullptr)
@@ -88,10 +95,19 @@ namespace
       return "cusparseCsr2cscEx2_bufferSize failed";
     }
 
-    void *workspace = nullptr;
-    if (buffer_size > 0 && cudaMalloc(&workspace, buffer_size) != cudaSuccess)
+    if (buffer_size > *workspace_size_slot)
     {
-      return "cudaMalloc failed for cusparse transpose workspace";
+      if (*workspace_slot)
+      {
+        cudaFree(*workspace_slot);
+        *workspace_slot = nullptr;
+        *workspace_size_slot = 0;
+      }
+      if (cudaMalloc(workspace_slot, buffer_size) != cudaSuccess)
+      {
+        return "cudaMalloc failed for cusparse transpose workspace";
+      }
+      *workspace_size_slot = buffer_size;
     }
 
     status = cusparseCsr2cscEx2(
@@ -109,9 +125,7 @@ namespace
         CUSPARSE_ACTION_NUMERIC,
         CUSPARSE_INDEX_BASE_ZERO,
         CUSPARSE_CSR2CSC_ALG1,
-        workspace);
-
-    cudaFree(workspace);
+        *workspace_slot);
 
     if (status != CUSPARSE_STATUS_SUCCESS)
     {
@@ -215,7 +229,9 @@ namespace
             values_data,
             static_cast<int *>(res.transpose_row_ptrs),
             static_cast<int *>(res.transpose_col_indices),
-            static_cast<T *>(res.transpose_values));
+            static_cast<T *>(res.transpose_values),
+            &res.transpose_workspace,
+            &res.transpose_workspace_size);
         if (transpose_err != nullptr)
         {
           return ffi::Error::Internal(transpose_err);
@@ -286,7 +302,9 @@ namespace
             values_data,
             static_cast<int *>(res.transpose_row_ptrs),
             static_cast<int *>(res.transpose_col_indices),
-            static_cast<T *>(res.transpose_values));
+            static_cast<T *>(res.transpose_values),
+            &res.transpose_workspace,
+            &res.transpose_workspace_size);
         if (transpose_err != nullptr)
         {
           return ffi::Error::Internal(transpose_err);
