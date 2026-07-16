@@ -586,26 +586,6 @@ namespace
 #endif
   }
 
-  // Check if CUDA-aware MPI should be used (respects MPI4JAX convention)
-  inline bool use_cuda_aware_mpi()
-  {
-    static int cached = -1;
-    if (cached == -1)
-    {
-      const char *env = std::getenv("MPI4JAX_USE_CUDA_MPI");
-      if (env != nullptr)
-      {
-        cached = (std::string(env) == "1" || std::string(env) == "true") ? 1 : 0;
-      }
-      else
-      {
-        // Default: use host-staged MPI (safer, works with all MPI implementations)
-        cached = 0;
-      }
-    }
-    return cached == 1;
-  }
-
 } // namespace
 
 #endif // JAXAMG_AMGX_UTILS_H_

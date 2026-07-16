@@ -5,68 +5,15 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 
 import jax
 import jax.experimental.sparse as jsp
-import jax.ffi as ffi
 import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
 from jax.typing import ArrayLike
 
-from ._ext import _amgx
 from .utils import temp_enable_x64
 
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
-
-_AMGX_CALL_NAME_ALLGATHER = "amgx_allgather"
-_AMGX_CALL_NAME_ALLGATHER_DOUBLE = "amgx_allgather_double"
-
-# The AllGather FFI handlers only exist in an MPI-enabled build (JAXAMG_WITH_MPI).
-# Skip fetching/registering them otherwise so import works without MPI.
-_HAS_MPI = bool(getattr(_amgx, "mpi_enabled", False))
-
-if _HAS_MPI:
-    _AMGX_HANDLER_ALLGATHER = _amgx.get_amgx_allgather_handler()
-    _AMGX_HANDLER_ALLGATHER_DOUBLE = _amgx.get_amgx_allgather_double_handler()
-
-    ffi.register_ffi_target(
-        _AMGX_CALL_NAME_ALLGATHER, _AMGX_HANDLER_ALLGATHER, platform="CUDA"
-    )
-    ffi.register_ffi_target(
-        _AMGX_CALL_NAME_ALLGATHER_DOUBLE,
-        _AMGX_HANDLER_ALLGATHER_DOUBLE,
-        platform="CUDA",
-    )
-
-
-def _amgx_allgather_impl(
-    sendbuf: ArrayLike,
-    recvcounts: ArrayLike,
-    displs: ArrayLike,
-    comm_ptr: ArrayLike,
-    nglobal: ArrayLike | None = None,
-) -> jax.Array:
-    """MPI AllGatherv implementation via FFI."""
-
-    sendbuf = jnp.asarray(sendbuf)
-
-    if nglobal is None:
-        nglobal = jnp.sum(recvcounts)
-
-    out_spec = jax.ShapeDtypeStruct((nglobal,), sendbuf.dtype)
-
-    call_name = (
-        _AMGX_CALL_NAME_ALLGATHER_DOUBLE
-        if sendbuf.dtype == jnp.float64
-        else _AMGX_CALL_NAME_ALLGATHER
-    )
-
-    call = ffi.ffi_call(
-        call_name,
-        out_spec,
-        input_layouts=[None, None, None, None],
-        output_layouts=None,
-    )
-    return call(sendbuf, recvcounts, displs, comm_ptr)
 
 
 def _mpi4jax_allgatherv(

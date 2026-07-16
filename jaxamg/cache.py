@@ -7,7 +7,6 @@ This module provides functions to cache metadata, enabling efficient usage with 
 from typing import TYPE_CHECKING, Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
 from . import config as amgx_config
@@ -117,7 +116,6 @@ def cache_mpi_metadata(
         The returned dictionary includes the following keys:
 
         - `recvcounts_tuple`: Tuple of row counts per rank
-        - `displs_tuple`: Tuple of displacement offsets
         - `comm_ptr`: MPI communicator pointer
         - `lrank`: Local GPU rank
         - `nglobal`: Global matrix size
@@ -134,10 +132,6 @@ def cache_mpi_metadata(
 
     # Compute MPI communication metadata
     all_sizes = comm.allgather(n_local)
-    recvcounts = jnp.array(all_sizes, dtype=jnp.int32)
-    displs = jnp.cumsum(jnp.concatenate([jnp.array([0]), recvcounts[:-1]])).astype(
-        jnp.int32
-    )
 
     from .mpi_utils import build_halo_plan, local_transpose_nnz, register_comm
 
@@ -202,8 +196,7 @@ def cache_mpi_metadata(
     )
 
     cache_dict = {
-        "recvcounts_tuple": tuple(recvcounts.tolist()),
-        "displs_tuple": tuple(displs.tolist()),
+        "recvcounts_tuple": recvcounts_tuple,
         "comm_ptr": comm_ptr,
         "lrank": lrank,
         "nglobal": nglobal,

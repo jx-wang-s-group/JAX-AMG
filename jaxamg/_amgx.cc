@@ -125,29 +125,6 @@ namespace
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
   );
 
-  XLA_FFI_DEFINE_HANDLER(
-      AmgxAllGather,
-      AmgxAllGatherImpl,
-      ffi::Ffi::Bind()
-          .Ctx<ffi::PlatformStream<cudaStream_t>>()
-          .Arg<ffi::Buffer<ffi::F32>>() // sendbuf
-          .Arg<ffi::Buffer<ffi::S32>>() // recvcounts
-          .Arg<ffi::Buffer<ffi::S32>>() // displs
-          .Arg<ffi::Buffer<ffi::S32>>() // comm_ptr
-          .Ret<ffi::Buffer<ffi::F32>>() // recvbuf
-  );
-
-  XLA_FFI_DEFINE_HANDLER(
-      AmgxAllGatherDouble,
-      AmgxAllGatherImplDouble,
-      ffi::Ffi::Bind()
-          .Ctx<ffi::PlatformStream<cudaStream_t>>()
-          .Arg<ffi::Buffer<ffi::F64>>() // sendbuf
-          .Arg<ffi::Buffer<ffi::S32>>() // recvcounts
-          .Arg<ffi::Buffer<ffi::S32>>() // displs
-          .Arg<ffi::Buffer<ffi::S32>>() // comm_ptr
-          .Ret<ffi::Buffer<ffi::F64>>() // recvbuf
-  );
 #endif // JAXAMG_WITH_MPI
 
 } // namespace
@@ -163,10 +140,6 @@ PYBIND11_MODULE(_amgx, m)
         { return py::capsule(reinterpret_cast<void *>(AmgxSolveMPI)); });
   m.def("get_amgx_solve_mpi_double_handler", []()
         { return py::capsule(reinterpret_cast<void *>(AmgxSolveMPIDouble)); });
-  m.def("get_amgx_allgather_handler", []()
-        { return py::capsule(reinterpret_cast<void *>(AmgxAllGather)); });
-  m.def("get_amgx_allgather_double_handler", []()
-        { return py::capsule(reinterpret_cast<void *>(AmgxAllGatherDouble)); });
   m.attr("mpi_enabled") = py::bool_(true);
 #else
   m.attr("mpi_enabled") = py::bool_(false);

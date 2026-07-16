@@ -571,9 +571,7 @@ def poisson_operator(skew: float = 0.0, dtype: DTypeLike | None = None) -> Calla
     return matvec
 
 
-def poisson3d_operator(
-    robin: float = 0.0, diagonal_value: float = 6.0, dtype: DTypeLike | None = None
-) -> Callable:
+def poisson3d_operator(robin: float = 0.0, diagonal_value: float = 6.0) -> Callable:
     """Create a matrix-free 3D Poisson operator (7-point stencil).
 
     The operator discretizes -Δu on a regular n×n×n grid, applied via stencil
