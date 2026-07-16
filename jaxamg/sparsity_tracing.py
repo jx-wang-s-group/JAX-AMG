@@ -819,7 +819,21 @@ def _scan(
     p = eqn.params
     body = p["jaxpr"]
     body_jaxpr, body_consts = getattr(body, "jaxpr", body), getattr(body, "consts", [])
-    nconsts, ncarry, length = p["num_consts"], p["num_carry"], p["length"]
+    if "num_consts" in p:
+        nconsts, ncarry = p["num_consts"], p["num_carry"]
+    else:
+        # jax >= 0.11: the counts moved into the ft_in FlatTree, whose unpacked
+        # (consts, carry, xs) groups hold one placeholder per eqn invar. Bail on
+        # any forwarding shape where invars are not their plain concatenation.
+        groups = p["ft_in"].unpack()
+        if any(entry is not None for group in groups for entry in group):
+            raise _BailOut("scan with forwarded ft_in entries")
+        nconsts, ncarry = len(groups[0]), len(groups[1])
+        if nconsts + ncarry + len(groups[2]) != len(eqn.invars):
+            raise _BailOut("scan ft_in inconsistent with invars")
+    if len(body_jaxpr.outvars) != len(eqn.outvars):
+        raise _BailOut("scan body outputs inconsistent with outvars")
+    length = p["length"]
     reverse = p.get("reverse", False)
     if length > 4096:
         raise _BailOut("scan too long to unroll")
