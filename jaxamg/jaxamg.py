@@ -1,6 +1,7 @@
 import functools
 import json
 import os
+import warnings
 from collections.abc import Callable
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, cast
@@ -460,7 +461,21 @@ def solve(
 
     # Prepare configuration string/file (skip if using mpi_cache which already has config_str)
     if mpi_cache is not None:
+        if config is not None or kwargs:
+            warnings.warn(
+                "A carries cached MPI metadata (with_cache(..., mpi=...)); the "
+                "config/kwargs passed to solve() are ignored in favor of the "
+                "cached config. Pass the config to cache_mpi_metadata() instead.",
+                stacklevel=2,
+            )
         config_str = mpi_cache["config_str"]
+        if save_stats_file is not None and '"print_solve_stats"' not in config_str:
+            warnings.warn(
+                "save_stats_file was passed, but the cached MPI config was "
+                "prepared without stats output; the stats file will be missing "
+                "solver statistics. Pass save_stats=True to cache_mpi_metadata().",
+                stacklevel=2,
+            )
     else:
         config_str = amgx_config.prepare_config(
             config,

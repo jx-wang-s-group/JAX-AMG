@@ -79,6 +79,7 @@ def cache_mpi_metadata(
     partition_info: tuple[int, int],
     A: MatrixOrOperator,
     is_symmetric: bool = False,
+    save_stats: bool = False,
 ) -> dict[str, Any]:
     """
     Pre-compute and cache MPI metadata for JIT-compatible solver usage.
@@ -105,6 +106,9 @@ def cache_mpi_metadata(
             transpose output size (`nnz_out`) is left unset (``None``). Should
             match the `is_symmetric` passed to `with_cache`; the default (False)
             computes it, which is always safe.
+        save_stats: If True, prepare the config with solver statistics output
+            enabled, so a later `solve(..., save_stats_file=...)` on the cached
+            matrix produces a complete stats file.
 
     Returns:
         A dictionary containing MPI metadata.
@@ -144,7 +148,7 @@ def cache_mpi_metadata(
     lrank = rank % gpu_count
 
     # Prepare config string
-    config_str = amgx_config.prepare_config(config, mpi=True)
+    config_str = amgx_config.prepare_config(config, save_stats=save_stats, mpi=True)
 
     # Compute max_nnz across all ranks, and capture this rank's global column
     # indices (needed for nnz_out, the transpose output sizing).
