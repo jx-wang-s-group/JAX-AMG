@@ -19,7 +19,6 @@ from jaxamg.matrices import poisson_matrix, rhs_linear
 from jaxamg.mpi_utils import (
     gather_vector,
     partition_csr_matrix,
-    partition_vector,
     validate_partition,
 )
 
@@ -69,9 +68,6 @@ def main():
 
     validate_partition(A_local, n, row_start, row_end)
 
-    b_global = rhs_linear(n)
-    b_local, _, _ = partition_vector(b_global, rank, nranks)
-
     comm.Barrier()
     if rank == 0:
         print("\nSolving distributed system...")
@@ -96,8 +92,6 @@ def main():
     solve_time = time.time() - t_start
 
     comm.Barrier()
-    for r in range(nranks):
-        comm.Barrier()
 
     if rank == 0:
         print(f"  Info: {info}")

@@ -2,7 +2,7 @@
 Demo: MPI-distributed automatic differentiation of torso3 (a structurally non-symmetric system).
 
 Usage:
-    mpirun -n 2 python demo/mpi_nonsysmmetric_matrix_autodiff.py
+    mpirun -n 2 python demo/mpi_nonsymmetric_matrix_autodiff.py
 """
 
 import time

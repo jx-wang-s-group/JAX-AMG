@@ -81,8 +81,6 @@ def main():
     solve_time = time.time() - t_start
 
     comm.Barrier()
-    for r in range(nranks):
-        comm.Barrier()
 
     if rank == 0:
         print(f"  Info: {info}")

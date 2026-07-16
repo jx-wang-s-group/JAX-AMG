@@ -9,7 +9,6 @@ Usage:
     mpirun -n 4 python demo/mpi_solver_cache_benchmark.py
 """
 
-import copy
 import time
 
 import jax
@@ -92,76 +91,54 @@ def run_benchmark(n_global, n_runs=5):
     baseline_times = []
     key = jax.random.PRNGKey(0)
 
-    # Build per-iteration MPI caches with distinct config file paths.
-    # The native cache key includes config string path, so this avoids resource reuse
-    # without calling clear_solver_cache() in MPI mode.
-    baseline_mpi_caches = [
-        jaxamg.cache_mpi_metadata(
-            copy.deepcopy(solver_config),
-            comm,
-            n_global,
-            partition_info,
-            A_local,
-            is_symmetric=True,
-        )
-        for _ in range(n_runs + 1)
-    ]
+    mpi_cache = jaxamg.cache_mpi_metadata(
+        solver_config, comm, n_global, partition_info, A_local, is_symmetric=True
+    )
 
     if rank == 0:
         print("\nRunning baseline...")
 
     # Warmup baseline
     key, warmup_key = jax.random.split(key)
-    step(A_local, b_local, warmup_key, baseline_mpi_caches[0]).block_until_ready()
+    step(A_local, b_local, warmup_key, mpi_cache).block_until_ready()
     comm.Barrier()
 
-    for i in range(n_runs):
+    for _ in range(n_runs):
         key, subkey = jax.random.split(key)
+        # Drop the cached AmgX resources (all ranks in lockstep) so every
+        # timed solve pays the full miss cost: resource creation, matrix
+        # upload, and solver setup. The clear itself is not timed.
+        jaxamg.clear_solver_cache()
         comm.Barrier()
         t0 = time.time()
-        x = step(A_local, b_local, subkey, baseline_mpi_caches[i + 1])
+        x = step(A_local, b_local, subkey, mpi_cache)
         x.block_until_ready()
         comm.Barrier()
         baseline_times.append((time.time() - t0) * 1000)
 
     avg_baseline = _summarize_times(comm, rank, "Baseline", baseline_times)
 
-    # Important for small cache sizes (especially CACHE_SIZE=1):
-    # baseline intentionally churns cache keys and can stress eviction paths.
-    # Fully reset native state before running cached branch.
-    comm.Barrier()
-    jaxamg.finalize()
-    comm.Barrier()
-
-    # Recreate matrix/RHS after finalize so cached branch starts from clean state.
-    A_local, row_start, row_end = tridiagonal_matrix_distributed(
-        n_global, rank, nranks, diagonal_value=4.0
-    )
-    n_local = row_end - row_start
-    b_local = rhs_ones(n_local, dtype=A_local.data.dtype)
-    partition_info = (row_start, row_end)
-
     cached_times = []
     key = jax.random.PRNGKey(0)
 
-    # Single MPI metadata cache reused across iterations for resource cache hits.
-    cached_mpi_cache = jaxamg.cache_mpi_metadata(
-        solver_config, comm, n_global, partition_info, A_local, is_symmetric=True
-    )
+    # Start the cached branch from a miss as well: its warmup repopulates the
+    # cache, then every timed solve is a hit that reuses the AmgX resources.
+    jaxamg.clear_solver_cache()
+    comm.Barrier()
 
     if rank == 0:
         print("\nRunning cached...")
 
     # Warmup cached
     key, warmup_key = jax.random.split(key)
-    step(A_local, b_local, warmup_key, cached_mpi_cache).block_until_ready()
+    step(A_local, b_local, warmup_key, mpi_cache).block_until_ready()
     comm.Barrier()
 
     for _ in range(n_runs):
         key, subkey = jax.random.split(key)
         comm.Barrier()
         t0 = time.time()
-        x = step(A_local, b_local, subkey, cached_mpi_cache)
+        x = step(A_local, b_local, subkey, mpi_cache)
         x.block_until_ready()
         comm.Barrier()
         cached_times.append((time.time() - t0) * 1000)

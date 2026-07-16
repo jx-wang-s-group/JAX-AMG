@@ -23,11 +23,10 @@ def run_jaxamg_solver(name, A, b, *, config=None, **kwargs):
         x, info = jaxamg.solve(A, b, config=config, **kwargs)
         elapsed = time.time() - t_start
         residual = jnp.linalg.norm(b - A @ x) / jnp.linalg.norm(b)
-        iterations = info.get("iterations", "?")
         print(f"{name:40s} | time={elapsed:6.3f}s residual={float(residual):.3e}")
-    except Exception:
+    except Exception as exc:
         elapsed = time.time() - t_start
-        print(f"{name:40s} | time={elapsed:6.3f}s residual=nan")
+        print(f"{name:40s} | time={elapsed:6.3f}s FAILED: {exc}")
 
 
 def run_solver(name, solver_fn, A, b, *, M=None, tol=1e-6, maxiter=200):
@@ -39,7 +38,7 @@ def run_solver(name, solver_fn, A, b, *, M=None, tol=1e-6, maxiter=200):
         print(f"{name:40s} | time={elapsed:6.3f}s residual={float(residual):.3e}")
     except Exception as exc:
         elapsed = time.time() - t_start
-        print(f"{name:40s} | time={elapsed:6.3f}s residaul=nan")
+        print(f"{name:40s} | time={elapsed:6.3f}s FAILED: {exc}")
 
 
 def run_lineax_solver(name, solver, operator, b, *, preconditioner=None):
@@ -47,15 +46,17 @@ def run_lineax_solver(name, solver, operator, b, *, preconditioner=None):
     kwargs = {}
     if preconditioner is not None:
         kwargs["options"] = {"preconditioner": preconditioner}
-    try:
-        solution = lx.linear_solve(operator, b, solver=solver, **kwargs)
-        elapsed = time.time() - t_start
-        x = solution.value
-        residual = jnp.linalg.norm(b - operator.mv(x)) / jnp.linalg.norm(b)
-        print(f"{name:40s} | time={elapsed:6.3f}s residual={float(residual):.3e}")
-    except Exception as exc:
-        elapsed = time.time() - t_start
-        print(f"{name:40s} | time={elapsed:6.3f}s residual=nan")
+    # throw=False reports solver failure via solution.result instead of raising.
+    solution = lx.linear_solve(operator, b, solver=solver, throw=False, **kwargs)
+    x = solution.value
+    elapsed = time.time() - t_start
+    residual = jnp.linalg.norm(b - operator.mv(x)) / jnp.linalg.norm(b)
+    status = (
+        ""
+        if solution.result == lx.RESULTS.successful
+        else f" FAILED: {solution.result}"
+    )
+    print(f"{name:40s} | time={elapsed:6.3f}s residual={float(residual):.3e}{status}")
 
 
 def main():
