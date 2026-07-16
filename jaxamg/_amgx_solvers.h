@@ -192,6 +192,10 @@ namespace
     CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, structure_hash, std::string(config)};
     bool cache_hit = GetSolverCache().get(key, res);
 
+    // Destroys freshly created resources on any early return below (armed only
+    // on the cache-miss path; disarmed once the cache takes ownership).
+    FreshResourceGuard fresh_guard{&res};
+
     bool reuse_success = false;
 
     if (cache_hit)
@@ -238,6 +242,7 @@ namespace
 
     if (!cache_hit)
     {
+      fresh_guard.armed = true;
 
       AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
 
@@ -261,23 +266,14 @@ namespace
       {
         if (cudaMalloc(&res.transpose_row_ptrs, (n_rows + 1) * sizeof(int)) != cudaSuccess)
         {
-          DestroyResources(res);
           return ffi::Error::Internal("cudaMalloc failed for transpose row_ptrs");
         }
         if (cudaMalloc(&res.transpose_col_indices, nnz * sizeof(int)) != cudaSuccess)
         {
-          cudaFree(res.transpose_row_ptrs);
-          res.transpose_row_ptrs = nullptr;
-          DestroyResources(res);
           return ffi::Error::Internal("cudaMalloc failed for transpose col_indices");
         }
         if (cudaMalloc(&res.transpose_values, nnz * sizeof(T)) != cudaSuccess)
         {
-          cudaFree(res.transpose_row_ptrs);
-          cudaFree(res.transpose_col_indices);
-          res.transpose_row_ptrs = nullptr;
-          res.transpose_col_indices = nullptr;
-          DestroyResources(res);
           return ffi::Error::Internal("cudaMalloc failed for transpose values");
         }
 
@@ -293,7 +289,6 @@ namespace
             static_cast<T *>(res.transpose_values));
         if (transpose_err != nullptr)
         {
-          DestroyResources(res);
           return ffi::Error::Internal(transpose_err);
         }
 
@@ -336,6 +331,7 @@ namespace
 
     if (status == AMGX_SOLVE_FAILED)
     {
+      // fresh_guard destroys not-yet-cached resources; cached entries stay.
       return ffi::Error::Internal("AmgX solve failed");
     }
 
@@ -358,9 +354,10 @@ namespace
 
     AMGX_SAFE_CALL(AMGX_vector_download(res.x_vec, x_data));
 
-    // 7. Store in Cache (if new)
+    // 7. Store in Cache (if new); the cache takes ownership from the guard.
     if (!cache_hit)
     {
+      fresh_guard.armed = false;
       GetSolverCache().put(key, res, DestroyResources);
     }
 
@@ -463,6 +460,10 @@ namespace
         std::string(config)};
     bool cache_hit = GetMPISolverCache().get(key, res);
 
+    // Destroys freshly created resources on any early return below (armed only
+    // on the cache-miss path; disarmed once the cache takes ownership).
+    FreshResourceGuard fresh_guard{&res};
+
     if (cache_hit)
     {
       // Refresh the cached matrix values. The D2D copy is asynchronous;
@@ -488,6 +489,8 @@ namespace
       // resources handle while stale distributed resources are still alive.
       // This avoids communicator setup crashes under small cache capacities.
       GetMPISolverCache().evict_lru_if_needed(1, DestroyResources);
+
+      fresh_guard.armed = true;
 
       AMGX_SAFE_CALL(CreateAmgxConfigFromStringOrFile(config, &res.cfg));
 
@@ -564,10 +567,7 @@ namespace
 
     if (status == AMGX_SOLVE_FAILED)
     {
-      if (!cache_hit)
-      {
-        DestroyResources(res);
-      }
+      // fresh_guard destroys not-yet-cached resources; cached entries stay.
       return ffi::Error::Internal("AmgX MPI solve failed");
     }
 
@@ -587,6 +587,7 @@ namespace
 
     if (!cache_hit)
     {
+      fresh_guard.armed = false;
       GetMPISolverCache().put(key, res, DestroyResources);
     }
 

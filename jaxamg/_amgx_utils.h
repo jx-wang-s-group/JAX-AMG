@@ -429,6 +429,23 @@ namespace
     }
   }
 
+  // Cleans up freshly created (not-yet-cached) resources on any early return
+  // -- AMGX_SAFE_CALL failures, allocation failures, or a failed solve. Arm it
+  // when entering the fresh-creation path and disarm just before the resources
+  // are handed to the cache; cache-owned entries are never destroyed here.
+  struct FreshResourceGuard
+  {
+    CachedResources *res;
+    bool armed = false;
+    ~FreshResourceGuard()
+    {
+      if (armed && res)
+      {
+        DestroyResources(*res);
+      }
+    }
+  };
+
   // Singleton for global AmgX resource management.
   // Owns the founding AMGX_config_handle that the resources were created with,
   // because the resources handle internally references it.
