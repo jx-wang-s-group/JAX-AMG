@@ -143,9 +143,8 @@ namespace
 
   // Assemble the host-side stats buffer: [iterations, final_residual, status,
   // residual_history...]. The history capacity is whatever the caller allocated
-  // beyond the first three entries (max_iters + 1 slots, or zero for callers
-  // that predate residual history); slots past iteration `iters` stay NaN so
-  // Python can tell padding from recorded residuals.
+  // beyond the first three entries (max_iters + 1 slots); slots past iteration
+  // `iters` stay NaN so Python can tell padding from recorded residuals.
   template <typename T>
   inline std::vector<T> CollectSolveStats(AMGX_solver_handle solver,
                                           size_t stats_len,
@@ -182,12 +181,14 @@ namespace
                                       ffi::Buffer<ffi::DataType::S32> col_indices,
                                       ffi::Buffer<DType> values,
                                       ffi::Buffer<DType> b,
+                                      ffi::Buffer<DType> x0,
                                       ffi::ResultBuffer<DType> x,
                                       ffi::ResultBuffer<DType> stats,
                                       std::string_view config,
                                       int32_t transpose_solve,
                                       int32_t return_stats,
-                                      int32_t reuse_setup)
+                                      int32_t reuse_setup,
+                                      int32_t use_x0)
   {
     EnsureAmgxInitialized();
 
@@ -212,6 +213,8 @@ namespace
     int *col_indices_data = const_cast<int *>(col_indices.typed_data());
     T *values_data = const_cast<T *>(values.typed_data());
     T *b_data = const_cast<T *>(b.typed_data());
+    // Ignored (an arbitrary same-shape buffer) unless use_x0 is set.
+    T *x0_data = const_cast<T *>(x0.typed_data());
     T *x_data = x->typed_data();
     T *stats_data = stats->typed_data();
 
@@ -281,7 +284,11 @@ namespace
       if (!reuse_setup)
         AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
-      AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
+      // AMGX_solver_solve treats the x vector's contents as the initial guess.
+      if (use_x0 != 0)
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_rows, 1, x0_data));
+      else
+        AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
 
       reuse_success = true;
     }
@@ -368,7 +375,10 @@ namespace
       }
 
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
-      AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
+      if (use_x0 != 0)
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_rows, 1, x0_data));
+      else
+        AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
       AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
     }
 
@@ -431,6 +441,7 @@ namespace
                                          ffi::Buffer<ffi::DataType::S64> col_indices,
                                          ffi::Buffer<DType> values,
                                          ffi::Buffer<DType> b,
+                                         ffi::Buffer<DType> x0,
                                          ffi::Buffer<ffi::DataType::S32> nglobal_buf,
                                          ffi::Buffer<ffi::DataType::S32> comm_ptr_buf,
                                          ffi::Buffer<ffi::DataType::S32> lrank_buf,
@@ -439,7 +450,8 @@ namespace
                                          std::string_view config,
                                          int32_t transpose_solve,
                                          int32_t return_stats,
-                                         int32_t reuse_setup)
+                                         int32_t reuse_setup,
+                                         int32_t use_x0)
   {
     if (transpose_solve != 0)
     {
@@ -478,6 +490,8 @@ namespace
     int64_t *col_indices_data = const_cast<int64_t *>(col_indices.typed_data());
     T *values_data = const_cast<T *>(values.typed_data());
     T *b_data = const_cast<T *>(b.typed_data());
+    // Ignored (an arbitrary same-shape buffer) unless use_x0 is set.
+    T *x0_data = const_cast<T *>(x0.typed_data());
     T *x_data = x->typed_data();
     T *stats_data = stats->typed_data();
 
@@ -532,8 +546,16 @@ namespace
       if (!reuse_setup)
         AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
-      std::vector<T> h_x(n_local, static_cast<T>(0));
-      AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
+      // AMGX_solver_solve treats the x vector's contents as the initial guess.
+      if (use_x0 != 0)
+      {
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, x0_data));
+      }
+      else
+      {
+        std::vector<T> h_x(n_local, static_cast<T>(0));
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
+      }
     }
 
     StatsCaptureGuard capture_guard(return_stats != 0);
@@ -609,8 +631,15 @@ namespace
       AMGX_SAFE_CALL(AMGX_vector_bind(res.x_vec, res.A));
       AMGX_SAFE_CALL(AMGX_vector_bind(res.b_vec, res.A));
 
-      std::vector<T> h_x(n_local, static_cast<T>(0));
-      AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
+      if (use_x0 != 0)
+      {
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, x0_data));
+      }
+      else
+      {
+        std::vector<T> h_x(n_local, static_cast<T>(0));
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
+      }
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
 
       AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
@@ -661,15 +690,17 @@ namespace
                                   ffi::Buffer<ffi::DataType::S32> col_indices,
                                   ffi::Buffer<ffi::DataType::F32> values,
                                   ffi::Buffer<ffi::DataType::F32> b,
+                                  ffi::Buffer<ffi::DataType::F32> x0,
                                   ffi::ResultBuffer<ffi::DataType::F32> x,
                                   ffi::ResultBuffer<ffi::DataType::F32> stats,
                                   std::string_view config,
                                   int32_t transpose_solve,
                                   int32_t return_stats,
-                                  int32_t reuse_setup)
+                                  int32_t reuse_setup,
+                                  int32_t use_x0)
   {
     return AmgxSolveInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats, reuse_setup);
+        stream, row_ptrs, col_indices, values, b, x0, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0);
   }
 
   // Double implementation
@@ -678,15 +709,17 @@ namespace
                                         ffi::Buffer<ffi::DataType::S32> col_indices,
                                         ffi::Buffer<ffi::DataType::F64> values,
                                         ffi::Buffer<ffi::DataType::F64> b,
+                                        ffi::Buffer<ffi::DataType::F64> x0,
                                         ffi::ResultBuffer<ffi::DataType::F64> x,
                                         ffi::ResultBuffer<ffi::DataType::F64> stats,
                                         std::string_view config,
                                         int32_t transpose_solve,
                                         int32_t return_stats,
-                                        int32_t reuse_setup)
+                                        int32_t reuse_setup,
+                                        int32_t use_x0)
   {
     return AmgxSolveInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x, stats, config, transpose_solve, return_stats, reuse_setup);
+        stream, row_ptrs, col_indices, values, b, x0, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0);
   }
 
 #ifdef JAXAMG_WITH_MPI
@@ -696,6 +729,7 @@ namespace
                                      ffi::Buffer<ffi::DataType::S64> col_indices,
                                      ffi::Buffer<ffi::DataType::F32> values,
                                      ffi::Buffer<ffi::DataType::F32> b,
+                                     ffi::Buffer<ffi::DataType::F32> x0,
                                      ffi::Buffer<ffi::DataType::S32> nglobal,
                                      ffi::Buffer<ffi::DataType::S32> comm_ptr,
                                      ffi::Buffer<ffi::DataType::S32> lrank,
@@ -704,10 +738,11 @@ namespace
                                      std::string_view config,
                                      int32_t transpose_solve,
                                      int32_t return_stats,
-                                     int32_t reuse_setup)
+                                     int32_t reuse_setup,
+                                     int32_t use_x0)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0);
   }
 
   // MPI Double implementation
@@ -716,6 +751,7 @@ namespace
                                            ffi::Buffer<ffi::DataType::S64> col_indices,
                                            ffi::Buffer<ffi::DataType::F64> values,
                                            ffi::Buffer<ffi::DataType::F64> b,
+                                           ffi::Buffer<ffi::DataType::F64> x0,
                                            ffi::Buffer<ffi::DataType::S32> nglobal,
                                            ffi::Buffer<ffi::DataType::S32> comm_ptr,
                                            ffi::Buffer<ffi::DataType::S32> lrank,
@@ -724,10 +760,11 @@ namespace
                                            std::string_view config,
                                            int32_t transpose_solve,
                                            int32_t return_stats,
-                                           int32_t reuse_setup)
+                                           int32_t reuse_setup,
+                                           int32_t use_x0)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0);
   }
 
 #endif // JAXAMG_WITH_MPI

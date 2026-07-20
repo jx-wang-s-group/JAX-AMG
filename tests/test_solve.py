@@ -290,11 +290,13 @@ class TestSolver:
             col_indices,
             values,
             b,
+            x0=None,
             config_str="",
             transpose_solve=False,
             return_stats=False,
             reuse_setup=False,
             res_history_len=0,
+            use_x0=False,
         ):
             calls.append(
                 {
@@ -315,7 +317,7 @@ class TestSolver:
             )
 
             def loss(rhs):
-                x, _ = solver(A, rhs)
+                x, _ = solver(A, rhs, rhs)
                 return jnp.sum(x)
 
             grad_b = jax.grad(loss)(b)
@@ -625,3 +627,98 @@ class TestResidualHistory:
         assert np.isfinite(history).all()
         # Not converged, but the preconditioned solver still made progress.
         assert history[-1] < history[0]
+
+
+class TestInitialGuess:
+    """solve(A, b, x0=...): warm starts via the AmgX x-vector."""
+
+    def test_warm_start_reduces_iterations(self):
+        A = poisson_matrix(64)
+        b = rhs_ones(64 * 64)
+        x_star, info_cold = jaxamg.solve(A, b)
+        assert info_cold["status"] == jaxamg.AMGXStatus.SUCCESS
+
+        # ABSOLUTE convergence so a good x0 lowers the bar instead of
+        # tightening it (RELATIVE_INI is relative to the initial residual).
+        kwargs = {"convergence": "ABSOLUTE", "tolerance": 1e-4}
+        _, cold = jaxamg.solve(A, b, **kwargs)
+        x_warm, warm = jaxamg.solve(A, b, x0=x_star, **kwargs)
+
+        assert warm["status"] == jaxamg.AMGXStatus.SUCCESS
+        assert warm["iterations"] < cold["iterations"]
+        np.testing.assert_allclose(np.asarray(x_warm), np.asarray(x_star), atol=1e-3)
+
+        # Entry 0 of the history is the initial residual of the warm start
+        # (~1e-3 here, vs ||b|| = 64 for a zero start). Loose tolerance: the
+        # residual is a float32 cancellation of O(||b||) quantities, so
+        # recomputing it in JAX carries ~||b||/r0 * eps relative noise.
+        history = np.asarray(warm["residual_history"])
+        r0 = float(jnp.linalg.norm(b - A @ x_star))
+        np.testing.assert_allclose(history[0], r0, rtol=0.05)
+
+    def test_x0_converges_to_same_solution(self):
+        A = poisson_matrix(64)
+        b = rhs_ones(64 * 64)
+        x_ref, _ = jaxamg.solve(A, b)
+
+        x0 = jax.random.normal(jax.random.PRNGKey(0), b.shape, dtype=b.dtype) * 10.0
+        x, info = jaxamg.solve(A, b, x0=x0)
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+        np.testing.assert_allclose(np.asarray(x), np.asarray(x_ref), atol=1e-3)
+
+    def test_x0_jit(self):
+        A = poisson_matrix(32)
+        b = rhs_ones(32 * 32)
+        x_star, _ = jaxamg.solve(A, b)
+        kwargs = {"convergence": "ABSOLUTE", "tolerance": 1e-4}
+
+        @jax.jit
+        def run(A, b, x0):
+            return jaxamg.solve(A, b, x0=x0, **kwargs)
+
+        x_jit, info_jit = run(A, b, x_star)
+        _, info_eager = jaxamg.solve(A, b, x0=x_star, **kwargs)
+        assert int(info_jit["iterations"]) == info_eager["iterations"]
+        np.testing.assert_allclose(np.asarray(x_jit), np.asarray(x_star), atol=1e-3)
+
+    def test_x0_gradients(self):
+        """x0 shifts only the iteration, so gradients ignore it entirely."""
+        A = poisson_matrix(32, skew=0.5)  # nonsymmetric: exercises the
+        b = rhs_ones(32 * 32)  # transpose adjoint path
+        x0 = jax.random.normal(jax.random.PRNGKey(1), b.shape, dtype=b.dtype)
+
+        def loss(vals, rhs, guess):
+            A_i = jsp.BCSR((vals, A.indices, A.indptr), shape=A.shape)
+            x, _ = jaxamg.solve(A_i, rhs, x0=guess)
+            return jnp.sum(x * x)
+
+        g_vals, g_b, g_x0 = jax.grad(loss, argnums=(0, 1, 2))(A.data, b, x0)
+
+        # d/dx0 is exactly zero.
+        assert float(jnp.max(jnp.abs(g_x0))) == 0.0
+
+        # d/dvals and d/db match the zero-start solve.
+        def loss_cold(vals, rhs):
+            A_i = jsp.BCSR((vals, A.indices, A.indptr), shape=A.shape)
+            x, _ = jaxamg.solve(A_i, rhs)
+            return jnp.sum(x * x)
+
+        g_vals_cold, g_b_cold = jax.grad(loss_cold, argnums=(0, 1))(A.data, b)
+        np.testing.assert_allclose(
+            np.asarray(g_vals),
+            np.asarray(g_vals_cold),
+            rtol=1e-3,
+            atol=1e-3 * float(jnp.max(jnp.abs(g_vals_cold))),
+        )
+        np.testing.assert_allclose(
+            np.asarray(g_b),
+            np.asarray(g_b_cold),
+            rtol=1e-3,
+            atol=1e-3 * float(jnp.max(jnp.abs(g_b_cold))),
+        )
+
+    def test_x0_shape_mismatch_raises(self):
+        A = poisson_matrix(8)
+        b = rhs_ones(64)
+        with pytest.raises(ValueError, match="x0 must have the same shape"):
+            jaxamg.solve(A, b, x0=jnp.zeros(5))

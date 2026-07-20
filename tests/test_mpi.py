@@ -798,3 +798,38 @@ def test_mpi_residual_history(mpi_context):
     all_hist = comm.allgather(history)
     for other in all_hist[1:]:
         np.testing.assert_array_equal(other, all_hist[0])
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_initial_guess(mpi_context):
+    """Warm-starting from a previous solution cuts iterations in MPI mode."""
+    comm, rank, nranks = mpi_context
+
+    grid_size = 16
+    n = grid_size**2
+    A_local, row_start, row_end = poisson_matrix_distributed(
+        grid_size, grid_size, rank, nranks
+    )
+    b_global = rhs_linear(n)
+    b_local, _, _ = partition_vector(b_global, rank, nranks)
+
+    solve_kwargs = dict(comm=comm, nglobal=n, partition_info=(row_start, row_end))
+    x_star, info_ref = jaxamg.solve(A_local, b_local, **solve_kwargs)
+    assert info_ref["status"] == jaxamg.AMGXStatus.SUCCESS
+
+    # ABSOLUTE convergence so the warm start lowers the bar instead of
+    # tightening it (RELATIVE_INI is relative to the initial residual).
+    abs_kwargs = dict(solve_kwargs, convergence="ABSOLUTE", tolerance=1e-4)
+    _, cold = jaxamg.solve(A_local, b_local, **abs_kwargs)
+    x_warm, warm = jaxamg.solve(A_local, b_local, x0=x_star, **abs_kwargs)
+
+    assert warm["status"] == jaxamg.AMGXStatus.SUCCESS
+    assert warm["iterations"] < cold["iterations"]
+
+    # The warm-started solve still lands on the reference solution.
+    x_warm_g = gather_vector(x_warm, comm, root=0)
+    x_star_g = gather_vector(x_star, comm, root=0)
+    if rank == 0:
+        np.testing.assert_allclose(
+            np.asarray(x_warm_g), np.asarray(x_star_g), atol=1e-3
+        )

@@ -135,6 +135,42 @@ You can supply a custom solver configuration:
 
 See [Solver Configuration](config.md) for full details.
 
+### Warm starts with an initial guess
+
+Pass `x0` to start the iteration from a previous solution instead of zero —
+useful in time-stepping or optimization loops where consecutive solves are
+close. The initial guess changes only the iteration count, never the converged
+solution or its gradients. Prefer `convergence="ABSOLUTE"` for warm-started
+loops: the default `RELATIVE_INI` criterion is relative to the *initial*
+residual, so a good `x0` would tighten the target instead of lowering the
+work.
+
+=== "Python"
+
+    ```python
+    import jaxamg
+    from jaxamg.matrices import poisson_matrix, rhs_ones
+
+    n = 64
+    A = poisson_matrix(n)
+    b = rhs_ones(n * n)
+
+    # Cold solve from a zero initial guess
+    x, info = jaxamg.solve(A, b, convergence="ABSOLUTE", tolerance=1e-4)
+    print("Cold start:", info["iterations"], "iterations")
+
+    # Warm start from the previous solution
+    x2, info2 = jaxamg.solve(A, b, x0=x, convergence="ABSOLUTE", tolerance=1e-4)
+    print("Warm start:", info2["iterations"], "iterations")
+    ```
+
+=== "Result"
+
+    ```text
+    Cold start: 6 iterations
+    Warm start: 2 iterations
+    ```
+
 ### Using JAX-AMG as a preconditioner for native JAX solvers
 
 You can also use JAX-AMG only for the preconditioner application, while a native JAX Krylov method owns the outer iterations.
