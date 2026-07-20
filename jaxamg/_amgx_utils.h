@@ -213,6 +213,7 @@ namespace
     int nnz;
     int mode; // AMGX_Mode (dFFI vs dDDI)
     bool transpose_solve;
+    int block_dim;
     size_t structure_hash; // FNV-1a of row_ptrs + col_indices content
     std::string config;
 
@@ -222,6 +223,7 @@ namespace
              nnz == other.nnz &&
              mode == other.mode &&
              transpose_solve == other.transpose_solve &&
+             block_dim == other.block_dim &&
              structure_hash == other.structure_hash &&
              config == other.config;
     }
@@ -273,6 +275,7 @@ namespace
     int lrank;
     int mode; // AMGX_Mode (dFFI vs dDDI)
     bool transpose_solve;
+    int block_dim;
     uint64_t comm_ptr;
     size_t structure_hash;
     std::string config;
@@ -285,6 +288,7 @@ namespace
              lrank == other.lrank &&
              mode == other.mode &&
              transpose_solve == other.transpose_solve &&
+             block_dim == other.block_dim &&
              comm_ptr == other.comm_ptr &&
              structure_hash == other.structure_hash &&
              config == other.config;
@@ -305,8 +309,10 @@ namespace std
       size_t h4 = hash<bool>()(k.transpose_solve);
       size_t h5 = hash<size_t>()(k.structure_hash);
       size_t h6 = hash<string>()(k.config);
+      size_t h7 = hash<int>()(k.block_dim);
 
-      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
+      return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5) ^
+             (h7 << 6);
     }
   };
 
@@ -324,9 +330,11 @@ namespace std
       size_t h7 = hash<uint64_t>()(k.comm_ptr);
       size_t h8 = hash<size_t>()(k.structure_hash);
       size_t h9 = hash<string>()(k.config);
+      size_t h10 = hash<int>()(k.block_dim);
 
       return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^
-             (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7) ^ (h9 << 8);
+             (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7) ^ (h9 << 8) ^
+             (h10 << 9);
     }
   };
 } // namespace std
@@ -349,6 +357,9 @@ namespace
     void *transpose_values = nullptr;      // transpose_solve mode only
     void *transpose_workspace = nullptr;   // cusparse csr2csc scratch (transpose_solve only)
     size_t transpose_workspace_size = 0;
+    void *bsr_values = nullptr;            // block mode: BSR values buffer (device, zero-filled once)
+    void *bsr_scatter_map = nullptr;       // block mode: scalar-entry -> BSR value slot map (device int32)
+    int bsr_nnzb = 0;                      // block mode: number of BSR blocks
     bool owns_resources = false;           // true if isolated (JAXAMG_CACHE_SIZE=0)
   };
 
@@ -425,6 +436,8 @@ namespace
       if (res.transpose_col_indices) cudaFree(res.transpose_col_indices);
       if (res.transpose_values) cudaFree(res.transpose_values);
       if (res.transpose_workspace) cudaFree(res.transpose_workspace);
+      if (res.bsr_values) cudaFree(res.bsr_values);
+      if (res.bsr_scatter_map) cudaFree(res.bsr_scatter_map);
     }
     catch (...)
     {

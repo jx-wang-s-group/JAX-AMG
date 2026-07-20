@@ -171,6 +171,49 @@ work.
     Warm start: 2 iterations
     ```
 
+### Block matrices
+
+For coupled multi-component systems (unknowns interleaved node-major), pass
+`block_dim` so AmgX sees the true block structure — the matrix and vectors
+keep their ordinary scalar form. Block-aware AMG and smoothing can converge
+in a few iterations where the scalar solver stalls:
+
+=== "Python"
+
+    ```python
+    import numpy as np
+    import scipy.sparse
+    import jax.numpy as jnp
+    import jax.experimental.sparse as jsp
+    import jaxamg
+    from jaxamg.matrices import poisson_matrix
+    from jaxamg.utils import to_scipy
+
+    # Coupled 2-component system: kron(Poisson, M)
+    M = np.array([[2.0, 1.0], [1.0, 2.0]], dtype=np.float32)
+    A_sp = scipy.sparse.kron(to_scipy(poisson_matrix(64)), M).tocsr()
+    A = jsp.BCSR(
+        (jnp.asarray(A_sp.data), jnp.asarray(A_sp.indices), jnp.asarray(A_sp.indptr)),
+        shape=A_sp.shape,
+    )
+    b = jnp.ones(A_sp.shape[0])
+
+    x, info = jaxamg.solve(A, b, block_dim=2)
+    print("Block solve:", info["iterations"], "iterations,", info["status"])
+
+    x1, info1 = jaxamg.solve(A, b)
+    print("Scalar solve:", info1["iterations"], "iterations,", info1["status"])
+    ```
+
+=== "Result"
+
+    ```text
+    Block solve: 15 iterations, AMGXStatus.SUCCESS
+    Scalar solve: 1000 iterations, AMGXStatus.NOT_CONVERGED
+    ```
+
+See [Block matrices](config.md#block-matrices) for the block-mode AMG defaults.
+
 ### Using JAX-AMG as a preconditioner for native JAX solvers
 
 You can also use JAX-AMG only for the preconditioner application, while a native JAX Krylov method owns the outer iterations.

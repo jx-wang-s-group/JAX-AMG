@@ -273,3 +273,31 @@ def test_outer_max_iters():
     # Unparseable input falls back to AmgX's registered default.
     assert outer_max_iters("") == 100
     assert outer_max_iters("not json") == 100
+
+
+def test_prepare_config_block_dim():
+    """block_dim > 1 switches AMG defaults to aggregation; CLASSICAL rejected."""
+    cfg = json.loads(prepare_config(block_dim=2))
+    precond = cfg["solver"]["preconditioner"]
+    assert precond["algorithm"] == "AGGREGATION"
+    assert precond["selector"] == "SIZE_2"
+
+    # Scalar default is unchanged.
+    cfg1 = json.loads(prepare_config())
+    assert cfg1["solver"]["preconditioner"]["algorithm"] == "CLASSICAL"
+
+    # Explicit classical AMG under block_dim > 1 is rejected.
+    with pytest.raises(ValueError, match="CLASSICAL"):
+        prepare_config(
+            {"preconditioner": {"solver": "AMG", "algorithm": "CLASSICAL"}},
+            block_dim=2,
+        )
+
+    # Non-AMG configs pass through untouched.
+    cfg2 = json.loads(
+        prepare_config(
+            {"solver": "FGMRES", "preconditioner": {"solver": "BLOCK_JACOBI"}},
+            block_dim=2,
+        )
+    )
+    assert cfg2["solver"]["solver"] == "FGMRES"

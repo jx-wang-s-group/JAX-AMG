@@ -297,6 +297,7 @@ class TestSolver:
             reuse_setup=False,
             res_history_len=0,
             use_x0=False,
+            block_dim=1,
         ):
             calls.append(
                 {
@@ -722,3 +723,125 @@ class TestInitialGuess:
         b = rhs_ones(64)
         with pytest.raises(ValueError, match="x0 must have the same shape"):
             jaxamg.solve(A, b, x0=jnp.zeros(5))
+
+
+class TestBlockSolve:
+    """solve(..., block_dim=k): scalar CSR in, AmgX BSR underneath."""
+
+    @staticmethod
+    def _kron_system(grid, M, skew=0.0):
+        """kron(poisson, M): node-major interleaved coupled system."""
+        P = to_scipy(poisson_matrix(grid, skew=skew))
+        A_sp = scipy.sparse.kron(P, M).tocsr()
+        A = jsp.BCSR(
+            (
+                jnp.asarray(A_sp.data.astype(np.float32)),
+                jnp.asarray(A_sp.indices),
+                jnp.asarray(A_sp.indptr),
+            ),
+            shape=A_sp.shape,
+        )
+        n = A_sp.shape[0]
+        b = jnp.asarray(np.linspace(0.5, 1.5, n).astype(np.float32))
+        return A_sp, A, b
+
+    def test_block_solve_matches_scipy(self):
+        """Default block config (aggregation AMG) solves a coupled system."""
+        M = np.array([[2.0, 1.0], [1.0, 2.0]], dtype=np.float32)
+        A_sp, A, b = self._kron_system(16, M)
+        x, info = jaxamg.solve(A, b, block_dim=2)
+
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+        x_ref = spla.spsolve(A_sp.tocsc().astype(np.float64), np.asarray(b))
+        np.testing.assert_allclose(np.asarray(x), x_ref, rtol=1e-4, atol=1e-6)
+
+    def test_block_partial_blocks(self):
+        """Blocks with missing scalar entries get zero fill-in, not garbage."""
+        M = np.array([[2.0, 1.0], [1.0, 2.0]], dtype=np.float32)
+        A_sp, _, b = self._kron_system(8, M)
+        # Drop one off-diagonal coupling entry so its 2x2 block is partial.
+        A_lil = A_sp.tolil()
+        for c in A_lil.rows[0]:
+            if c >= 2:
+                A_lil[0, c] = 0
+                break
+        A_sp = A_lil.tocsr()
+        A_sp.eliminate_zeros()
+        A = jsp.BCSR(
+            (
+                jnp.asarray(A_sp.data.astype(np.float32)),
+                jnp.asarray(A_sp.indices),
+                jnp.asarray(A_sp.indptr),
+            ),
+            shape=A_sp.shape,
+        )
+        x, info = jaxamg.solve(A, b, block_dim=2, solver="FGMRES", max_iters=200)
+
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+        x_ref = spla.spsolve(A_sp.tocsc().astype(np.float64), np.asarray(b))
+        np.testing.assert_allclose(np.asarray(x), x_ref, rtol=1e-3, atol=1e-6)
+
+    def test_block_gradients_match_reference(self):
+        """Nonsymmetric block system: VJP against the scipy adjoint formula.
+
+        Exercises the composed transpose+BSR scatter map in the backward
+        solve (transpose_solve=True with block_dim > 1).
+        """
+        M = np.array([[3.0, 1.0], [0.5, 2.0]], dtype=np.float32)  # nonsymmetric
+        A_sp, A, b = self._kron_system(12, M, skew=0.7)
+
+        def loss(vals, rhs):
+            A_i = jsp.BCSR((vals, A.indices, A.indptr), shape=A.shape)
+            x, _ = jaxamg.solve(A_i, rhs, block_dim=2, tolerance=1e-8, max_iters=300)
+            return jnp.sum(x * x)
+
+        g_vals, g_b = jax.grad(loss, argnums=(0, 1))(A.data, b)
+
+        # Reference: lambda = A^-T (2x); dL/dvals_k = -lambda[r_k] x[c_k];
+        # dL/db = lambda.
+        A64 = A_sp.tocsc().astype(np.float64)
+        x_ref = spla.spsolve(A64, np.asarray(b))
+        lam = spla.spsolve(A64.T, 2.0 * x_ref)
+        rows = np.repeat(np.arange(A_sp.shape[0]), np.diff(A_sp.indptr))
+        g_vals_ref = -lam[rows] * x_ref[A_sp.indices]
+
+        scale_v = np.max(np.abs(g_vals_ref))
+        scale_b = np.max(np.abs(lam))
+        np.testing.assert_allclose(np.asarray(g_vals), g_vals_ref, atol=1e-3 * scale_v)
+        np.testing.assert_allclose(np.asarray(g_b), lam, atol=1e-3 * scale_b)
+
+    def test_block_jit_and_x0(self):
+        M = np.array([[2.0, 1.0], [1.0, 2.0]], dtype=np.float32)
+        A_sp, A, b = self._kron_system(8, M)
+
+        @jax.jit
+        def run(vals, rhs, x0):
+            A_i = jsp.BCSR((vals, A.indices, A.indptr), shape=A.shape)
+            return jaxamg.solve(
+                A_i, rhs, x0=x0, block_dim=2, convergence="ABSOLUTE", tolerance=1e-4
+            )
+
+        x_cold, info_cold = run(A.data, b, jnp.zeros_like(b))
+        x_warm, info_warm = run(A.data, b, x_cold)
+        assert int(info_warm["iterations"]) <= int(info_cold["iterations"])
+        history = np.asarray(info_warm["residual_history"])
+        iters = int(info_warm["iterations"])
+        assert np.isfinite(history[: iters + 1]).all()
+        assert np.isnan(history[iters + 1 :]).all()
+
+    def test_block_classical_amg_rejected(self):
+        M = np.array([[2.0, 1.0], [1.0, 2.0]], dtype=np.float32)
+        _, A, b = self._kron_system(8, M)
+        with pytest.raises(ValueError, match="CLASSICAL"):
+            jaxamg.solve(
+                A,
+                b,
+                block_dim=2,
+                config={"preconditioner": {"solver": "AMG", "algorithm": "CLASSICAL"}},
+            )
+
+    def test_block_dim_divisibility(self):
+        M = np.array([[2.0, 1.0], [1.0, 2.0]], dtype=np.float32)
+        _, A, b = self._kron_system(8, M)
+        with pytest.raises(ValueError, match="divisible"):
+            jaxamg.solve(A, b, block_dim=3)

@@ -79,6 +79,7 @@ def cache_mpi_metadata(
     A: MatrixOrOperator,
     is_symmetric: bool = False,
     save_stats: bool = False,
+    block_dim: int = 1,
 ) -> dict[str, Any]:
     """
     Pre-compute and cache MPI metadata for JIT-compatible solver usage.
@@ -108,6 +109,8 @@ def cache_mpi_metadata(
         save_stats: If True, prepare the config with solver statistics output
             enabled, so a later `solve(..., save_stats_file=...)` on the cached
             matrix produces a complete stats file.
+        block_dim: BSR block size for AmgX (see `jaxamg.solve`). Each rank's
+            local partition must be divisible by it.
 
     Returns:
         A dictionary containing MPI metadata.
@@ -130,6 +133,15 @@ def cache_mpi_metadata(
     row_start, row_end = partition_info
     n_local = row_end - row_start
 
+    block_dim = int(block_dim)
+    if block_dim < 1:
+        raise ValueError("block_dim must be a positive integer")
+    if block_dim > 1 and (n_local % block_dim != 0 or nglobal % block_dim != 0):
+        raise ValueError(
+            f"local partition ({n_local} rows) and nglobal ({nglobal}) must "
+            f"be divisible by block_dim {block_dim}"
+        )
+
     # Compute MPI communication metadata
     all_sizes = comm.allgather(n_local)
 
@@ -142,7 +154,9 @@ def cache_mpi_metadata(
     lrank = rank % gpu_count
 
     # Prepare config string
-    config_str = amgx_config.prepare_config(config, save_stats=save_stats, mpi=True)
+    config_str = amgx_config.prepare_config(
+        config, save_stats=save_stats, mpi=True, block_dim=block_dim
+    )
 
     # Compute max_nnz across all ranks, and capture this rank's global column
     # indices (needed for nnz_out, the transpose output sizing).
@@ -204,6 +218,7 @@ def cache_mpi_metadata(
         "max_nnz": max_nnz,
         "nnz_out": nnz_out,
         "halo_plan": halo_plan,
+        "block_dim": block_dim,
     }
 
     return cache_dict

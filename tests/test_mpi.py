@@ -833,3 +833,111 @@ def test_mpi_initial_guess(mpi_context):
         np.testing.assert_allclose(
             np.asarray(x_warm_g), np.asarray(x_star_g), atol=1e-3
         )
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_block_solve(mpi_context):
+    """Distributed block solve (block_dim=2) of a coupled kron system."""
+    import jax.experimental.sparse as jsp
+    import scipy.sparse
+    import scipy.sparse.linalg as spla
+
+    comm, rank, nranks = mpi_context
+
+    from jaxamg.utils import to_scipy
+
+    M = np.array([[2.0, 1.0], [1.0, 2.0]], dtype=np.float32)
+    A_sp = scipy.sparse.kron(to_scipy(poisson_matrix(16)), M).tocsr()
+    n = A_sp.shape[0]
+    b_global = np.linspace(0.5, 1.5, n).astype(np.float32)
+
+    A_glob = jsp.BCSR(
+        (
+            jnp.asarray(A_sp.data.astype(np.float32)),
+            jnp.asarray(A_sp.indices),
+            jnp.asarray(A_sp.indptr),
+        ),
+        shape=A_sp.shape,
+    )
+    A_local, row_start, row_end = partition_csr_matrix(A_glob, rank, nranks)
+    b_local, _, _ = partition_vector(jnp.asarray(b_global), rank, nranks)
+    assert row_start % 2 == 0 and (row_end - row_start) % 2 == 0
+
+    # Default block config (aggregation AMG) on the distributed system.
+    x_local, info = jaxamg.solve(
+        A_local,
+        b_local,
+        comm=comm,
+        nglobal=n,
+        partition_info=(row_start, row_end),
+        block_dim=2,
+    )
+    x = gather_vector(x_local, comm, root=0)
+
+    assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+    if rank == 0:
+        x_ref = spla.spsolve(A_sp.tocsc().astype(np.float64), b_global)
+        np.testing.assert_allclose(np.asarray(x), x_ref, rtol=1e-4, atol=1e-6)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_block_gradients(mpi_context):
+    """Distributed block VJP (incl. distributed transpose) vs scipy adjoint."""
+    import jax.experimental.sparse as jsp
+    import scipy.sparse
+    import scipy.sparse.linalg as spla
+
+    comm, rank, nranks = mpi_context
+
+    from jaxamg.utils import to_scipy
+
+    M = np.array([[3.0, 1.0], [0.5, 2.0]], dtype=np.float32)  # nonsymmetric
+    A_sp = scipy.sparse.kron(to_scipy(poisson_matrix(12, skew=0.7)), M).tocsr()
+    n = A_sp.shape[0]
+    b_global = np.linspace(0.5, 1.5, n).astype(np.float32)
+
+    A_glob = jsp.BCSR(
+        (
+            jnp.asarray(A_sp.data.astype(np.float32)),
+            jnp.asarray(A_sp.indices),
+            jnp.asarray(A_sp.indptr),
+        ),
+        shape=A_sp.shape,
+    )
+    A_local, row_start, row_end = partition_csr_matrix(A_glob, rank, nranks)
+    b_local, _, _ = partition_vector(jnp.asarray(b_global), rank, nranks)
+
+    def loss(vals, rhs):
+        A_i = jsp.BCSR((vals, A_local.indices, A_local.indptr), shape=A_local.shape)
+        x_l, _ = jaxamg.solve(
+            A_i,
+            rhs,
+            comm=comm,
+            nglobal=n,
+            partition_info=(row_start, row_end),
+            block_dim=2,
+            solver="FGMRES",
+            tolerance=1e-8,
+            max_iters=300,
+        )
+        return jnp.sum(x_l * x_l)
+
+    g_vals, g_b = jax.grad(loss, argnums=(0, 1))(A_local.data, b_local)
+
+    # Reference: global loss is sum over ranks; each rank's cotangent is its
+    # local 2x, so lambda solves A^T lambda = 2x (globally).
+    A64 = A_sp.tocsc().astype(np.float64)
+    x_ref = spla.spsolve(A64, b_global)
+    lam = spla.spsolve(A64.T, 2.0 * x_ref)
+    rows_l = np.repeat(
+        np.arange(row_start, row_end), np.diff(np.asarray(A_local.indptr))
+    )
+    g_vals_ref = -lam[rows_l] * x_ref[np.asarray(A_local.indices)]
+    g_b_ref = lam[row_start:row_end]
+
+    np.testing.assert_allclose(
+        np.asarray(g_vals), g_vals_ref, atol=1e-3 * np.max(np.abs(g_vals_ref))
+    )
+    np.testing.assert_allclose(
+        np.asarray(g_b), g_b_ref, atol=1e-3 * np.max(np.abs(g_b_ref))
+    )

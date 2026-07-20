@@ -72,6 +72,41 @@ initial residual. Outside `jit` it is trimmed to `iterations + 1` entries;
 inside `jit` it has fixed length `max_iters + 1`, NaN-padded past entry
 `iterations`.
 
+### Block matrices
+
+For coupled multi-component systems, pass `block_dim=k` to `jaxamg.solve(...)`
+to treat the matrix as having square `k x k` blocks (unknowns interleaved
+node-major: row `i*k + c` is component `c` of node `i`). `A` and `b` keep
+their ordinary scalar CSR/vector form — the conversion to AmgX's BSR format
+happens internally — and autodiff works unchanged. Rows must be divisible by
+`block_dim` (each rank's local partition in MPI mode).
+
+Because AmgX's classical AMG does not support block matrices, the AMG defaults
+switch to aggregation AMG when `block_dim > 1`:
+
+```python
+{
+    "solver": "AMG",
+    "algorithm": "AGGREGATION",
+    "selector": "SIZE_2",
+    "smoother": {"solver": "BLOCK_JACOBI", "relaxation_factor": 0.9},
+    "presweeps": 1,
+    "postsweeps": 1,
+    "max_levels": 100,
+    "min_coarse_rows": 32,
+    "dense_lu_num_rows": 64,
+    "coarse_solver": "DENSE_LU_SOLVER",
+    "max_iters": 1,
+    "cycle": "V",
+}
+```
+
+Explicitly configuring CLASSICAL AMG together with `block_dim > 1` raises a
+`ValueError`. Block-aware preconditioning is often the entire benefit: on a
+strongly coupled system, `BLOCK_JACOBI` under `block_dim=2` inverts true
+2x2 diagonal blocks (instead of scalar diagonal entries) and can converge in
+a handful of iterations where the scalar-preconditioned solve stalls.
+
 ### MPI config
 
 The `communicator` key can be set to `MPI` for standard CPU-based MPI or `MPI_DIRECT` for GPU-aware MPI. The default is `MPI`. To use GPU-aware MPI, ensure that your MPI installation supports it. For more details, see the [MPI Guide](mpi.md).
