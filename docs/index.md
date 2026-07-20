@@ -46,6 +46,7 @@ x, info = jaxamg.solve(A, b)
 print(f"Solution: {x}")
 print(f"Iterations: {info['iterations']}")
 print(f"Residual: {info['residual']}")
+print(f"Convergence curve: {info['residual_history']}")
 ```
 
 `A` can be any sparse matrix (`jax.experimental.sparse` BCSR/BCOO, SciPy sparse), a dense array, or a matrix-free callable operator.

@@ -18,6 +18,7 @@
 #include <vector>
 #include <fstream>
 #include <algorithm>
+#include <limits>
 #include <type_traits>
 
 #include "_amgx_utils.h"
@@ -138,6 +139,37 @@ namespace
     }
 
     return nullptr;
+  }
+
+  // Assemble the host-side stats buffer: [iterations, final_residual, status,
+  // residual_history...]. The history capacity is whatever the caller allocated
+  // beyond the first three entries (max_iters + 1 slots, or zero for callers
+  // that predate residual history); slots past iteration `iters` stay NaN so
+  // Python can tell padding from recorded residuals.
+  template <typename T>
+  inline std::vector<T> CollectSolveStats(AMGX_solver_handle solver,
+                                          size_t stats_len,
+                                          int iters,
+                                          double residual,
+                                          AMGX_SOLVE_STATUS status)
+  {
+    std::vector<T> stats_host(stats_len, std::numeric_limits<T>::quiet_NaN());
+    if (stats_len >= 3)
+    {
+      stats_host[0] = static_cast<T>(iters);
+      stats_host[1] = static_cast<T>(residual);
+      stats_host[2] = static_cast<T>(status);
+      const size_t n_hist = std::min(stats_len - 3, static_cast<size_t>(iters) + 1);
+      for (size_t i = 0; i < n_hist; ++i)
+      {
+        double r = 0.0;
+        if (AMGX_solver_get_iteration_residual(solver, static_cast<int>(i), 0, &r) == AMGX_RC_OK)
+        {
+          stats_host[3 + i] = static_cast<T>(r);
+        }
+      }
+    }
+    return stats_host;
   }
 
   /*
@@ -364,11 +396,10 @@ namespace
       residual = -1.0;
     }
 
-    T stats_host[3] = {
-        static_cast<T>(iters),
-        static_cast<T>(residual),
-        static_cast<T>(status)};
-    cudaMemcpyAsync(stats_data, stats_host, 3 * sizeof(T), cudaMemcpyHostToDevice, stream);
+    std::vector<T> stats_host = CollectSolveStats<T>(
+        res.solver, stats->element_count(), iters, residual, status);
+    cudaMemcpyAsync(stats_data, stats_host.data(), stats_host.size() * sizeof(T),
+                    cudaMemcpyHostToDevice, stream);
 
     AMGX_SAFE_CALL(AMGX_vector_download(res.x_vec, x_data));
 
@@ -605,8 +636,10 @@ namespace
       residual = -1.0;
     }
 
-    T stats_host[3] = {static_cast<T>(iters), static_cast<T>(residual), static_cast<T>(status)};
-    cudaMemcpyAsync(stats_data, stats_host, 3 * sizeof(T), cudaMemcpyHostToDevice, stream);
+    std::vector<T> stats_host = CollectSolveStats<T>(
+        res.solver, stats->element_count(), iters, residual, status);
+    cudaMemcpyAsync(stats_data, stats_host.data(), stats_host.size() * sizeof(T),
+                    cudaMemcpyHostToDevice, stream);
     AMGX_SAFE_CALL(AMGX_vector_download(res.x_vec, x_data));
 
     if (!cache_hit)

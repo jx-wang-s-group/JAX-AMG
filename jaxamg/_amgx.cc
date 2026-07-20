@@ -144,6 +144,9 @@ PYBIND11_MODULE(_amgx, m)
 #else
   m.attr("mpi_enabled") = py::bool_(false);
 #endif
+  // Python only requests residual-history slots in the stats buffer when this
+  // flag exists; an older extension would leave those slots uninitialized.
+  m.attr("supports_residual_history") = py::bool_(true);
 
   m.def("initialize", &EnsureAmgxInitialized);
   m.def("finalize", &AmgxFinalize);

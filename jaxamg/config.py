@@ -287,3 +287,24 @@ def prepare_config(
     validate_config(merged_config, mpi=mpi)
 
     return _format_config(merged_config)
+
+
+def outer_max_iters(config_str: str) -> int:
+    """Return the outer solver scope's ``max_iters`` from a prepared config string.
+
+    Used to size the residual-history slots of the solve's stats output. The
+    scope mirrors where ``prepare_config`` injects ``store_res_history`` (which
+    is also the scope whose history AmgX exposes); AmgX's registered default of
+    100 is the fallback when the value is absent.
+    """
+    try:
+        cfg = json.loads(config_str)
+    except (TypeError, ValueError):
+        return 100
+    scope = cfg
+    if isinstance(cfg, dict) and isinstance(cfg.get("solver"), dict):
+        scope = cfg["solver"]
+    if not isinstance(scope, dict):
+        return 100
+    value = _as_int(scope.get("max_iters"), 100)
+    return value if value is not None and value > 0 else 100

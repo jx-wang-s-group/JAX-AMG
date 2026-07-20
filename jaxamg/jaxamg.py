@@ -103,6 +103,7 @@ def _amgx_solve_impl(
     transpose_solve: bool = False,
     return_stats: bool = False,
     reuse_setup: bool = False,
+    res_history_len: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX solver (non-differentiable)."""
 
@@ -111,7 +112,7 @@ def _amgx_solve_impl(
 
     out_spec = (
         jax.ShapeDtypeStruct(b.shape, b.dtype),
-        jax.ShapeDtypeStruct((3,), b.dtype),
+        jax.ShapeDtypeStruct((3 + res_history_len,), b.dtype),
     )
 
     call_name = _AMGX_CALL_NAME
@@ -151,6 +152,7 @@ def _amgx_solve_mpi_impl(
     transpose_solve: bool = False,
     return_stats: bool = False,
     reuse_setup: bool = False,
+    res_history_len: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX MPI solver (non-differentiable)."""
 
@@ -159,7 +161,7 @@ def _amgx_solve_mpi_impl(
 
     out_spec = (
         jax.ShapeDtypeStruct(b.shape, b.dtype),
-        jax.ShapeDtypeStruct((3,), b.dtype),
+        jax.ShapeDtypeStruct((3 + res_history_len,), b.dtype),
     )
 
     call_name = _AMGX_CALL_NAME_MPI
@@ -196,12 +198,14 @@ def _get_solver_primitive(
     is_symmetric: bool = False,
     return_stats: bool = False,
     reuse_setup: bool = False,
+    res_history_len: int = 0,
 ) -> Callable:
     """
     Returns a JAX custom_vjp primitive for AmgX solve with a specific configuration.
     Cached to avoid recompilation for identical configurations.
 
     reuse_setup: Skip warm AMGX resetup and keep the cached hierarchy.
+    res_history_len: Residual-history slots appended to the stats output.
     """
 
     @jax.custom_vjp
@@ -214,6 +218,7 @@ def _get_solver_primitive(
             config_str=config_str,
             return_stats=return_stats,
             reuse_setup=reuse_setup,
+            res_history_len=res_history_len,
         )
         return x, info
 
@@ -286,6 +291,7 @@ def _get_solver_primitive_mpi(
     n_ghost: int = 0,
     return_stats: bool = False,
     reuse_setup: bool = False,
+    res_history_len: int = 0,
 ) -> Callable:
     """
     Create cached JAX custom_vjp primitive for MPI AmgX solve.
@@ -345,6 +351,7 @@ def _get_solver_primitive_mpi(
             config_str=config_str,
             return_stats=return_stats,
             reuse_setup=reuse_setup,
+            res_history_len=res_history_len,
         )
 
         return x, info
@@ -461,7 +468,7 @@ def solve(
 
     Returns:
         x: Solution vector (float32 or float64). In MPI mode, returns local portion.
-        info: Dictionary containing `iterations`, `residual`, and `status`.
+        info: Dictionary containing `iterations`, `residual`, `status`, and `residual_history` (residual norm per outer iteration, entry 0 being the initial residual; inside `jit` it has fixed length `max_iters + 1` with NaN padding past entry `iterations`).
     """
 
     b = jnp.asarray(b)
@@ -474,7 +481,7 @@ def solve(
         )
 
     # Load the native extension and register FFI targets (sets HAS_MPI).
-    _ensure_backend()
+    ext = _ensure_backend()
 
     # MPI cache may be pre-attached to A via `with_cache`
     mpi_cache = getattr(A, "_mpi_cache", None)
@@ -503,6 +510,15 @@ def solve(
             mpi=(comm is not None),
             **kwargs,
         )
+
+    # Residual-history slots appended to the stats output (outer max_iters + 1
+    # entries). An older extension without support would leave them
+    # uninitialized, so only request them when the extension advertises the
+    # capability.
+    if getattr(ext, "supports_residual_history", False):
+        res_history_len = amgx_config.outer_max_iters(config_str) + 1
+    else:
+        res_history_len = 0
 
     # Detect desired precision (non-float RHS dtypes are promoted to float32)
     target_dtype = get_preferred_dtype(A, b)
@@ -552,6 +568,7 @@ def solve(
                 n_ghost=halo_plan.n_ghost,
                 return_stats=1 if save_stats_file else 0,
                 reuse_setup=reuse_setup,
+                res_history_len=res_history_len,
             )
 
             x, info = solver(
@@ -635,6 +652,7 @@ def solve(
                 n_ghost=halo_plan.n_ghost,
                 return_stats=1 if save_stats_file else 0,
                 reuse_setup=reuse_setup,
+                res_history_len=res_history_len,
             )
             x, info = solver(
                 A_csr,
@@ -653,19 +671,33 @@ def solve(
             is_symmetric=is_symmetric,
             return_stats=1 if save_stats_file else 0,
             reuse_setup=reuse_setup,
+            res_history_len=res_history_len,
         )
 
         x, info = solver(A_csr, b)
 
     if isinstance(info, jax.core.Tracer):
         # Inside JIT (or another trace): info elements are tracers; return as-is.
-        return x, {"iterations": info[0], "residual": info[1], "status": info[2]}
+        # The history keeps its fixed trace-time length (outer max_iters + 1),
+        # NaN-padded past entry `iterations`.
+        info_dict: dict[str, Any] = {
+            "iterations": info[0],
+            "residual": info[1],
+            "status": info[2],
+        }
+        if res_history_len:
+            info_dict["residual_history"] = info[3:]
+        return x, info_dict
 
     info_dict = {
         "iterations": int(info[0]),
         "residual": float(info[1]),
         "status": AMGXStatus(int(info[2])),
     }
+    if res_history_len:
+        # Entry i is the residual norm after outer iteration i (entry 0 is the
+        # initial residual); trim the NaN padding outside a trace.
+        info_dict["residual_history"] = info[3 : 4 + int(info[0])]
     if save_stats_file is not None:
         try:
             stats_str = _ensure_backend().get_stats_string()

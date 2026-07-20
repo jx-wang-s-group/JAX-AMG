@@ -761,3 +761,40 @@ def test_mpi_repeated_solve_warm_cache(mpi_context):
         # x = x0 / 2 rather than a silent reuse of the first matrix.
         np.testing.assert_allclose(A_global @ x_scaled, 0.5 * b_global, atol=1e-4)
         np.testing.assert_allclose(x_scaled, 0.5 * solutions[0], atol=1e-4)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_residual_history(mpi_context):
+    """The residual history is the global convergence curve on every rank."""
+    comm, rank, nranks = mpi_context
+
+    grid_size = 16
+    n = grid_size**2
+    A_local, row_start, row_end = poisson_matrix_distributed(
+        grid_size, grid_size, rank, nranks
+    )
+    b_global = rhs_linear(n)
+    b_local, _, _ = partition_vector(b_global, rank, nranks)
+
+    _, info = jaxamg.solve(
+        A_local,
+        b_local,
+        comm=comm,
+        nglobal=n,
+        partition_info=(row_start, row_end),
+    )
+
+    assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+    history = np.asarray(info["residual_history"])
+    assert history.shape == (info["iterations"] + 1,)
+    assert np.isfinite(history).all()
+    np.testing.assert_allclose(history[-1], info["residual"], rtol=1e-6)
+
+    # Entry 0 is the initial GLOBAL residual norm, and the monitored norm is a
+    # global reduction, so every rank must see the identical curve.
+    np.testing.assert_allclose(
+        history[0], np.linalg.norm(np.asarray(b_global)), rtol=1e-5
+    )
+    all_hist = comm.allgather(history)
+    for other in all_hist[1:]:
+        np.testing.assert_array_equal(other, all_hist[0])
