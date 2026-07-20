@@ -294,6 +294,7 @@ class TestSolver:
             transpose_solve=False,
             return_stats=False,
             reuse_setup=False,
+            res_history_len=0,
         ):
             calls.append(
                 {
@@ -301,7 +302,7 @@ class TestSolver:
                     "reuse_setup": bool(reuse_setup),
                 }
             )
-            return b, jnp.array([0, 0, 0], dtype=b.dtype)
+            return b, jnp.zeros(3 + res_history_len, dtype=b.dtype)
 
         monkeypatch.setattr(jaxamg_module, "_amgx_solve_impl", fake_amgx_solve)
         jaxamg_module._get_solver_primitive.cache_clear()
@@ -561,3 +562,66 @@ class TestSolver:
         assert scipy.sparse.isspmatrix_csr(loaded)
         assert loaded.dtype == np.float32
         np.testing.assert_allclose(loaded.toarray(), A.astype(np.float32).toarray())
+
+
+class TestResidualHistory:
+    """info["residual_history"]: the outer solver's convergence curve."""
+
+    def test_eager_history(self):
+        A = poisson_matrix(64)
+        b = rhs_ones(64 * 64)
+        _, info = jaxamg.solve(A, b)
+
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+        history = np.asarray(info["residual_history"])
+
+        # Outside jit the NaN padding is trimmed: one entry per outer
+        # iteration, plus the initial residual at entry 0.
+        assert history.shape == (info["iterations"] + 1,)
+        assert np.isfinite(history).all()
+
+        # Entry 0 is the initial residual norm (x starts at zero, so ||b||).
+        np.testing.assert_allclose(history[0], np.linalg.norm(np.asarray(b)), rtol=1e-6)
+        # The last entry is the final residual already reported in info.
+        np.testing.assert_allclose(history[-1], info["residual"], rtol=1e-6)
+        # Default convergence criterion is RELATIVE_INI at 1e-6.
+        assert history[-1] / history[0] <= 1e-6
+
+    def test_jit_history_fixed_shape(self):
+        A = poisson_matrix(32)
+        b = rhs_ones(32 * 32)
+        max_iters = 50
+
+        @jax.jit
+        def run(A, b):
+            return jaxamg.solve(A, b, max_iters=max_iters)
+
+        _, info = run(A, b)
+        history = np.asarray(info["residual_history"])
+        iters = int(info["iterations"])
+
+        # Inside jit the history keeps its trace-time length (max_iters + 1),
+        # NaN-padded past the recorded entries.
+        assert history.shape == (max_iters + 1,)
+        assert np.isfinite(history[: iters + 1]).all()
+        assert np.isnan(history[iters + 1 :]).all()
+
+        # The recorded prefix matches the eager solve.
+        _, info_eager = jaxamg.solve(A, b, max_iters=max_iters)
+        np.testing.assert_allclose(
+            history[: iters + 1],
+            np.asarray(info_eager["residual_history"]),
+            rtol=1e-6,
+        )
+
+    def test_not_converged_history_is_full(self):
+        A = poisson_matrix(64)
+        b = rhs_ones(64 * 64)
+        _, info = jaxamg.solve(A, b, max_iters=3)
+
+        assert info["status"] == jaxamg.AMGXStatus.NOT_CONVERGED
+        history = np.asarray(info["residual_history"])
+        assert history.shape == (4,)
+        assert np.isfinite(history).all()
+        # Not converged, but the preconditioned solver still made progress.
+        assert history[-1] < history[0]

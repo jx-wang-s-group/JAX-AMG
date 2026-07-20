@@ -65,7 +65,12 @@ settings above.
     The default above is for `jaxamg.solve(...)`, a full Krylov solve (`PBICGSTAB`) preconditioned by AMG. `jaxamg.make_preconditioner(...)` (and `make_lineax_preconditioner(...)`) instead default to a *single* AMG V-cycle (`solver="AMG"`, `max_iters=1`) used as an approximate inverse, since there the outer Krylov method owns the iteration. Override via their own `config`/`kwargs`.
 
 JAX-AMG also enables residual tracking internally (`monitor_residual=1`,
-`store_res_history=1`) so `info["residual"]` is always available.
+`store_res_history=1`) so `info["residual"]` and `info["residual_history"]`
+are always available. The history is the outer solver's convergence curve:
+entry `i` is the residual norm after outer iteration `i`, with entry 0 the
+initial residual. Outside `jit` it is trimmed to `iterations + 1` entries;
+inside `jit` it has fixed length `max_iters + 1`, NaN-padded past entry
+`iterations`.
 
 ### MPI config
 

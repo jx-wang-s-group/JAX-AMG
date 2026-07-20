@@ -244,3 +244,32 @@ def test_prepare_config_rejects_mpi_dilu_tiny_min_coarse_rows():
 
     with pytest.raises(ValueError, match="MULTICOLOR_DILU"):
         prepare_config(config, mpi=True)
+
+
+def test_outer_max_iters():
+    """outer_max_iters reads the outer solver scope of a prepared config."""
+    from jaxamg.config import outer_max_iters
+
+    # Default config: jaxamg's default outer max_iters.
+    assert outer_max_iters(prepare_config()) == 1000
+
+    # Flat overrides land in the outer scope.
+    assert outer_max_iters(prepare_config({"max_iters": 25})) == 25
+    assert outer_max_iters(prepare_config(max_iters=7)) == 7
+
+    # Nested config: the outer solver block's max_iters wins; the
+    # preconditioner's own max_iters is ignored.
+    nested = prepare_config(
+        {
+            "solver": {
+                "solver": "FGMRES",
+                "max_iters": 40,
+                "preconditioner": {"solver": "AMG", "max_iters": 3},
+            }
+        }
+    )
+    assert outer_max_iters(nested) == 40
+
+    # Unparseable input falls back to AmgX's registered default.
+    assert outer_max_iters("") == 100
+    assert outer_max_iters("not json") == 100
