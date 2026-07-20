@@ -99,11 +99,13 @@ def _amgx_solve_impl(
     col_indices: ArrayLike,
     values: ArrayLike,
     b: ArrayLike,
+    x0: ArrayLike | None = None,
     config_str: str = "",
     transpose_solve: bool = False,
     return_stats: bool = False,
     reuse_setup: bool = False,
     res_history_len: int = 0,
+    use_x0: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX solver (non-differentiable)."""
 
@@ -122,19 +124,23 @@ def _amgx_solve_impl(
     call = ffi.ffi_call(
         call_name,
         out_spec,
-        input_layouts=[None, None, None, None],
+        input_layouts=[None, None, None, None, None],
         output_layouts=None,
         vmap_method="sequential",
     )
+    # The x0 slot is a required input; pass b as a same-shape dummy when
+    # unused (ignored by the C++ side when use_x0 is 0).
     results = call(
         row_ptrs,
         col_indices,
         values,
         b,
+        x0 if x0 is not None else b,
         config=config_str,
         transpose_solve=np.int32(transpose_solve),
         return_stats=np.int32(return_stats),
         reuse_setup=np.int32(reuse_setup),
+        use_x0=np.int32(use_x0),
     )
 
     return cast(tuple, results)
@@ -145,6 +151,7 @@ def _amgx_solve_mpi_impl(
     col_indices: ArrayLike,
     values: ArrayLike,
     b: ArrayLike,
+    x0: ArrayLike | None,
     nglobal: ArrayLike,
     comm_ptr: ArrayLike,
     lrank: ArrayLike,
@@ -153,6 +160,7 @@ def _amgx_solve_mpi_impl(
     return_stats: bool = False,
     reuse_setup: bool = False,
     res_history_len: int = 0,
+    use_x0: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX MPI solver (non-differentiable)."""
 
@@ -171,15 +179,18 @@ def _amgx_solve_mpi_impl(
     call = ffi.ffi_call(
         call_name,
         out_spec,
-        input_layouts=[None, None, None, None, None, None, None],
+        input_layouts=[None, None, None, None, None, None, None, None],
         output_layouts=None,
         vmap_method="sequential",
     )
+    # The x0 slot is a required input; pass b as a same-shape dummy when
+    # unused (ignored by the C++ side when use_x0 is 0).
     results = call(
         row_ptrs,
         col_indices,
         values,
         b,
+        x0 if x0 is not None else b,
         nglobal,
         comm_ptr,
         lrank,
@@ -187,6 +198,7 @@ def _amgx_solve_mpi_impl(
         transpose_solve=np.int32(transpose_solve),
         return_stats=np.int32(return_stats),
         reuse_setup=np.int32(reuse_setup),
+        use_x0=np.int32(use_x0),
     )
 
     return cast(tuple, results)
@@ -199,6 +211,7 @@ def _get_solver_primitive(
     return_stats: bool = False,
     reuse_setup: bool = False,
     res_history_len: int = 0,
+    use_x0: bool = False,
 ) -> Callable:
     """
     Returns a JAX custom_vjp primitive for AmgX solve with a specific configuration.
@@ -206,36 +219,41 @@ def _get_solver_primitive(
 
     reuse_setup: Skip warm AMGX resetup and keep the cached hierarchy.
     res_history_len: Residual-history slots appended to the stats output.
+    use_x0: Honor the x0 operand as the initial guess (otherwise it is a
+        same-shape dummy and the solve starts from zero).
     """
 
     @jax.custom_vjp
-    def solve(A: jsp.BCSR, b: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def solve(A: jsp.BCSR, b: jax.Array, x0: jax.Array) -> tuple[jax.Array, jax.Array]:
         x, info = _amgx_solve_impl(
             A.indptr,
             A.indices,
             A.data,
             b,
+            x0,
             config_str=config_str,
             return_stats=return_stats,
             reuse_setup=reuse_setup,
             res_history_len=res_history_len,
+            use_x0=use_x0,
         )
         return x, info
 
     def fwd(
-        A: jsp.BCSR, b: jax.Array
+        A: jsp.BCSR, b: jax.Array, x0: jax.Array
     ) -> tuple[tuple[jax.Array, jax.Array], tuple[jsp.BCSR, jax.Array]]:
-        x, info = solve(A, b)
+        x, info = solve(A, b, x0)
         # Returns ((x, info), residuals)
         return (x, info), (A, x)
 
     def bwd(
         residuals: tuple[jsp.BCSR, jax.Array], g: tuple[jax.Array, jax.Array]
-    ) -> tuple[jsp.BCSR, jax.Array]:
+    ) -> tuple[jsp.BCSR, jax.Array, jax.Array]:
         g_x = g[0]
         A, x = residuals
 
-        # Solve A^T λ = g_x
+        # Solve A^T λ = g_x (always from a zero start: x0 shifts only the
+        # forward iteration, never the solution, so the adjoint ignores it).
         solver = _get_solver_primitive(
             config_str,
             is_symmetric,
@@ -245,7 +263,7 @@ def _get_solver_primitive(
 
         # Check if matrix is symmetric
         if is_symmetric:
-            adj_b, _ = solver(A, g_x)
+            adj_b, _ = solver(A, g_x, g_x)
         else:
             # Use backend transposed solve and keep compatibility fallback.
             try:
@@ -260,7 +278,7 @@ def _get_solver_primitive(
                 )
             except Exception:
                 A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
-                adj_b, _ = solver(A_T, g_x)
+                adj_b, _ = solver(A_T, g_x, g_x)
 
         n = A.shape[0]
         row_lengths = A.indptr[1:] - A.indptr[:-1]
@@ -272,7 +290,8 @@ def _get_solver_primitive(
         grad_values = -adj_b[row_indices] * x[A.indices]
         grad_A = jsp.BCSR((grad_values, A.indices, A.indptr), shape=A.shape)
 
-        return grad_A, adj_b
+        # The exact solution does not depend on the initial guess.
+        return grad_A, adj_b, jnp.zeros_like(adj_b)
 
     solve.defvjp(fwd, bwd)
     return solve
@@ -292,6 +311,7 @@ def _get_solver_primitive_mpi(
     return_stats: bool = False,
     reuse_setup: bool = False,
     res_history_len: int = 0,
+    use_x0: bool = False,
 ) -> Callable:
     """
     Create cached JAX custom_vjp primitive for MPI AmgX solve.
@@ -323,6 +343,7 @@ def _get_solver_primitive_mpi(
     def solve(
         A: jsp.BCSR,
         b: jax.Array,
+        x0: jax.Array,
         col_to_combined: jax.Array,
         send_ids: jax.Array,
         recv_ghost_slot: jax.Array,
@@ -345,6 +366,7 @@ def _get_solver_primitive_mpi(
             A.indices,
             A.data,
             b,
+            x0,
             nglobal_arr,
             comm_ptr_arr,
             lrank_arr,
@@ -352,12 +374,13 @@ def _get_solver_primitive_mpi(
             return_stats=return_stats,
             reuse_setup=reuse_setup,
             res_history_len=res_history_len,
+            use_x0=use_x0,
         )
 
         return x, info
 
-    def fwd(A, b, col_to_combined, send_ids, recv_ghost_slot):
-        out = solve(A, b, col_to_combined, send_ids, recv_ghost_slot)
+    def fwd(A, b, x0, col_to_combined, send_ids, recv_ghost_slot):
+        out = solve(A, b, x0, col_to_combined, send_ids, recv_ghost_slot)
         x, info = out
         return out, (
             A,
@@ -371,10 +394,29 @@ def _get_solver_primitive_mpi(
         g_x, _ = g
         A, x, col_to_combined, send_ids, recv_ghost_slot = residuals
 
+        # Backward solves always start from zero: x0 shifts only the forward
+        # iteration, never the solution, so the adjoint ignores it (and skips
+        # the residual-history readback).
+        adj_solver = _get_solver_primitive_mpi(
+            config_str,
+            nglobal,
+            comm_ptr,
+            lrank,
+            is_symmetric=is_symmetric,
+            recvcounts_tuple=recvcounts_tuple,
+            max_nnz=max_nnz,
+            nnz_out=nnz_out,
+            n_ghost=n_ghost,
+            return_stats=return_stats,
+            reuse_setup=reuse_setup,
+        )
+
         # Backward solve: A^T @ adj_b = g_x
         if is_symmetric:
             # Symmetric: skip the distributed transpose.
-            adj_b, _ = solve(A, g_x, col_to_combined, send_ids, recv_ghost_slot)
+            adj_b, _ = adj_solver(
+                A, g_x, g_x, col_to_combined, send_ids, recv_ghost_slot
+            )
         else:
             # Distributed transpose via mpi4jax (JIT-compatible, GPU-direct when
             # MPI4JAX_USE_CUDA_MPI=1).
@@ -398,7 +440,9 @@ def _get_solver_primitive_mpi(
             # Reconstruct BCSR for A^T
             A_T = jsp.BCSR((at_data, at_indices, at_indptr), shape=A.shape)
 
-            adj_b, _ = solve(A_T, g_x, col_to_combined, send_ids, recv_ghost_slot)
+            adj_b, _ = adj_solver(
+                A_T, g_x, g_x, col_to_combined, send_ids, recv_ghost_slot
+            )
 
         # Gradient w.r.t. A: ∂L/∂A_ij = -adj_b[i] * x[j]. Fetch only the solution
         # entries this rank's rows reference via the halo exchange, ordered after
@@ -419,7 +463,8 @@ def _get_solver_primitive_mpi(
         grad_values = -adj_b[row_indices] * x_combined[col_to_combined]
         grad_A = jsp.BCSR((grad_values, A.indices, A.indptr), shape=A.shape)
 
-        return grad_A, adj_b, None, None, None
+        # The exact solution does not depend on the initial guess.
+        return grad_A, adj_b, jnp.zeros_like(adj_b), None, None, None
 
     solve.defvjp(fwd, bwd)
     return solve
@@ -445,6 +490,7 @@ def _format_and_save_stats(
 def solve(
     A: MatrixOrOperator,
     b: ArrayLike,
+    x0: ArrayLike | None = None,
     config: dict | None = None,
     comm: "Comm | None" = None,
     nglobal: int | None = None,
@@ -458,6 +504,7 @@ def solve(
     Args:
         A: Matrix or callable operator A(x). All matrices/operators are converted to `jax.experimental.sparse.bcsr` sparse matrices internally. In MPI mode this is the local partition.
         b: Right-hand-side vector. In MPI mode this is the local RHS partition.
+        x0: Optional initial guess (same shape as `b`; local partition in MPI mode). Defaults to zero. A good warm start (e.g. the previous solution in a time-stepping or optimization loop) cuts iterations; it does not change the converged solution or its gradients. Note that with the default `RELATIVE_INI` convergence the tolerance is relative to the *initial* residual, so a very good `x0` tightens the target; consider `convergence="ABSOLUTE"` for warm-started loops.
         config: AmgX configuration dictionary (see [Solver Configuration](config.md) for details). If `None`, JAX-AMG defaults are used.
         comm: MPI communicator (typically `mpi4py.MPI.COMM_WORLD`). If provided, the solve runs in MPI mode. If not provided, MPI mode can still be used if MPI metadata has already been attached via `with_cache(..., mpi=...)`.
         nglobal: Global matrix row count for MPI mode. Required when `comm` is provided and MPI metadata is not pre-attached to `A`.
@@ -481,7 +528,7 @@ def solve(
         )
 
     # Load the native extension and register FFI targets (sets HAS_MPI).
-    ext = _ensure_backend()
+    _ensure_backend()
 
     # MPI cache may be pre-attached to A via `with_cache`
     mpi_cache = getattr(A, "_mpi_cache", None)
@@ -511,19 +558,27 @@ def solve(
             **kwargs,
         )
 
-    # Residual-history slots appended to the stats output (outer max_iters + 1
-    # entries). An older extension without support would leave them
-    # uninitialized, so only request them when the extension advertises the
-    # capability.
-    if getattr(ext, "supports_residual_history", False):
-        res_history_len = amgx_config.outer_max_iters(config_str) + 1
-    else:
-        res_history_len = 0
+    # Residual-history slots appended to the stats output (one per outer
+    # iteration, plus the initial residual).
+    res_history_len = amgx_config.outer_max_iters(config_str) + 1
 
     # Detect desired precision (non-float RHS dtypes are promoted to float32)
     target_dtype = get_preferred_dtype(A, b)
     if b.dtype != target_dtype:
         b = b.astype(target_dtype)
+
+    use_x0 = x0 is not None
+    if use_x0:
+        x0 = jnp.asarray(x0)
+        if x0.shape != b.shape:
+            raise ValueError(
+                f"x0 must have the same shape as b; got {x0.shape} vs {b.shape}"
+            )
+        if x0.dtype != target_dtype:
+            x0 = x0.astype(target_dtype)
+    # The primitive always takes an x0 operand; b doubles as a same-shape
+    # dummy that the backend ignores when use_x0 is off.
+    x0_arg = x0 if use_x0 else b
 
     # Check for symmetry attribute on A
     is_symmetric = getattr(A, "_is_symmetric", False)
@@ -569,11 +624,13 @@ def solve(
                 return_stats=1 if save_stats_file else 0,
                 reuse_setup=reuse_setup,
                 res_history_len=res_history_len,
+                use_x0=use_x0,
             )
 
             x, info = solver(
                 A_csr,
                 b,
+                x0_arg,
                 jnp.asarray(halo_plan.col_to_combined),
                 jnp.asarray(halo_plan.send_ids_2d),
                 jnp.asarray(halo_plan.recv_ghost_slot_2d),
@@ -653,10 +710,12 @@ def solve(
                 return_stats=1 if save_stats_file else 0,
                 reuse_setup=reuse_setup,
                 res_history_len=res_history_len,
+                use_x0=use_x0,
             )
             x, info = solver(
                 A_csr,
                 b,
+                x0_arg,
                 jnp.asarray(halo_plan.col_to_combined),
                 jnp.asarray(halo_plan.send_ids_2d),
                 jnp.asarray(halo_plan.recv_ghost_slot_2d),
@@ -672,32 +731,30 @@ def solve(
             return_stats=1 if save_stats_file else 0,
             reuse_setup=reuse_setup,
             res_history_len=res_history_len,
+            use_x0=use_x0,
         )
 
-        x, info = solver(A_csr, b)
+        x, info = solver(A_csr, b, x0_arg)
 
     if isinstance(info, jax.core.Tracer):
         # Inside JIT (or another trace): info elements are tracers; return as-is.
         # The history keeps its fixed trace-time length (outer max_iters + 1),
         # NaN-padded past entry `iterations`.
-        info_dict: dict[str, Any] = {
+        return x, {
             "iterations": info[0],
             "residual": info[1],
             "status": info[2],
+            "residual_history": info[3:],
         }
-        if res_history_len:
-            info_dict["residual_history"] = info[3:]
-        return x, info_dict
 
     info_dict = {
         "iterations": int(info[0]),
         "residual": float(info[1]),
         "status": AMGXStatus(int(info[2])),
-    }
-    if res_history_len:
         # Entry i is the residual norm after outer iteration i (entry 0 is the
         # initial residual); trim the NaN padding outside a trace.
-        info_dict["residual_history"] = info[3 : 4 + int(info[0])]
+        "residual_history": info[3 : 4 + int(info[0])],
+    }
     if save_stats_file is not None:
         try:
             stats_str = _ensure_backend().get_stats_string()

@@ -58,12 +58,14 @@ namespace
           .Arg<ffi::Buffer<ffi::S32>>()             // col_indices
           .Arg<ffi::Buffer<ffi::F32>>()             // values
           .Arg<ffi::Buffer<ffi::F32>>()             // b
+          .Arg<ffi::Buffer<ffi::F32>>()             // x0 (ignored unless use_x0)
           .Ret<ffi::Buffer<ffi::F32>>()             // x
           .Ret<ffi::Buffer<ffi::F32>>()             // stats
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
+          .Attr<int32_t>("use_x0")                  // honor x0 initial guess
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -75,12 +77,14 @@ namespace
           .Arg<ffi::Buffer<ffi::S32>>()             // col_indices
           .Arg<ffi::Buffer<ffi::F64>>()             // values
           .Arg<ffi::Buffer<ffi::F64>>()             // b
+          .Arg<ffi::Buffer<ffi::F64>>()             // x0 (ignored unless use_x0)
           .Ret<ffi::Buffer<ffi::F64>>()             // x
           .Ret<ffi::Buffer<ffi::F64>>()             // stats
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
+          .Attr<int32_t>("use_x0")                  // honor x0 initial guess
   );
 
 #ifdef JAXAMG_WITH_MPI
@@ -94,6 +98,7 @@ namespace
           .Arg<ffi::Buffer<ffi::S64>>()             // col_indices (GLOBAL, int64)
           .Arg<ffi::Buffer<ffi::F32>>()             // values
           .Arg<ffi::Buffer<ffi::F32>>()             // b (local)
+          .Arg<ffi::Buffer<ffi::F32>>()             // x0 (local; ignored unless use_x0)
           .Arg<ffi::Buffer<ffi::S32>>()             // nglobal
           .Arg<ffi::Buffer<ffi::S32>>()             // comm_ptr (2 x int32)
           .Arg<ffi::Buffer<ffi::S32>>()             // lrank
@@ -103,6 +108,7 @@ namespace
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
+          .Attr<int32_t>("use_x0")                  // honor x0 initial guess
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -114,6 +120,7 @@ namespace
           .Arg<ffi::Buffer<ffi::S64>>()             // col_indices (GLOBAL, int64)
           .Arg<ffi::Buffer<ffi::F64>>()             // values
           .Arg<ffi::Buffer<ffi::F64>>()             // b (local)
+          .Arg<ffi::Buffer<ffi::F64>>()             // x0 (local; ignored unless use_x0)
           .Arg<ffi::Buffer<ffi::S32>>()             // nglobal
           .Arg<ffi::Buffer<ffi::S32>>()             // comm_ptr (2 x int32)
           .Arg<ffi::Buffer<ffi::S32>>()             // lrank
@@ -123,6 +130,7 @@ namespace
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
+          .Attr<int32_t>("use_x0")                  // honor x0 initial guess
   );
 
 #endif // JAXAMG_WITH_MPI
@@ -144,9 +152,6 @@ PYBIND11_MODULE(_amgx, m)
 #else
   m.attr("mpi_enabled") = py::bool_(false);
 #endif
-  // Python only requests residual-history slots in the stats buffer when this
-  // flag exists; an older extension would leave those slots uninitialized.
-  m.attr("supports_residual_history") = py::bool_(true);
 
   m.def("initialize", &EnsureAmgxInitialized);
   m.def("finalize", &AmgxFinalize);
