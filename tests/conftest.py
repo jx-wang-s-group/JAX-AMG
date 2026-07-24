@@ -1,7 +1,19 @@
 """Pytest configuration and fixtures for jaxamg tests."""
 
-import jax
-import pytest
+import os
+
+# Under mpirun, pin each rank to a single distinct GPU before JAX initializes
+# its CUDA backend (test collection already allocates on device). Otherwise
+# every rank allocates on the first visible device, whose memory is exhausted
+# once a few ranks preallocate on it.
+_local_rank = os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK")
+_visible_gpus = os.environ.get("CUDA_VISIBLE_DEVICES")
+if _local_rank is not None and _visible_gpus:
+    _gpus = _visible_gpus.split(",")
+    os.environ["CUDA_VISIBLE_DEVICES"] = _gpus[int(_local_rank) % len(_gpus)]
+
+import jax  # noqa: E402
+import pytest  # noqa: E402
 
 
 @pytest.fixture(scope="session", autouse=True)

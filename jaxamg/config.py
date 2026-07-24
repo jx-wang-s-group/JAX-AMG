@@ -228,6 +228,36 @@ def validate_config(config: dict, *, mpi: bool = False, block_dim: int = 1) -> N
                     '"SIZE_2") or a non-AMG preconditioner.'
                 )
 
+        if mpi:
+            # AmgX's distributed DENSE_LU solver mishandles block (BSR)
+            # matrices once they span 3+ ranks: local-LU coarse corrections
+            # come out wrong (V-cycles silently diverge to NaN) and the
+            # exact-solve path rejects blocks with an opaque cusolver error.
+            # The MPI block defaults use BLOCK_JACOBI coarse sweeps instead;
+            # reject explicit DENSE_LU_SOLVER so the failure is loud and
+            # actionable rather than a wrong answer.
+            def _entry_solver(entry: Any) -> str:
+                if isinstance(entry, dict):
+                    entry = entry.get("solver")
+                return _as_upper(entry)
+
+            dense_lu_paths = []
+            if _entry_solver(solver_block.get("solver")) == "DENSE_LU_SOLVER":
+                dense_lu_paths.append("solver")
+            for amg in _amg_blocks(solver_block):
+                path = "solver" if amg is solver_block else "solver.preconditioner"
+                if _entry_solver(amg.get("coarse_solver")) == "DENSE_LU_SOLVER":
+                    dense_lu_paths.append(f"{path}.coarse_solver")
+            if dense_lu_paths:
+                raise ValueError(
+                    f"Invalid MPI AmgX config: {', '.join(dense_lu_paths)} uses "
+                    "DENSE_LU_SOLVER, which produces wrong results for "
+                    "distributed block matrices (block_dim > 1) on 3 or more "
+                    "ranks. Use coarse smoother sweeps instead, e.g. "
+                    '\'coarse_solver\': {"solver": "BLOCK_JACOBI", '
+                    '"max_iters": 50} (the MPI block default).'
+                )
+
     communicator = solver_block.get("communicator")
     if communicator is not None and _as_upper(communicator) not in {
         "MPI",
@@ -291,6 +321,15 @@ def prepare_config(
     amg_defaults = deep_merge(
         {}, _AMG_AGGREGATION_DEFAULTS if block_dim > 1 else _AMG_DEFAULTS
     )
+
+    # AmgX's distributed DENSE_LU coarse solve mishandles block (BSR) matrices
+    # once the coarse level spans 3+ ranks: its local-LU path returns wrong
+    # coarse corrections (diverging V-cycles), and its exact-solve path rejects
+    # block matrices outright. Use block-Jacobi coarse sweeps instead for
+    # distributed block solves; single-GPU block solves keep DENSE_LU.
+    if mpi and block_dim > 1:
+        amg_defaults["coarse_solver"] = {"solver": "BLOCK_JACOBI", "max_iters": 50}
+        amg_defaults.pop("dense_lu_num_rows", None)
 
     defaults = {
         "solver": "PBICGSTAB",

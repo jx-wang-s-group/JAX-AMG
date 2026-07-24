@@ -101,6 +101,13 @@ switch to aggregation AMG when `block_dim > 1`:
 }
 ```
 
+In MPI mode the block defaults differ in one place: `coarse_solver` becomes
+`{"solver": "BLOCK_JACOBI", "max_iters": 50}` (and `dense_lu_num_rows` is
+dropped). AmgX's distributed `DENSE_LU_SOLVER` produces wrong coarse
+corrections for block matrices spanning 3 or more ranks — V-cycles silently
+diverge — so explicitly configuring `DENSE_LU_SOLVER` (as coarse solver or
+outer solver) together with `comm` and `block_dim > 1` raises a `ValueError`.
+
 Explicitly configuring CLASSICAL AMG together with `block_dim > 1` raises a
 `ValueError`. Block-aware preconditioning is often the entire benefit: on a
 strongly coupled system, `BLOCK_JACOBI` under `block_dim=2` inverts true
@@ -191,7 +198,7 @@ These go inside the AMG solver/preconditioner scope:
 | `interpolator` | Interpolation strategy, e.g. `D2` (default for Classical). |
 | `smoother` | Smoother solver, e.g. `BLOCK_JACOBI` (default), `JACOBI_L1`, `MULTICOLOR_GS`, `MULTICOLOR_DILU`. |
 | `presweeps`, `postsweeps` | Number of smoothing sweeps (default: 1). |
-| `coarse_solver` | Coarse-level solver: `DENSE_LU_SOLVER` (default) or `NOSOLVER`. |
+| `coarse_solver` | Coarse-level solver: `DENSE_LU_SOLVER` (default), `NOSOLVER`, or a nested solver scope. For MPI block solves the default is block-Jacobi sweeps and `DENSE_LU_SOLVER` is rejected (see [Block matrices](#block-matrices)). |
 | `strength_threshold` | Strength of connection threshold for coarsening (default: 0.5). |
 | `max_levels` | Maximum multigrid levels (default: 100). |
 | `cycle` | Cycle type: `V` (default), `W`, `F`, `CG`, `CGF`. |

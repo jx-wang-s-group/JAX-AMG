@@ -835,10 +835,34 @@ def test_mpi_initial_guess(mpi_context):
         )
 
 
+def _partition_block_aligned(A_sp, b_global, rank, nranks, block_dim):
+    """Row-partition a scipy CSR system on block boundaries.
+
+    The naive row partition can split a block across two ranks (e.g. 512 rows
+    over 3 ranks -> 171/171/170), which the block solver cannot handle;
+    partition whole blocks instead.
+    """
+    import jax.experimental.sparse as jsp
+
+    n_blocks = A_sp.shape[0] // block_dim
+    blk_start, blk_end, _ = get_partition_info(n_blocks, rank, nranks)
+    row_start, row_end = blk_start * block_dim, blk_end * block_dim
+    A_loc = A_sp[row_start:row_end, :]
+    A_local = jsp.BCSR(
+        (
+            jnp.asarray(A_loc.data.astype(np.float32)),
+            jnp.asarray(A_loc.indices),
+            jnp.asarray(A_loc.indptr),
+        ),
+        shape=A_loc.shape,
+    )
+    b_local = jnp.asarray(b_global[row_start:row_end])
+    return A_local, b_local, row_start, row_end
+
+
 @pytest.mark.mpi(min_size=2)
 def test_mpi_block_solve(mpi_context):
     """Distributed block solve (block_dim=2) of a coupled kron system."""
-    import jax.experimental.sparse as jsp
     import scipy.sparse
     import scipy.sparse.linalg as spla
 
@@ -851,17 +875,9 @@ def test_mpi_block_solve(mpi_context):
     n = A_sp.shape[0]
     b_global = np.linspace(0.5, 1.5, n).astype(np.float32)
 
-    A_glob = jsp.BCSR(
-        (
-            jnp.asarray(A_sp.data.astype(np.float32)),
-            jnp.asarray(A_sp.indices),
-            jnp.asarray(A_sp.indptr),
-        ),
-        shape=A_sp.shape,
+    A_local, b_local, row_start, row_end = _partition_block_aligned(
+        A_sp, b_global, rank, nranks, block_dim=2
     )
-    A_local, row_start, row_end = partition_csr_matrix(A_glob, rank, nranks)
-    b_local, _, _ = partition_vector(jnp.asarray(b_global), rank, nranks)
-    assert row_start % 2 == 0 and (row_end - row_start) % 2 == 0
 
     # Default block config (aggregation AMG) on the distributed system.
     x_local, info = jaxamg.solve(
@@ -896,16 +912,9 @@ def test_mpi_block_gradients(mpi_context):
     n = A_sp.shape[0]
     b_global = np.linspace(0.5, 1.5, n).astype(np.float32)
 
-    A_glob = jsp.BCSR(
-        (
-            jnp.asarray(A_sp.data.astype(np.float32)),
-            jnp.asarray(A_sp.indices),
-            jnp.asarray(A_sp.indptr),
-        ),
-        shape=A_sp.shape,
+    A_local, b_local, row_start, row_end = _partition_block_aligned(
+        A_sp, b_global, rank, nranks, block_dim=2
     )
-    A_local, row_start, row_end = partition_csr_matrix(A_glob, rank, nranks)
-    b_local, _, _ = partition_vector(jnp.asarray(b_global), rank, nranks)
 
     def loss(vals, rhs):
         A_i = jsp.BCSR((vals, A_local.indices, A_local.indptr), shape=A_local.shape)

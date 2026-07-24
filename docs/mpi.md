@@ -75,6 +75,11 @@ comm.Barrier()
 jaxamg.finalize()
 ```
 
+Block matrices (`block_dim > 1`) work in MPI mode as well; each rank's local
+partition must be block-aligned (its row count divisible by `block_dim`).
+Note that the AMG coarse-solver default differs from the single-GPU case —
+see [Block matrices](config.md#block-matrices) in the configuration guide.
+
 ## Caching
 
 If you are solving many similar systems repeatedly, such as in an optimization loop, especially with JIT, compute and cache the metadata once (outside the JIT-compiled region) and reuse it for subsequent solves:
