@@ -72,6 +72,48 @@ initial residual. Outside `jit` it is trimmed to `iterations + 1` entries;
 inside `jit` it has fixed length `max_iters + 1`, NaN-padded past entry
 `iterations`.
 
+### Block matrices
+
+For coupled multi-component systems, pass `block_dim=k` to `jaxamg.solve(...)`
+to treat the matrix as having square `k x k` blocks (unknowns interleaved
+node-major: row `i*k + c` is component `c` of node `i`). `A` and `b` keep
+their ordinary scalar CSR/vector form — the conversion to AmgX's BSR format
+happens internally — and autodiff works unchanged. Rows must be divisible by
+`block_dim` (each rank's local partition in MPI mode).
+
+Because AmgX's classical AMG does not support block matrices, the AMG defaults
+switch to aggregation AMG when `block_dim > 1`:
+
+```python
+{
+    "solver": "AMG",
+    "algorithm": "AGGREGATION",
+    "selector": "SIZE_2",
+    "smoother": {"solver": "BLOCK_JACOBI", "relaxation_factor": 0.9},
+    "presweeps": 1,
+    "postsweeps": 1,
+    "max_levels": 100,
+    "min_coarse_rows": 32,
+    "dense_lu_num_rows": 64,
+    "coarse_solver": "DENSE_LU_SOLVER",
+    "max_iters": 1,
+    "cycle": "V",
+}
+```
+
+In MPI mode the block defaults differ in one place: `coarse_solver` becomes
+`{"solver": "BLOCK_JACOBI", "max_iters": 50}` (and `dense_lu_num_rows` is
+dropped). AmgX's distributed `DENSE_LU_SOLVER` produces wrong coarse
+corrections for block matrices spanning 3 or more ranks — V-cycles silently
+diverge — so explicitly configuring `DENSE_LU_SOLVER` (as coarse solver or
+outer solver) together with `comm` and `block_dim > 1` raises a `ValueError`.
+
+Explicitly configuring CLASSICAL AMG together with `block_dim > 1` raises a
+`ValueError`. Block-aware preconditioning is often the entire benefit: on a
+strongly coupled system, `BLOCK_JACOBI` under `block_dim=2` inverts true
+2x2 diagonal blocks (instead of scalar diagonal entries) and can converge in
+a handful of iterations where the scalar-preconditioned solve stalls.
+
 ### MPI config
 
 The `communicator` key can be set to `MPI` for standard CPU-based MPI or `MPI_DIRECT` for GPU-aware MPI. The default is `MPI`. To use GPU-aware MPI, ensure that your MPI installation supports it. For more details, see the [MPI Guide](mpi.md).
@@ -156,7 +198,7 @@ These go inside the AMG solver/preconditioner scope:
 | `interpolator` | Interpolation strategy, e.g. `D2` (default for Classical). |
 | `smoother` | Smoother solver, e.g. `BLOCK_JACOBI` (default), `JACOBI_L1`, `MULTICOLOR_GS`, `MULTICOLOR_DILU`. |
 | `presweeps`, `postsweeps` | Number of smoothing sweeps (default: 1). |
-| `coarse_solver` | Coarse-level solver: `DENSE_LU_SOLVER` (default) or `NOSOLVER`. |
+| `coarse_solver` | Coarse-level solver: `DENSE_LU_SOLVER` (default), `NOSOLVER`, or a nested solver scope. For MPI block solves the default is block-Jacobi sweeps and `DENSE_LU_SOLVER` is rejected (see [Block matrices](#block-matrices)). |
 | `strength_threshold` | Strength of connection threshold for coarsening (default: 0.5). |
 | `max_levels` | Maximum multigrid levels (default: 100). |
 | `cycle` | Cycle type: `V` (default), `W`, `F`, `CG`, `CGF`. |

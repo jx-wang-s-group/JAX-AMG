@@ -171,6 +171,135 @@ namespace
     return stats_host;
   }
 
+  // Build the BSR structure of the (optionally transposed) scalar CSR pattern
+  // plus a scatter map from the scalar values order into the BSR values
+  // buffer (slot = block_index * bs^2 + local_row * bs + local_col; blocks are
+  // row-major within, matching AmgX's layout). Fill-in slots are never mapped;
+  // the BSR values buffer is zero-initialized once so they stay zero across
+  // value refreshes. For transpose=true the map composes the CSR transpose
+  // permutation, so scattering A's values directly yields BSR(A^T).
+  // ColT is int (single-GPU) or int64_t (MPI global column indices).
+  template <typename ColT>
+  inline const char *BuildBsrScatterMap(int n_rows, int nnz, int bs, bool transpose,
+                                        const int *row_ptrs, const ColT *col_indices,
+                                        std::vector<int> &bsr_row_ptrs,
+                                        std::vector<int> &bsr_col_indices,
+                                        std::vector<int> &scatter_map)
+  {
+    if (bs < 1 || n_rows % bs != 0)
+      return "matrix rows are not divisible by block_dim";
+    // Transposed target has as many block rows as the (square) input.
+    const int n_b = n_rows / bs;
+
+    struct Entry
+    {
+      int bcol;
+      int sub;
+      int idx;
+    };
+
+    // Bucket scalar entries by target block row (counting sort).
+    std::vector<int> offsets(n_b + 1, 0);
+    for (int r = 0; r < n_rows; ++r)
+      for (int k = row_ptrs[r]; k < row_ptrs[r + 1]; ++k)
+      {
+        const long long er = transpose ? static_cast<long long>(col_indices[k]) : r;
+        offsets[static_cast<int>(er / bs) + 1]++;
+      }
+    for (int i = 0; i < n_b; ++i)
+      offsets[i + 1] += offsets[i];
+
+    std::vector<Entry> entries(nnz);
+    {
+      std::vector<int> cursor(offsets.begin(), offsets.end() - 1);
+      for (int r = 0; r < n_rows; ++r)
+        for (int k = row_ptrs[r]; k < row_ptrs[r + 1]; ++k)
+        {
+          const long long c = static_cast<long long>(col_indices[k]);
+          const long long er = transpose ? c : r;
+          const long long ec = transpose ? r : c;
+          Entry e;
+          e.bcol = static_cast<int>(ec / bs);
+          e.sub = static_cast<int>((er % bs) * bs + (ec % bs));
+          e.idx = k;
+          entries[cursor[static_cast<int>(er / bs)]++] = e;
+        }
+    }
+
+    bsr_row_ptrs.assign(n_b + 1, 0);
+    bsr_col_indices.clear();
+    scatter_map.assign(nnz, 0);
+    for (int br = 0; br < n_b; ++br)
+    {
+      const int lo = offsets[br], hi = offsets[br + 1];
+      std::sort(entries.begin() + lo, entries.begin() + hi,
+                [](const Entry &a, const Entry &b)
+                { return a.bcol < b.bcol; });
+      int prev_bcol = -1;
+      for (int i = lo; i < hi; ++i)
+      {
+        if (entries[i].bcol != prev_bcol)
+        {
+          prev_bcol = entries[i].bcol;
+          bsr_col_indices.push_back(prev_bcol);
+        }
+        const long long slot =
+            (static_cast<long long>(bsr_col_indices.size()) - 1) * bs * bs +
+            entries[i].sub;
+        if (slot > std::numeric_limits<int>::max())
+          return "block value buffer exceeds int32 indexing";
+        scatter_map[entries[i].idx] = static_cast<int>(slot);
+      }
+      bsr_row_ptrs[br + 1] = static_cast<int>(bsr_col_indices.size());
+    }
+    return nullptr;
+  }
+
+  // Scatter the scalar CSR values (device) into the cached BSR values buffer
+  // via the precomputed slot map: bsr_values[map[i]] = values[i]. One generic
+  // cusparseScatter call; unmapped fill-in slots keep their initial zeros.
+  template <typename T>
+  inline const char *ScatterValuesToBsr(cudaStream_t stream, int nnz,
+                                        const T *values, void *map_dev,
+                                        void *bsr_values, int64_t dense_size)
+  {
+    cusparseHandle_t handle = GetCusparseHandle();
+    if (handle == nullptr)
+    {
+      return "cusparseCreate failed";
+    }
+    cusparseSetStream(handle, stream);
+
+    const cudaDataType dtype =
+        std::is_same<T, double>::value ? CUDA_R_64F : CUDA_R_32F;
+    cusparseSpVecDescr_t vec_x = nullptr;
+    cusparseDnVecDescr_t vec_y = nullptr;
+    cusparseStatus_t status = cusparseCreateSpVec(
+        &vec_x, dense_size, nnz, map_dev, const_cast<T *>(values),
+        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, dtype);
+    if (status == CUSPARSE_STATUS_SUCCESS)
+    {
+      status = cusparseCreateDnVec(&vec_y, dense_size, bsr_values, dtype);
+    }
+    if (status == CUSPARSE_STATUS_SUCCESS)
+    {
+      status = cusparseScatter(handle, vec_x, vec_y);
+    }
+    if (vec_y)
+      cusparseDestroyDnVec(vec_y);
+    if (vec_x)
+      cusparseDestroySpVec(vec_x);
+    if (status != CUSPARSE_STATUS_SUCCESS)
+    {
+      return "cusparseScatter failed for block values";
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess)
+    {
+      return "cudaStreamSynchronize failed after block value scatter";
+    }
+    return nullptr;
+  }
+
   /*
    * AmgxSolveInternal: Templated core implementation of the XLA FFI handler.
    * Supports both float (AMGX_mode_dFFI) and double (AMGX_mode_dDDI).
@@ -188,7 +317,8 @@ namespace
                                       int32_t transpose_solve,
                                       int32_t return_stats,
                                       int32_t reuse_setup,
-                                      int32_t use_x0)
+                                      int32_t use_x0,
+                                      int32_t block_dim)
   {
     EnsureAmgxInitialized();
 
@@ -221,6 +351,15 @@ namespace
     const int n_rows = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
     const int nnz = static_cast<int>(values.element_count());
 
+    // Block mode (block_dim > 1): the scalar CSR inputs are converted to BSR
+    // for AmgX; n_b is the number of block rows.
+    const int bs = block_dim;
+    if (bs < 1 || n_rows % bs != 0)
+    {
+      return ffi::Error::Internal("matrix rows are not divisible by block_dim");
+    }
+    const int n_b = n_rows / bs;
+
     // The cache-hit path only replaces coefficient values, so the key must
     // capture the full sparsity pattern (row_ptrs + col_indices) for a changed
     // pattern to miss and trigger a fresh setup. Reuse host buffers across calls
@@ -238,7 +377,7 @@ namespace
     size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_rows + 1) * sizeof(int));
     structure_hash = fnv1a_hash(h_col_indices.data(), nnz * sizeof(int), structure_hash);
 
-    CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, structure_hash, std::string(config)};
+    CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, bs, structure_hash, std::string(config)};
     bool cache_hit = GetSolverCache().get(key, res);
 
     // Destroys freshly created resources on any early return below (armed only
@@ -249,7 +388,26 @@ namespace
 
     if (cache_hit)
     {
-      if (transpose_solve != 0)
+      if (bs > 1)
+      {
+        // Block mode covers plain and transpose solves alike: the cached map
+        // already routes each scalar value to its (possibly transposed) BSR
+        // slot, so refreshing coefficients is a single scatter.
+        if (!res.bsr_values || !res.bsr_scatter_map)
+        {
+          return ffi::Error::Internal("block cache entry missing BSR buffers");
+        }
+        const char *scatter_err = ScatterValuesToBsr<T>(
+            stream, nnz, values_data, res.bsr_scatter_map, res.bsr_values,
+            static_cast<int64_t>(res.bsr_nnzb) * bs * bs);
+        if (scatter_err != nullptr)
+        {
+          return ffi::Error::Internal(scatter_err);
+        }
+        AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
+            res.A, n_b, res.bsr_nnzb, static_cast<T *>(res.bsr_values), nullptr));
+      }
+      else if (transpose_solve != 0)
       {
         if (!res.transpose_row_ptrs || !res.transpose_col_indices || !res.transpose_values)
         {
@@ -283,12 +441,12 @@ namespace
       // reuse_setup keeps the existing hierarchy while still refreshing the fine matrix.
       if (!reuse_setup)
         AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
-      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
+      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_b, bs, b_data));
       // AMGX_solver_solve treats the x vector's contents as the initial guess.
       if (use_x0 != 0)
-        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_rows, 1, x0_data));
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_b, bs, x0_data));
       else
-        AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
+        AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_b, bs));
 
       reuse_success = true;
     }
@@ -317,7 +475,54 @@ namespace
       AMGX_SAFE_CALL(AMGX_vector_create(&res.b_vec, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, Mode, res.cfg));
 
-      if (transpose_solve != 0)
+      if (bs > 1)
+      {
+        // Build the BSR structure (of A, or A^T for transpose solves) plus
+        // the value scatter map on the host; the pattern is already there
+        // from the cache-key hashing above.
+        std::vector<int> bsr_row_ptrs, bsr_col_indices, scatter_map;
+        const char *build_err = BuildBsrScatterMap<int>(
+            n_rows, nnz, bs, transpose_solve != 0,
+            h_row_ptrs.data(), h_col_indices.data(),
+            bsr_row_ptrs, bsr_col_indices, scatter_map);
+        if (build_err != nullptr)
+        {
+          return ffi::Error::Internal(build_err);
+        }
+        res.bsr_nnzb = static_cast<int>(bsr_col_indices.size());
+        const size_t map_bytes = static_cast<size_t>(nnz) * sizeof(int);
+        const size_t val_bytes =
+            static_cast<size_t>(res.bsr_nnzb) * bs * bs * sizeof(T);
+        if (cudaMalloc(&res.bsr_scatter_map, map_bytes) != cudaSuccess ||
+            cudaMalloc(&res.bsr_values, val_bytes) != cudaSuccess)
+        {
+          return ffi::Error::Internal("cudaMalloc failed for block buffers");
+        }
+        cudaMemcpyAsync(res.bsr_scatter_map, scatter_map.data(), map_bytes,
+                        cudaMemcpyHostToDevice, stream);
+        cudaMemsetAsync(res.bsr_values, 0, val_bytes, stream);
+        const char *scatter_err = ScatterValuesToBsr<T>(
+            stream, nnz, values_data, res.bsr_scatter_map, res.bsr_values,
+            static_cast<int64_t>(res.bsr_nnzb) * bs * bs);
+        if (scatter_err != nullptr)
+        {
+          return ffi::Error::Internal(scatter_err);
+        }
+
+        // Mixed host (structure) / device (values) pointers are fine: AmgX
+        // uploads with cudaMemcpyDefault.
+        AMGX_SAFE_CALL(AMGX_matrix_upload_all(
+            res.A,
+            n_b,
+            res.bsr_nnzb,
+            bs,
+            bs,
+            bsr_row_ptrs.data(),
+            bsr_col_indices.data(),
+            static_cast<T *>(res.bsr_values),
+            nullptr));
+      }
+      else if (transpose_solve != 0)
       {
         if (cudaMalloc(&res.transpose_row_ptrs, (n_rows + 1) * sizeof(int)) != cudaSuccess)
         {
@@ -374,11 +579,11 @@ namespace
             nullptr));
       }
 
-      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_rows, 1, b_data));
+      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_b, bs, b_data));
       if (use_x0 != 0)
-        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_rows, 1, x0_data));
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_b, bs, x0_data));
       else
-        AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_rows, 1));
+        AMGX_SAFE_CALL(AMGX_vector_set_zero(res.x_vec, n_b, bs));
       AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
     }
 
@@ -451,7 +656,8 @@ namespace
                                          int32_t transpose_solve,
                                          int32_t return_stats,
                                          int32_t reuse_setup,
-                                         int32_t use_x0)
+                                         int32_t use_x0,
+                                         int32_t block_dim)
   {
     if (transpose_solve != 0)
     {
@@ -498,6 +704,17 @@ namespace
     const int n_local = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
     const int nnz = static_cast<int>(values.element_count());
 
+    // Block mode (block_dim > 1): local scalar CSR (with global columns) is
+    // converted to BSR. Both the local partition and the global size must be
+    // block-aligned.
+    const int bs = block_dim;
+    if (bs < 1 || n_local % bs != 0 || nglobal_host % bs != 0)
+    {
+      return ffi::Error::Internal(
+          "local partition or global size is not divisible by block_dim");
+    }
+    const int n_local_b = n_local / bs;
+
     CachedResources res;
 
     // Hash row_ptrs and the (global, int64) col_indices; see the single-GPU
@@ -524,6 +741,7 @@ namespace
         lrank_host,
         static_cast<int>(Mode),
         false,
+        bs,
         comm_ptr_val,
         structure_hash,
         std::string(config)};
@@ -535,26 +753,46 @@ namespace
 
     if (cache_hit)
     {
-      // Refresh the cached matrix values. The D2D copy is asynchronous;
-      // synchronize before AMGX reads values_buf.
-      cudaMemcpyAsync(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice, stream);
-      cudaStreamSynchronize(stream);
-      AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
-          res.A, n_local, nnz, res.values_buf, nullptr));
+      if (bs > 1)
+      {
+        // Refresh coefficients with one scatter into the cached BSR buffer.
+        if (!res.bsr_values || !res.bsr_scatter_map)
+        {
+          return ffi::Error::Internal("block cache entry missing BSR buffers");
+        }
+        const char *scatter_err = ScatterValuesToBsr<T>(
+            stream, nnz, values_data, res.bsr_scatter_map, res.bsr_values,
+            static_cast<int64_t>(res.bsr_nnzb) * bs * bs);
+        if (scatter_err != nullptr)
+        {
+          return ffi::Error::Internal(scatter_err);
+        }
+        AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
+            res.A, n_local_b, res.bsr_nnzb, static_cast<T *>(res.bsr_values), nullptr));
+      }
+      else
+      {
+        // Refresh the cached matrix values. The D2D copy is asynchronous;
+        // synchronize before AMGX reads values_buf.
+        cudaMemcpyAsync(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+        cudaStreamSynchronize(stream);
+        AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(
+            res.A, n_local, nnz, res.values_buf, nullptr));
+      }
 
       // reuse_setup keeps the existing hierarchy while still refreshing the fine matrix.
       if (!reuse_setup)
         AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
-      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
+      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local_b, bs, b_data));
       // AMGX_solver_solve treats the x vector's contents as the initial guess.
       if (use_x0 != 0)
       {
-        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, x0_data));
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local_b, bs, x0_data));
       }
       else
       {
         std::vector<T> h_x(n_local, static_cast<T>(0));
-        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local_b, bs, h_x.data()));
       }
     }
 
@@ -586,23 +824,66 @@ namespace
 
       // Copy the matrix into cache-owned buffers. The cached distributed matrix
       // and the warm-path AMGX_matrix_replace_coefficients reference these across
-      // solves, whereas the XLA inputs are released after this call. col_indices
-      // is narrowed to int32 (the low 4 bytes of each int64; valid since global
-      // indices are < nglobal_host, an int) for the 32-bit upload path below.
-      if (cudaMalloc(&res.values_buf, nnz * sizeof(T)) != cudaSuccess ||
-          cudaMalloc(&res.row_ptrs_buf, (n_local + 1) * sizeof(int)) != cudaSuccess ||
-          cudaMalloc(&res.col_indices_buf, nnz * sizeof(int)) != cudaSuccess)
+      // solves, whereas the XLA inputs are released after this call. In block
+      // mode the cache-owned buffers hold the BSR structure/values instead of
+      // the scalar CSR; in scalar mode col_indices is narrowed to int32 (the
+      // low 4 bytes of each int64; valid since global indices are <
+      // nglobal_host, an int) for the 32-bit upload path below.
+      if (bs > 1)
       {
-        return ffi::Error::Internal("cudaMalloc for MPI matrix buffers failed");
+        std::vector<int> bsr_row_ptrs, bsr_col_indices, scatter_map;
+        const char *build_err = BuildBsrScatterMap<int64_t>(
+            n_local, nnz, bs, /*transpose=*/false,
+            h_row_ptrs.data(), h_col_indices.data(),
+            bsr_row_ptrs, bsr_col_indices, scatter_map);
+        if (build_err != nullptr)
+        {
+          return ffi::Error::Internal(build_err);
+        }
+        res.bsr_nnzb = static_cast<int>(bsr_col_indices.size());
+        const size_t map_bytes = static_cast<size_t>(nnz) * sizeof(int);
+        const size_t val_bytes =
+            static_cast<size_t>(res.bsr_nnzb) * bs * bs * sizeof(T);
+        if (cudaMalloc(&res.bsr_scatter_map, map_bytes) != cudaSuccess ||
+            cudaMalloc(&res.bsr_values, val_bytes) != cudaSuccess ||
+            cudaMalloc(&res.row_ptrs_buf, (n_local_b + 1) * sizeof(int)) != cudaSuccess ||
+            cudaMalloc(&res.col_indices_buf, res.bsr_nnzb * sizeof(int)) != cudaSuccess)
+        {
+          return ffi::Error::Internal("cudaMalloc for MPI block buffers failed");
+        }
+        cudaMemcpyAsync(res.bsr_scatter_map, scatter_map.data(), map_bytes,
+                        cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(res.row_ptrs_buf, bsr_row_ptrs.data(),
+                        (n_local_b + 1) * sizeof(int), cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(res.col_indices_buf, bsr_col_indices.data(),
+                        res.bsr_nnzb * sizeof(int), cudaMemcpyHostToDevice, stream);
+        cudaMemsetAsync(res.bsr_values, 0, val_bytes, stream);
+        const char *scatter_err = ScatterValuesToBsr<T>(
+            stream, nnz, values_data, res.bsr_scatter_map, res.bsr_values,
+            static_cast<int64_t>(res.bsr_nnzb) * bs * bs);
+        if (scatter_err != nullptr)
+        {
+          return ffi::Error::Internal(scatter_err);
+        }
       }
-      cudaMemcpyAsync(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice, stream);
-      cudaMemcpyAsync(res.row_ptrs_buf, row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToDevice, stream);
-      cudaMemcpy2DAsync(res.col_indices_buf, sizeof(int), col_indices_data, sizeof(int64_t),
-                        sizeof(int), nnz, cudaMemcpyDeviceToDevice, stream);
-      cudaStreamSynchronize(stream);
+      else
+      {
+        if (cudaMalloc(&res.values_buf, nnz * sizeof(T)) != cudaSuccess ||
+            cudaMalloc(&res.row_ptrs_buf, (n_local + 1) * sizeof(int)) != cudaSuccess ||
+            cudaMalloc(&res.col_indices_buf, nnz * sizeof(int)) != cudaSuccess)
+        {
+          return ffi::Error::Internal("cudaMalloc for MPI matrix buffers failed");
+        }
+        cudaMemcpyAsync(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(res.row_ptrs_buf, row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpy2DAsync(res.col_indices_buf, sizeof(int), col_indices_data, sizeof(int64_t),
+                          sizeof(int), nnz, cudaMemcpyDeviceToDevice, stream);
+        cudaStreamSynchronize(stream);
+      }
 
-      // Contiguous row partition (owning rank per global row), required for AMGX
-      // to build the multi-ring halo (classical AMG uses 2 rings).
+      // Contiguous row partition (owning rank per global row -- block row in
+      // block mode), required for AMGX to build the multi-ring halo (classical
+      // AMG uses 2 rings).
       int nranks_host = 1;
       MPI_Comm_size(*mpi_comm, &nranks_host);
       std::vector<int> counts(nranks_host);
@@ -610,20 +891,29 @@ namespace
       if (MPI_Allgather(&n_local_send, 1, MPI_INT, counts.data(), 1, MPI_INT,
                         *mpi_comm) != MPI_SUCCESS)
         return ffi::Error::Internal("MPI_Allgather of local sizes failed");
-      std::vector<int> partition_vector(nglobal_host);
+      const int nglobal_b = nglobal_host / bs;
+      std::vector<int> partition_vector(nglobal_b);
       for (int r = 0, off = 0; r < nranks_host; ++r)
-        for (int i = 0; i < counts[r] && off < nglobal_host; ++i)
+      {
+        if (counts[r] % bs != 0)
+          return ffi::Error::Internal(
+              "a rank's partition is not divisible by block_dim");
+        for (int i = 0; i < counts[r] / bs && off < nglobal_b; ++i)
           partition_vector[off++] = r;
+      }
 
       // 32-bit index upload path; the 64-bit AMGX_matrix_upload_all_global
-      // produces a diverging AMG hierarchy at >= 4 ranks.
+      // produces a diverging AMG hierarchy at >= 4 ranks. In block mode the
+      // cache-owned buffers hold the BSR structure and values.
       int nrings = 1;
       AMGX_SAFE_CALL(AMGX_config_get_default_number_of_rings(res.cfg, &nrings));
       AMGX_SAFE_CALL(AMGX_matrix_upload_all_global_32(
-          res.A, nglobal_host, n_local, nnz, 1, 1,
+          res.A, nglobal_b, n_local_b, bs > 1 ? res.bsr_nnzb : nnz, bs, bs,
           static_cast<int *>(res.row_ptrs_buf),
           static_cast<int *>(res.col_indices_buf),
-          static_cast<T *>(res.values_buf), nullptr,
+          bs > 1 ? static_cast<T *>(res.bsr_values)
+                 : static_cast<T *>(res.values_buf),
+          nullptr,
           nrings, nrings, partition_vector.data()));
 
       AMGX_SAFE_CALL(AMGX_vector_create(&res.x_vec, res.rsrc, Mode));
@@ -633,14 +923,14 @@ namespace
 
       if (use_x0 != 0)
       {
-        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, x0_data));
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local_b, bs, x0_data));
       }
       else
       {
         std::vector<T> h_x(n_local, static_cast<T>(0));
-        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local, 1, h_x.data()));
+        AMGX_SAFE_CALL(AMGX_vector_upload(res.x_vec, n_local_b, bs, h_x.data()));
       }
-      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local, 1, b_data));
+      AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local_b, bs, b_data));
 
       AMGX_SAFE_CALL(AMGX_solver_setup(res.solver, res.A));
     }
@@ -697,10 +987,11 @@ namespace
                                   int32_t transpose_solve,
                                   int32_t return_stats,
                                   int32_t reuse_setup,
-                                  int32_t use_x0)
+                                  int32_t use_x0,
+                                  int32_t block_dim)
   {
     return AmgxSolveInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x0, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0);
+        stream, row_ptrs, col_indices, values, b, x0, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim);
   }
 
   // Double implementation
@@ -716,10 +1007,11 @@ namespace
                                         int32_t transpose_solve,
                                         int32_t return_stats,
                                         int32_t reuse_setup,
-                                        int32_t use_x0)
+                                        int32_t use_x0,
+                                        int32_t block_dim)
   {
     return AmgxSolveInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x0, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0);
+        stream, row_ptrs, col_indices, values, b, x0, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim);
   }
 
 #ifdef JAXAMG_WITH_MPI
@@ -739,10 +1031,11 @@ namespace
                                      int32_t transpose_solve,
                                      int32_t return_stats,
                                      int32_t reuse_setup,
-                                     int32_t use_x0)
+                                     int32_t use_x0,
+                                     int32_t block_dim)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim);
   }
 
   // MPI Double implementation
@@ -761,10 +1054,11 @@ namespace
                                            int32_t transpose_solve,
                                            int32_t return_stats,
                                            int32_t reuse_setup,
-                                           int32_t use_x0)
+                                           int32_t use_x0,
+                                           int32_t block_dim)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim);
   }
 
 #endif // JAXAMG_WITH_MPI

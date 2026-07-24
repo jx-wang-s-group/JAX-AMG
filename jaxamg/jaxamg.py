@@ -106,6 +106,7 @@ def _amgx_solve_impl(
     reuse_setup: bool = False,
     res_history_len: int = 0,
     use_x0: bool = False,
+    block_dim: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX solver (non-differentiable)."""
 
@@ -141,6 +142,7 @@ def _amgx_solve_impl(
         return_stats=np.int32(return_stats),
         reuse_setup=np.int32(reuse_setup),
         use_x0=np.int32(use_x0),
+        block_dim=np.int32(block_dim),
     )
 
     return cast(tuple, results)
@@ -161,6 +163,7 @@ def _amgx_solve_mpi_impl(
     reuse_setup: bool = False,
     res_history_len: int = 0,
     use_x0: bool = False,
+    block_dim: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX MPI solver (non-differentiable)."""
 
@@ -199,6 +202,7 @@ def _amgx_solve_mpi_impl(
         return_stats=np.int32(return_stats),
         reuse_setup=np.int32(reuse_setup),
         use_x0=np.int32(use_x0),
+        block_dim=np.int32(block_dim),
     )
 
     return cast(tuple, results)
@@ -212,6 +216,7 @@ def _get_solver_primitive(
     reuse_setup: bool = False,
     res_history_len: int = 0,
     use_x0: bool = False,
+    block_dim: int = 1,
 ) -> Callable:
     """
     Returns a JAX custom_vjp primitive for AmgX solve with a specific configuration.
@@ -221,6 +226,7 @@ def _get_solver_primitive(
     res_history_len: Residual-history slots appended to the stats output.
     use_x0: Honor the x0 operand as the initial guess (otherwise it is a
         same-shape dummy and the solve starts from zero).
+    block_dim: BSR block size for AmgX (the JAX-side matrix stays scalar CSR).
     """
 
     @jax.custom_vjp
@@ -236,6 +242,7 @@ def _get_solver_primitive(
             reuse_setup=reuse_setup,
             res_history_len=res_history_len,
             use_x0=use_x0,
+            block_dim=block_dim,
         )
         return x, info
 
@@ -259,6 +266,7 @@ def _get_solver_primitive(
             is_symmetric,
             return_stats=False,
             reuse_setup=reuse_setup,
+            block_dim=block_dim,
         )
 
         # Check if matrix is symmetric
@@ -275,6 +283,7 @@ def _get_solver_primitive(
                     config_str=config_str,
                     transpose_solve=True,
                     reuse_setup=reuse_setup,
+                    block_dim=block_dim,
                 )
             except Exception:
                 A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
@@ -312,6 +321,7 @@ def _get_solver_primitive_mpi(
     reuse_setup: bool = False,
     res_history_len: int = 0,
     use_x0: bool = False,
+    block_dim: int = 1,
 ) -> Callable:
     """
     Create cached JAX custom_vjp primitive for MPI AmgX solve.
@@ -375,6 +385,7 @@ def _get_solver_primitive_mpi(
             reuse_setup=reuse_setup,
             res_history_len=res_history_len,
             use_x0=use_x0,
+            block_dim=block_dim,
         )
 
         return x, info
@@ -409,6 +420,7 @@ def _get_solver_primitive_mpi(
             n_ghost=n_ghost,
             return_stats=return_stats,
             reuse_setup=reuse_setup,
+            block_dim=block_dim,
         )
 
         # Backward solve: A^T @ adj_b = g_x
@@ -492,6 +504,7 @@ def solve(
     b: ArrayLike,
     x0: ArrayLike | None = None,
     config: dict | None = None,
+    block_dim: int = 1,
     comm: "Comm | None" = None,
     nglobal: int | None = None,
     partition_info: tuple[int, int] | None = None,
@@ -506,6 +519,7 @@ def solve(
         b: Right-hand-side vector. In MPI mode this is the local RHS partition.
         x0: Optional initial guess (same shape as `b`; local partition in MPI mode). Defaults to zero. A good warm start (e.g. the previous solution in a time-stepping or optimization loop) cuts iterations; it does not change the converged solution or its gradients. Note that with the default `RELATIVE_INI` convergence the tolerance is relative to the *initial* residual, so a very good `x0` tightens the target; consider `convergence="ABSOLUTE"` for warm-started loops.
         config: AmgX configuration dictionary (see [Solver Configuration](config.md) for details). If `None`, JAX-AMG defaults are used.
+        block_dim: Treat the matrix as a block matrix with square `block_dim x block_dim` blocks (e.g. coupled multi-component PDE systems with node-major interleaved unknowns: row `i*block_dim + c` is component `c` of node `i`). `A` and `b` keep their ordinary scalar CSR/vector form; the conversion to AmgX's BSR format happens internally. Rows must be divisible by `block_dim` (each rank's local partition in MPI mode). Since AmgX's classical AMG does not support blocks, the AMG defaults switch to aggregation (`SIZE_2` + `BLOCK_JACOBI`); explicitly configured CLASSICAL AMG is rejected. In MPI mode the aggregation defaults use block-Jacobi coarse sweeps instead of `DENSE_LU_SOLVER` (which is broken in AmgX for distributed block matrices on 3+ ranks and rejected if configured explicitly); see [Solver Configuration](config.md#block-matrices).
         comm: MPI communicator (typically `mpi4py.MPI.COMM_WORLD`). If provided, the solve runs in MPI mode. If not provided, MPI mode can still be used if MPI metadata has already been attached via `with_cache(..., mpi=...)`.
         nglobal: Global matrix row count for MPI mode. Required when `comm` is provided and MPI metadata is not pre-attached to `A`.
         partition_info: `(row_start, row_end)` owned by this rank in MPI mode.  Required when `comm` is provided and MPI metadata is not pre-attached to `A`.
@@ -530,6 +544,15 @@ def solve(
     # Load the native extension and register FFI targets (sets HAS_MPI).
     _ensure_backend()
 
+    block_dim = int(block_dim)
+    if block_dim < 1:
+        raise ValueError("block_dim must be a positive integer")
+    if block_dim > 1 and b.shape[0] % block_dim != 0:
+        raise ValueError(
+            f"b length {b.shape[0]} is not divisible by block_dim {block_dim}"
+            " (in MPI mode each rank's local partition must be block-aligned)"
+        )
+
     # MPI cache may be pre-attached to A via `with_cache`
     mpi_cache = getattr(A, "_mpi_cache", None)
 
@@ -543,6 +566,15 @@ def solve(
                 stacklevel=2,
             )
         config_str = mpi_cache["config_str"]
+        cached_block_dim = mpi_cache.get("block_dim", 1)
+        if block_dim not in (1, cached_block_dim):
+            warnings.warn(
+                "A carries cached MPI metadata; the block_dim passed to "
+                "solve() is ignored in favor of the cached value. Pass "
+                "block_dim to cache_mpi_metadata() instead.",
+                stacklevel=2,
+            )
+        block_dim = cached_block_dim
         if save_stats_file is not None and '"print_solve_stats"' not in config_str:
             warnings.warn(
                 "save_stats_file was passed, but the cached MPI config was "
@@ -555,6 +587,7 @@ def solve(
             config,
             save_stats=(save_stats_file is not None),
             mpi=(comm is not None),
+            block_dim=block_dim,
             **kwargs,
         )
 
@@ -625,6 +658,7 @@ def solve(
                 reuse_setup=reuse_setup,
                 res_history_len=res_history_len,
                 use_x0=use_x0,
+                block_dim=block_dim,
             )
 
             x, info = solver(
@@ -711,6 +745,7 @@ def solve(
                 reuse_setup=reuse_setup,
                 res_history_len=res_history_len,
                 use_x0=use_x0,
+                block_dim=block_dim,
             )
             x, info = solver(
                 A_csr,
@@ -732,6 +767,7 @@ def solve(
             reuse_setup=reuse_setup,
             res_history_len=res_history_len,
             use_x0=use_x0,
+            block_dim=block_dim,
         )
 
         x, info = solver(A_csr, b, x0_arg)

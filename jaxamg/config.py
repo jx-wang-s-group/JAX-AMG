@@ -24,6 +24,31 @@ _AMG_DEFAULTS = {
     "cycle": "V",
 }
 
+# Block matrices (block_dim > 1): AmgX's classical AMG only supports scalar
+# matrices, so the AMG defaults switch to aggregation, which supports square
+# blocks (pairwise SIZE_2 aggregates + block-Jacobi smoothing). The coarse
+# floor is deliberately generous: aggregating all the way down to a couple of
+# rows produces degenerate distributed coarse levels (empty per-rank parts)
+# whose dense-LU solve yields NaNs, analogous to the MULTICOLOR_DILU case
+# guarded in validate_config.
+_AMG_AGGREGATION_DEFAULTS = {
+    "solver": "AMG",
+    "algorithm": "AGGREGATION",
+    "selector": "SIZE_2",
+    "smoother": {
+        "solver": "BLOCK_JACOBI",
+        "relaxation_factor": 0.9,
+    },
+    "presweeps": 1,
+    "postsweeps": 1,
+    "max_levels": 100,
+    "min_coarse_rows": 32,
+    "dense_lu_num_rows": 64,
+    "coarse_solver": "DENSE_LU_SOLVER",
+    "max_iters": 1,
+    "cycle": "V",
+}
+
 
 def _is_nested_config(config: dict | None) -> bool:
     """Return whether *config* already uses AMGX's nested config structure."""
@@ -177,7 +202,7 @@ def _validate_smoother(amg: dict, path: str) -> str:
     )
 
 
-def validate_config(config: dict, *, mpi: bool = False) -> None:
+def validate_config(config: dict, *, mpi: bool = False, block_dim: int = 1) -> None:
     """Validate a prepared AmgX config for known unsupported combinations.
 
     The validator is intentionally conservative: it catches configurations that
@@ -187,6 +212,51 @@ def validate_config(config: dict, *, mpi: bool = False) -> None:
     solver_block = config.get("solver", config)
     if not isinstance(solver_block, dict):
         return
+
+    if block_dim > 1:
+        # AmgX's classical AMG hard-fails on block matrices ("Classical AMG
+        # not implemented for block_size != 1"); only aggregation AMG supports
+        # square blocks.
+        for amg in _amg_blocks(solver_block):
+            path = "solver" if amg is solver_block else "solver.preconditioner"
+            algorithm = _as_upper(amg.get("algorithm", "CLASSICAL"))
+            if algorithm == "CLASSICAL":
+                raise ValueError(
+                    f"Invalid AmgX config: {path} uses CLASSICAL AMG, which "
+                    "does not support block matrices (block_dim > 1). Use "
+                    "'algorithm': \"AGGREGATION\" (e.g. with 'selector': "
+                    '"SIZE_2") or a non-AMG preconditioner.'
+                )
+
+        if mpi:
+            # AmgX's distributed DENSE_LU solver mishandles block (BSR)
+            # matrices once they span 3+ ranks: local-LU coarse corrections
+            # come out wrong (V-cycles silently diverge to NaN) and the
+            # exact-solve path rejects blocks with an opaque cusolver error.
+            # The MPI block defaults use BLOCK_JACOBI coarse sweeps instead;
+            # reject explicit DENSE_LU_SOLVER so the failure is loud and
+            # actionable rather than a wrong answer.
+            def _entry_solver(entry: Any) -> str:
+                if isinstance(entry, dict):
+                    entry = entry.get("solver")
+                return _as_upper(entry)
+
+            dense_lu_paths = []
+            if _entry_solver(solver_block.get("solver")) == "DENSE_LU_SOLVER":
+                dense_lu_paths.append("solver")
+            for amg in _amg_blocks(solver_block):
+                path = "solver" if amg is solver_block else "solver.preconditioner"
+                if _entry_solver(amg.get("coarse_solver")) == "DENSE_LU_SOLVER":
+                    dense_lu_paths.append(f"{path}.coarse_solver")
+            if dense_lu_paths:
+                raise ValueError(
+                    f"Invalid MPI AmgX config: {', '.join(dense_lu_paths)} uses "
+                    "DENSE_LU_SOLVER, which produces wrong results for "
+                    "distributed block matrices (block_dim > 1) on 3 or more "
+                    "ranks. Use coarse smoother sweeps instead, e.g. "
+                    '\'coarse_solver\': {"solver": "BLOCK_JACOBI", '
+                    '"max_iters": 50} (the MPI block default).'
+                )
 
     communicator = solver_block.get("communicator")
     if communicator is not None and _as_upper(communicator) not in {
@@ -235,6 +305,7 @@ def prepare_config(
     user_config: dict | None = None,
     save_stats: bool = False,
     mpi: bool = False,
+    block_dim: int = 1,
     **kwargs: Any,
 ) -> str:
     """
@@ -242,10 +313,23 @@ def prepare_config(
 
     Merges the user config into defaults, applies overrides (kwargs),
     injects residual tracking settings, and wraps the result in AMGX's
-    ``config_version: 2`` nested JSON format.
+    ``config_version: 2`` nested JSON format. For block matrices
+    (``block_dim > 1``) the AMG defaults switch from classical to
+    aggregation AMG, the only AmgX AMG algorithm that supports blocks.
     """
     # Clean copy of AMG defaults
-    amg_defaults = deep_merge({}, _AMG_DEFAULTS)
+    amg_defaults = deep_merge(
+        {}, _AMG_AGGREGATION_DEFAULTS if block_dim > 1 else _AMG_DEFAULTS
+    )
+
+    # AmgX's distributed DENSE_LU coarse solve mishandles block (BSR) matrices
+    # once the coarse level spans 3+ ranks: its local-LU path returns wrong
+    # coarse corrections (diverging V-cycles), and its exact-solve path rejects
+    # block matrices outright. Use block-Jacobi coarse sweeps instead for
+    # distributed block solves; single-GPU block solves keep DENSE_LU.
+    if mpi and block_dim > 1:
+        amg_defaults["coarse_solver"] = {"solver": "BLOCK_JACOBI", "max_iters": 50}
+        amg_defaults.pop("dense_lu_num_rows", None)
 
     defaults = {
         "solver": "PBICGSTAB",
@@ -284,7 +368,7 @@ def prepare_config(
         _inject_amg_stats(target_dict)
         _inject_amg_stats(target_dict.get("preconditioner", {}))
 
-    validate_config(merged_config, mpi=mpi)
+    validate_config(merged_config, mpi=mpi, block_dim=block_dim)
 
     return _format_config(merged_config)
 

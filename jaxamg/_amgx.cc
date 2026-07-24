@@ -66,6 +66,7 @@ namespace
           .Attr<int32_t>("return_stats")            // return stats flag
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
           .Attr<int32_t>("use_x0")                  // honor x0 initial guess
+          .Attr<int32_t>("block_dim")               // BSR block size (1 = scalar CSR)
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -85,6 +86,7 @@ namespace
           .Attr<int32_t>("return_stats")            // return stats flag
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
           .Attr<int32_t>("use_x0")                  // honor x0 initial guess
+          .Attr<int32_t>("block_dim")               // BSR block size (1 = scalar CSR)
   );
 
 #ifdef JAXAMG_WITH_MPI
@@ -109,6 +111,7 @@ namespace
           .Attr<int32_t>("return_stats")            // return stats flag
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
           .Attr<int32_t>("use_x0")                  // honor x0 initial guess
+          .Attr<int32_t>("block_dim")               // BSR block size (1 = scalar CSR)
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -131,6 +134,7 @@ namespace
           .Attr<int32_t>("return_stats")            // return stats flag
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
           .Attr<int32_t>("use_x0")                  // honor x0 initial guess
+          .Attr<int32_t>("block_dim")               // BSR block size (1 = scalar CSR)
   );
 
 #endif // JAXAMG_WITH_MPI
@@ -173,6 +177,7 @@ PYBIND11_MODULE(_amgx, m)
             entry["nnz"] = py::int_(k.nnz);
             entry["mode"] = py::str(ModeToString(k.mode));
             entry["transpose_solve"] = py::bool_(k.transpose_solve);
+            entry["block_dim"] = py::int_(k.block_dim);
             entry["structure_hash"] = py::int_(k.structure_hash);
             entry["config"] = py::str(k.config);
             single_entries.append(entry);
@@ -187,6 +192,7 @@ PYBIND11_MODULE(_amgx, m)
             entry["lrank"] = py::int_(k.lrank);
             entry["mode"] = py::str(ModeToString(k.mode));
             entry["transpose_solve"] = py::bool_(k.transpose_solve);
+            entry["block_dim"] = py::int_(k.block_dim);
             entry["structure_hash"] = py::int_(k.structure_hash);
             entry["config"] = py::str(k.config);
             mpi_entries.append(entry);

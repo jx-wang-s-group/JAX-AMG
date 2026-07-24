@@ -273,3 +273,80 @@ def test_outer_max_iters():
     # Unparseable input falls back to AmgX's registered default.
     assert outer_max_iters("") == 100
     assert outer_max_iters("not json") == 100
+
+
+def test_prepare_config_block_dim():
+    """block_dim > 1 switches AMG defaults to aggregation; CLASSICAL rejected."""
+    cfg = json.loads(prepare_config(block_dim=2))
+    precond = cfg["solver"]["preconditioner"]
+    assert precond["algorithm"] == "AGGREGATION"
+    assert precond["selector"] == "SIZE_2"
+
+    # Scalar default is unchanged.
+    cfg1 = json.loads(prepare_config())
+    assert cfg1["solver"]["preconditioner"]["algorithm"] == "CLASSICAL"
+
+    # Explicit classical AMG under block_dim > 1 is rejected.
+    with pytest.raises(ValueError, match="CLASSICAL"):
+        prepare_config(
+            {"preconditioner": {"solver": "AMG", "algorithm": "CLASSICAL"}},
+            block_dim=2,
+        )
+
+    # Non-AMG configs pass through untouched.
+    cfg2 = json.loads(
+        prepare_config(
+            {"solver": "FGMRES", "preconditioner": {"solver": "BLOCK_JACOBI"}},
+            block_dim=2,
+        )
+    )
+    assert cfg2["solver"]["solver"] == "FGMRES"
+
+
+def test_prepare_config_mpi_block_coarse_solver():
+    """MPI block defaults avoid AmgX's broken distributed DENSE_LU coarse solve."""
+    # MPI + block_dim > 1: coarse solver switches to block-Jacobi sweeps.
+    cfg = json.loads(prepare_config(mpi=True, block_dim=2))
+    precond = cfg["solver"]["preconditioner"]
+    assert precond["coarse_solver"] == {"solver": "BLOCK_JACOBI", "max_iters": 50}
+    assert "dense_lu_num_rows" not in precond
+
+    # Single-GPU block and MPI scalar defaults keep DENSE_LU.
+    cfg1 = json.loads(prepare_config(block_dim=2))
+    assert cfg1["solver"]["preconditioner"]["coarse_solver"] == "DENSE_LU_SOLVER"
+    cfg2 = json.loads(prepare_config(mpi=True))
+    assert cfg2["solver"]["preconditioner"]["coarse_solver"] == "DENSE_LU_SOLVER"
+
+    # Explicit DENSE_LU coarse solver under MPI + block_dim > 1 is rejected,
+    # both as a plain string and as a nested solver scope.
+    with pytest.raises(ValueError, match="DENSE_LU_SOLVER"):
+        prepare_config(
+            {"preconditioner": {"solver": "AMG", "coarse_solver": "DENSE_LU_SOLVER"}},
+            mpi=True,
+            block_dim=2,
+        )
+    with pytest.raises(ValueError, match="DENSE_LU_SOLVER"):
+        prepare_config(
+            {
+                "preconditioner": {
+                    "solver": "AMG",
+                    "coarse_solver": {"solver": "DENSE_LU_SOLVER"},
+                }
+            },
+            mpi=True,
+            block_dim=2,
+        )
+
+    # DENSE_LU as the outer solver is rejected too.
+    with pytest.raises(ValueError, match="DENSE_LU_SOLVER"):
+        prepare_config({"solver": "DENSE_LU_SOLVER"}, mpi=True, block_dim=2)
+
+    # ...but stays allowed for single-GPU block and MPI scalar configs.
+    prepare_config(
+        {"preconditioner": {"solver": "AMG", "coarse_solver": "DENSE_LU_SOLVER"}},
+        block_dim=2,
+    )
+    prepare_config(
+        {"preconditioner": {"solver": "AMG", "coarse_solver": "DENSE_LU_SOLVER"}},
+        mpi=True,
+    )
