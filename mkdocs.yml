@@ -60,6 +60,7 @@ nav:
   - Solver Configuration: config.md
   - MPI: mpi.md
   - Caching: caching.md
+  - JAX Sharding: sharding.md
   - Environment Variables: environ.md
   - Development: development.md
   - API Reference: api.md

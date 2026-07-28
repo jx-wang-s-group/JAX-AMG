@@ -11,6 +11,7 @@ from .jaxamg import (
     solve,
 )
 from .preconditioners import make_lineax_preconditioner, make_preconditioner
+from .sharding import make_sharded_solver, solve_sharded
 from .sparsity import cache_coloring
 
 __all__ = [
@@ -19,6 +20,8 @@ __all__ = [
     "with_cache",
     "cache_coloring",
     "cache_mpi_metadata",
+    "make_sharded_solver",
+    "solve_sharded",
     "AMGXStatus",
     "make_preconditioner",
     "make_lineax_preconditioner",
