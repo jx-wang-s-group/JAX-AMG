@@ -90,17 +90,14 @@ class ShardedMatrix:
     ) -> None:
         local_device = mesh.local_devices[0]
         local_nnz = int(local_bcsr.data.shape[0])
-        local_values = data.addressable_shards[0].data[:local_nnz]
-        # Keep only one local matrix-value buffer. In particular, an uneven
-        # partition must not retain both the original unpadded values and the
-        # padded shard used by ``data``.
-        self._local_bcsr = jsp.BCSR(
-            (
-                local_values,
-                jax.device_put(local_bcsr.indices, local_device),
-                jax.device_put(local_bcsr.indptr, local_device),
-            ),
-            shape=local_bcsr.shape,
+        # Keep only the rank-local CSR structure. The matrix values live solely
+        # in the padded shard of ``data``; ``local_matrix`` re-slices them on
+        # demand, so no second per-rank value buffer is retained.
+        self._structure = _CSRStructure(
+            jax.device_put(local_bcsr.indices, local_device),
+            jax.device_put(local_bcsr.indptr, local_device),
+            tuple(local_bcsr.shape),
+            local_nnz,
         )
         self._comm = comm
         self.mesh = mesh
@@ -122,8 +119,8 @@ class ShardedMatrix:
         _validate_operand(values, self.data, self.mesh, self.axis_name, "matrix data")
         local_values = values.addressable_shards[0].data[: self.local_nnz]
         return jsp.BCSR(
-            (local_values, self._local_bcsr.indices, self._local_bcsr.indptr),
-            shape=self._local_bcsr.shape,
+            (local_values, self._structure.indices, self._structure.indptr),
+            shape=self._structure.shape,
         )
 
 
@@ -181,7 +178,8 @@ def make_sharded_vector(
         comm: MPI communicator whose rank order matches ``mesh``. Defaults to
             ``MPI.COMM_WORLD``.
         mesh: One-dimensional JAX device mesh with one device per MPI rank.
-            Defaults to a mesh containing all JAX devices.
+            Defaults to a mesh over the first ``comm.size`` JAX devices (all
+            devices in a typical multi-process job).
         global_size: Optional true global length. When provided, it is checked
             against the sum of local lengths.
         axis_name: Mesh axis used to partition the vector.
@@ -192,7 +190,12 @@ def make_sharded_vector(
     """
     comm = _resolve_comm(comm)
     if mesh is None:
-        mesh = jax.make_mesh((jax.device_count(),), (axis_name,))
+        # One device per MPI rank. In a multi-process job this covers all JAX
+        # devices; a process with extra local devices uses the leading ones.
+        comm_size = comm.Get_size()
+        mesh = jax.make_mesh(
+            (comm_size,), (axis_name,), devices=jax.devices()[:comm_size]
+        )
     values: jax.Array | np.ndarray
     if isinstance(local_values, jax.Array):
         if not local_values.is_fully_addressable:
@@ -604,22 +607,21 @@ def make_sharded_solver(
     _validate_vector_layout(b, mesh, axis_name, comm.Get_size(), max_n_local)
 
     block_dim = int(block_dim)
-    local_rhs = b.addressable_shards[0].data[:n_local]
-    A_bcsr = A._local_bcsr
-    if get_preferred_dtype(A_bcsr, local_rhs) != A.data.dtype:
+    A_structure = A._structure
+    if get_preferred_dtype(A.data, b) != A.data.dtype:
         raise ValueError(
             "the sharded matrix dtype is incompatible with b; rebuild it "
             "with make_sharded_matrix(A_local, b)"
         )
 
-    _validate_matrix(A_bcsr, nglobal, partition_info, block_dim)
+    _validate_matrix(A_structure, nglobal, partition_info, block_dim)
     local_device = mesh.local_devices[0]
     local_hardware_id = getattr(local_device, "local_hardware_id", local_device.id)
 
     # MPI setup needs CSR structure on the host. Materialize it exactly once;
     # the halo and transpose plans below share these arrays.
-    indices_host = np.asarray(A_bcsr.indices, dtype=np.int64)
-    indptr_host = np.asarray(A_bcsr.indptr, dtype=np.int64)
+    indices_host = np.asarray(A_structure.indices, dtype=np.int64)
+    indptr_host = np.asarray(A_structure.indptr, dtype=np.int64)
     halo_plan = build_halo_plan(indices_host, A.row_counts, partition_info, comm)
 
     rhs_spec = P(axis_name)
@@ -627,12 +629,6 @@ def make_sharded_solver(
     max_nnz = A.max_local_nnz
     local_nnz = A.local_nnz
     A_data = A.data
-    A_structure = _CSRStructure(
-        A_bcsr.indices,
-        A_bcsr.indptr,
-        tuple(A_bcsr.shape),
-        local_nnz,
-    )
 
     if is_symmetric:
         nnz_out = None
@@ -684,6 +680,7 @@ def make_sharded_solver(
         halo_plan,
         block_dim=block_dim,
         lrank=int(local_hardware_id),
+        device=local_device,
     )
     if not is_symmetric:
         # The MPI solve's primal does not consume halo operands, and sharding's
@@ -691,8 +688,6 @@ def make_sharded_solver(
         # Therefore the nested A^T solve needs only placeholder halo operands.
         transpose_cache = {
             **mpi_cache,
-            "max_nnz": max_transpose_nnz,
-            "nnz_out": local_nnz,
             "halo_plan": _primal_halo_placeholder(n_local, len(A.row_counts)),
         }
 
@@ -802,7 +797,7 @@ def make_sharded_solver(
     halo_plan = mpi_cache["halo_plan"]
     max_n_ghost = halo_plan.max_n_ghost
     local_row_indices = np.repeat(
-        np.arange(A_bcsr.shape[0], dtype=np.int32),
+        np.arange(A_structure.shape[0], dtype=np.int32),
         np.diff(indptr_host),
     )
     # Keep rank-local halo metadata inside the shard_map bodies. Making these
@@ -961,7 +956,7 @@ def make_sharded_solver(
     ) -> tuple[jax.Array, ShardedInfo]:
         _validate_operand(rhs, b, mesh, axis_name, "b")
         if A_data_override is None:
-            if isinstance(rhs, jax.core.Tracer):
+            if isinstance(rhs, jax.core.Tracer) or isinstance(x0, jax.core.Tracer):
                 raise ValueError(
                     "A_data must be passed explicitly when a sharded solver is "
                     "used inside jax.jit, jax.grad, or another JAX transform"

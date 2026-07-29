@@ -56,7 +56,10 @@ def test_make_sharded_vector_constructs_default_mesh():
     b = jaxamg.make_sharded_vector(values, comm=comm, global_size=4)
 
     assert isinstance(b.sharding, jax.NamedSharding)
-    assert b.sharding.mesh.size == jax.device_count()
+    # The default mesh holds one device per MPI rank, so extra local devices
+    # (e.g. on a multi-GPU workstation) do not invalidate a small communicator.
+    assert b.sharding.mesh.size == 1
+    assert b.sharding.mesh.devices.flat[0] == jax.devices()[0]
     assert b.sharding.spec == jax.P("rank")
     np.testing.assert_array_equal(np.asarray(b), values)
 
@@ -201,6 +204,10 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
 
     with pytest.raises(ValueError, match="A_data must be passed explicitly"):
         jax.jit(solver).lower(b)
+
+    # A traced x0 with a concrete RHS must not embed the cached matrix values.
+    with pytest.raises(ValueError, match="A_data must be passed explicitly"):
+        jax.jit(lambda guess: solver(b, guess)).lower(b)
 
     x_updated, _ = solver(b, A_data=2 * matrix.data)
     np.testing.assert_array_equal(np.asarray(x_updated), 2 * np.asarray(b))

@@ -32,6 +32,7 @@ def _build_mpi_cache(
     save_stats: bool = False,
     block_dim: int = 1,
     lrank: int | None = None,
+    device: jax.Device | None = None,
 ) -> dict[str, Any]:
     """Assemble MPI metadata after structure-dependent collectives are done."""
     from .mpi_utils import register_comm
@@ -44,8 +45,9 @@ def _build_mpi_cache(
     # These plans are solve operands, not setup metadata. Keep one device copy
     # in the cache so repeated eager solves do not re-transfer every routing
     # array from the host. The original NumPy buffers can then be released.
-    local_devices = jax.local_devices()
-    device = local_devices[lrank % len(local_devices)]
+    if device is None:
+        local_devices = jax.local_devices()
+        device = local_devices[lrank % len(local_devices)]
     halo_plan = halo_plan._replace(
         col_to_combined=jax.device_put(halo_plan.col_to_combined, device),
         send_ids_2d=jax.device_put(halo_plan.send_ids_2d, device),
@@ -223,8 +225,13 @@ def cache_mpi_metadata(
 
     # Compute max_nnz across all ranks, and capture this rank's global column
     # indices (needed for nnz_out, the transpose output sizing).
-    # For sparse matrices (BCSR), get nnz/indices from the arrays directly.
-    if all(hasattr(A, field) for field in ("data", "indices", "indptr")):
+    # For CSR-like matrices (BCSR, SciPy CSR), read the arrays directly. SciPy
+    # CSC/BSR also expose these attributes but with different semantics, so
+    # they take the conversion path below instead.
+    if (
+        all(hasattr(A, field) for field in ("data", "indices", "indptr"))
+        and getattr(A, "format", "csr") == "csr"
+    ):
         local_nnz = len(A.data)
         local_col_indices = np.asarray(A.indices)
         local_indptr = np.asarray(A.indptr)

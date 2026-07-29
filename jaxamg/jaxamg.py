@@ -666,7 +666,13 @@ def solve(
             halo_plan = mpi_cache["halo_plan"]
             row_indices = mpi_cache.get("row_indices")
             if row_indices is None:
-                row_indices = np.empty(0, dtype=np.int32)
+                # Caches built without row indices (e.g. the sharding-internal
+                # solver caches) fall back to the traceable computation.
+                row_indices = jnp.repeat(
+                    jnp.arange(A_csr.shape[0], dtype=jnp.int32),
+                    A_csr.indptr[1:] - A_csr.indptr[:-1],
+                    total_repeat_length=len(A_csr.data),
+                )
             transpose_plan = mpi_cache.get("transpose_plan")
             transpose_operands = _transpose_plan_operands(A_csr, transpose_plan)
             solver = _get_solver_primitive_mpi(
