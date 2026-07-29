@@ -26,6 +26,12 @@ This page documents the public API of JAX-AMG.
         show_source: false
         heading_level: 3
 
+::: jaxamg.ShardedSolve
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
 ::: jaxamg.make_sharded_matrix
     options:
         show_root_heading: true

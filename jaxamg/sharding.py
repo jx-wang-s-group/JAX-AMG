@@ -75,7 +75,7 @@ def _resolve_comm(comm: Comm | None) -> Comm:
 
 
 class ShardedMatrix:
-    """Distributed CSR matrix with local structure and sharded values."""
+    """Distributed CSR matrix created by :func:`make_sharded_matrix`."""
 
     def __init__(
         self,
@@ -128,7 +128,7 @@ class ShardedMatrix:
 
 
 class ShardedSolve:
-    """Callable sharded solver with differentiable packed matrix values."""
+    """Callable sharded solver created by :func:`make_sharded_solver`."""
 
     def __init__(
         self,
@@ -567,10 +567,8 @@ def make_sharded_solver(
 
     Args:
         A: Distributed matrix created with :func:`make_sharded_matrix`.
-        b: Global JAX array with shape ``(n_global,)`` using row
-            ``NamedSharding``. For unequal row counts, construct it with
-            :func:`make_sharded_vector`; physical shards are padded to the
-            largest local partition.
+        b: Global row-sharded JAX vector. Construct it with
+            :func:`make_sharded_vector`, which handles unequal row counts.
         config: AmgX configuration. Defaults to the JAX-AMG MPI configuration.
         is_symmetric: Whether the global matrix is symmetric. When ``False``
             (the default), the distributed transpose is prepared once during

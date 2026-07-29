@@ -30,7 +30,7 @@ per MPI process are not supported yet.
 Call `jax.distributed.initialize()` before querying JAX devices. On a single
 node, keep all participating GPUs visible to every MPI process and select one
 distinct device per process. Do not remap every rank's GPU to CUDA ordinal 0;
-JAX/NCCL would then see duplicate devices. Because JAX-AMG already requires
+JAX/NCCL would then see duplicate devices. Because this interface uses
 `mpi4py`, its cluster-detection method can derive the coordinator, process IDs,
 and local device assignment from the MPI job:
 
