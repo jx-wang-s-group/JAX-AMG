@@ -32,6 +32,16 @@ def _single_device_array(values):
     return mesh, jax.device_put(jnp.asarray(values), sharding)
 
 
+def _single_rank_transpose_plan(A):
+    nnz = len(A.data)
+    return sharding_module._TransposeValuePlan(
+        np.arange(nnz, dtype=np.int32),
+        np.arange(nnz, dtype=np.int32),
+        np.zeros((1, 1), dtype=np.int32),
+        np.full((1, 1), nnz, dtype=np.int32),
+    )
+
+
 def test_make_sharded_vector_constructs_default_mesh():
     comm = SimpleNamespace(
         Get_size=lambda: 1,
@@ -109,7 +119,7 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
 
     def fake_transpose(A, *args):
         transpose_calls.append(A)
-        return A, np.arange(len(A.data), dtype=np.int32)
+        return A, _single_rank_transpose_plan(A)
 
     monkeypatch.setattr(
         sharding_module, "_transpose_distributed_matrix", fake_transpose
@@ -140,8 +150,13 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     np.testing.assert_array_equal(np.asarray(info["iterations"]), [2])
     assert info["residual_history"].shape == (1, 3)
 
-    x_jit, _ = jax.jit(solver)(b)
+    x_jit, _ = jax.jit(lambda matrix_data, rhs: solver(rhs, A_data=matrix_data))(
+        matrix.data, b
+    )
     np.testing.assert_array_equal(np.asarray(x_jit), np.asarray(b))
+
+    with pytest.raises(ValueError, match="A_data must be passed explicitly"):
+        jax.jit(solver).lower(b)
 
     x_updated, _ = solver(b, A_data=2 * matrix.data)
     np.testing.assert_array_equal(np.asarray(x_updated), 2 * np.asarray(b))
@@ -150,14 +165,17 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     np.testing.assert_array_equal(np.asarray(x_warm), 2 * np.asarray(b))
 
     with jax.set_mesh(mesh):
-        grad_b = jax.grad(lambda rhs: jnp.sum(solver(rhs)[0] ** 2))(b)
+        grad_b = jax.grad(
+            lambda data, rhs: jnp.sum(solver(rhs, A_data=data)[0] ** 2),
+            argnums=1,
+        )(matrix.data, b)
         grad_A_data = jax.grad(lambda data: jnp.sum(solver(b, A_data=data)[0] ** 2))(
             matrix.data
         )
         grad_b_warm, grad_x0 = jax.grad(
-            lambda rhs, x0: jnp.sum(solver(rhs, x0)[0] ** 2),
-            argnums=(0, 1),
-        )(b, b)
+            lambda data, rhs, x0: jnp.sum(solver(rhs, x0, A_data=data)[0] ** 2),
+            argnums=(1, 2),
+        )(matrix.data, b, b)
     np.testing.assert_array_equal(np.asarray(grad_b), 2 * np.asarray(b))
     grad_A_local = matrix.local_matrix(grad_A_data)
     np.testing.assert_array_equal(
@@ -202,7 +220,7 @@ def test_sharded_solver_supports_batched_rhs(monkeypatch):
     monkeypatch.setattr(
         sharding_module,
         "_transpose_distributed_matrix",
-        lambda A, *args: (A, np.arange(len(A.data), dtype=np.int32)),
+        lambda A, *args: (A, _single_rank_transpose_plan(A)),
     )
 
     def fake_solve(A, rhs, x0=None, **kwargs):
@@ -221,7 +239,9 @@ def test_sharded_solver_supports_batched_rhs(monkeypatch):
     solver = jaxamg.make_sharded_solver(matrix, b)
 
     with jax.set_mesh(mesh):
-        x, info = jax.jit(solver)(b)
+        x, info = jax.jit(lambda matrix_data, rhs: solver(rhs, A_data=matrix_data))(
+            matrix.data, b
+        )
         grad_A_data, grad_b = jax.jit(
             jax.grad(
                 lambda matrix_data, rhs: jnp.sum(
@@ -231,9 +251,9 @@ def test_sharded_solver_supports_batched_rhs(monkeypatch):
             )
         )(matrix.data, b)
         grad_b_warm, grad_x0 = jax.grad(
-            lambda rhs, x0: jnp.sum(solver(rhs, x0)[0] ** 2),
-            argnums=(0, 1),
-        )(b, b)
+            lambda data, rhs, x0: jnp.sum(solver(rhs, x0, A_data=data)[0] ** 2),
+            argnums=(1, 2),
+        )(matrix.data, b, b)
 
     np.testing.assert_array_equal(np.asarray(x), values)
     np.testing.assert_array_equal(np.asarray(solver.local_vector(x)), values)

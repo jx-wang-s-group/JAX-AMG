@@ -154,17 +154,20 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
     with jax.transfer_guard_device_to_host("disallow"):
         b = jaxamg.make_sharded_vector(b_local_device, mesh=mesh, global_size=n_global)
         matrix = jaxamg.make_sharded_matrix(A_local, b)
-    solver = jaxamg.make_sharded_solver(
-        matrix,
-        b,
-        config={
-            "solver": "GMRES",
-            "preconditioner": {"solver": "JACOBI_L1"},
-            "communicator": "MPI_DIRECT",
-            "max_iters": 100,
-            "tolerance": 1e-8,
-        },
-    )
+    # Rank-local transpose and halo constants must remain local even when the
+    # surrounding application keeps an explicit global mesh active.
+    with jax.set_mesh(mesh):
+        solver = jaxamg.make_sharded_solver(
+            matrix,
+            b,
+            config={
+                "solver": "GMRES",
+                "preconditioner": {"solver": "JACOBI_L1"},
+                "communicator": "MPI_DIRECT",
+                "max_iters": 100,
+                "tolerance": 1e-8,
+            },
+        )
 
     # Change every real matrix value after setup. Padding is also changed but
     # must remain disconnected from both the solve and its gradient.
@@ -174,21 +177,18 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
         x, _ = solver(rhs, A_data=matrix_data)
         return jnp.sum(x**2)
 
-    def cached_loss(rhs):
-        x, _ = solver(rhs)
-        return jnp.sum(x**2)
-
     with jax.set_mesh(mesh):
         compiled_solve = jax.jit(
             lambda matrix_data, rhs: solver(rhs, A_data=matrix_data)
         )
-        compiled_cached_solve = jax.jit(solver)
         compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1)))
-        compiled_cached_grad = jax.jit(jax.grad(cached_loss))
+        compiled_cached_grad = jax.jit(jax.grad(loss, argnums=1))
         x, info = compiled_solve(A_data, b)
-        x_cached, _ = compiled_cached_solve(b)
         grad_A_data, grad_b = compiled_grad(A_data, b)
-        grad_b_cached = compiled_cached_grad(b)
+        grad_b_cached = compiled_cached_grad(matrix.data, b)
+    # The cached-value convenience remains efficient for a direct call; only
+    # enclosing JAX transforms require an explicit matrix-data operand.
+    x_cached, _ = solver(b)
     x.block_until_ready()
     x_cached.block_until_ready()
     grad_A_data.block_until_ready()

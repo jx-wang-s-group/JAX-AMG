@@ -97,10 +97,11 @@ with one entry per rank.
 For multiple right-hand sides sharing the same matrix, pass rank-local values
 with shape `(n_local, nrhs)` to `make_sharded_vector`. The returned array and
 solution use `PartitionSpec("rank", None)`. AmgX solves the columns sequentially
-in a fixed cross-rank order. Matrix gradients are summed over all RHS columns;
-RHS gradients retain the padded shape and sharding of the RHS. The scalar info
-values have shape `(nranks, nrhs)`, and residual history has shape
-`(nranks, nrhs, max_iters + 1)`.
+in a fixed cross-rank order and reuses the hierarchy after the first column.
+Matrix gradients are accumulated over all RHS columns without retaining one
+full sparse gradient per column; RHS gradients retain the padded shape and
+sharding of the RHS. The scalar info values have shape `(nranks, nrhs)`, and
+residual history has shape `(nranks, nrhs, max_iters + 1)`.
 
 Pass `A.data` to the solve when differentiating matrix values. Enter the mesh
 context for an outer transformation:
@@ -112,18 +113,23 @@ def loss(A_data, rhs):
     x, _ = solver(rhs, A_data=A_data)
     return jnp.sum(x**2)
 
-compiled_solver = jax.jit(solver)
+compiled_solver = jax.jit(
+    lambda A_data, rhs: solver(rhs, A_data=A_data)
+)
 compiled_gradient = jax.jit(jax.grad(loss, argnums=(0, 1)))
 
 with jax.set_mesh(b.sharding.mesh):
-    x, info = compiled_solver(b)
+    x, info = compiled_solver(A.data, b)
     grad_A_data, grad_b = compiled_gradient(A.data, b)
 
 grad_A_local = A.local_matrix(grad_A_data)
 ```
 
-The solver is compiled internally and also composes with an enclosing
-`jax.jit`, including JIT-compiled reverse-mode differentiation.
+The solver is compiled internally, so a direct `solver(b)` call can use the
+matrix's cached values. Pass `A.data` explicitly under an enclosing JAX
+transformation, including RHS-only differentiation. This keeps the distributed
+matrix values as a dynamic operand instead of embedding a full local value
+buffer in the compiled executable.
 
 Run the complete single-node example with:
 
@@ -135,6 +141,8 @@ mpirun -n 2 python demo/sharded_poisson_problem.py
 
 `MPI4JAX_USE_CUDA_MPI` remains relevant to the existing MPI autodiff path but
 is not required for the sharding path. Matrix gradients use a sparse JAX
-all-to-all halo exchange. For a nonsymmetric matrix, the transpose structure is
-cached during solver creation and its values are updated for each adjoint solve;
-the forward and adjoint solves are both performed by AmgX.
+all-to-all halo exchange. For a nonsymmetric matrix, the transpose structure
+and a sparse value-exchange plan are cached during solver creation. Only
+off-rank transpose values are exchanged, once per backward pass, rather than
+replicating all matrix values on every GPU. The forward and adjoint solves are
+both performed by AmgX.

@@ -8,7 +8,7 @@ to use one MPI rank per GPU for the distributed solve.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.experimental.sparse as jsp
@@ -25,6 +25,24 @@ if TYPE_CHECKING:
     from mpi4py.MPI import Comm
 
 ShardedInfo = dict[str, jax.Array]
+
+
+class _CSRStructure(NamedTuple):
+    """Rank-local CSR structure without an otherwise unused values buffer."""
+
+    indices: jax.Array
+    indptr: jax.Array
+    shape: tuple[int, int]
+    nnz: int
+
+
+class _TransposeValuePlan(NamedTuple):
+    """Static sparse exchange plan for values of a distributed transpose."""
+
+    local_source_ids: np.ndarray
+    local_target_ids: np.ndarray
+    send_ids_2d: np.ndarray
+    recv_target_ids_2d: np.ndarray
 
 
 def _resolve_comm(comm: Comm | None) -> Comm:
@@ -53,15 +71,26 @@ class ShardedMatrix:
         self,
         local_bcsr: jsp.BCSR,
         data: jax.Array,
-        local_packed_data: jax.Array,
         comm: Comm,
         mesh: Mesh,
         axis_name: str,
         partition_info: tuple[int, int],
         max_local_size: int,
     ) -> None:
-        self._local_bcsr = local_bcsr
-        self._local_packed_data = local_packed_data
+        local_device = mesh.local_devices[0]
+        local_nnz = int(local_bcsr.data.shape[0])
+        local_values = data.addressable_shards[0].data[:local_nnz]
+        # Keep only one local matrix-value buffer. In particular, an uneven
+        # partition must not retain both the original unpadded values and the
+        # padded shard used by ``data``.
+        self._local_bcsr = jsp.BCSR(
+            (
+                local_values,
+                jax.device_put(local_bcsr.indices, local_device),
+                jax.device_put(local_bcsr.indptr, local_device),
+            ),
+            shape=local_bcsr.shape,
+        )
         self._comm = comm
         self.mesh = mesh
         self.axis_name = axis_name
@@ -70,8 +99,8 @@ class ShardedMatrix:
         self.data = data
         self.global_size = int(local_bcsr.shape[1])
         self.local_size = int(local_bcsr.shape[0])
-        self.local_nnz = int(local_bcsr.data.shape[0])
-        self.max_local_nnz = int(local_packed_data.shape[0])
+        self.local_nnz = local_nnz
+        self.max_local_nnz = int(data.addressable_shards[0].data.shape[0])
         self.shape = (self.global_size, self.global_size)
         self.local_shape = tuple(local_bcsr.shape)
 
@@ -108,7 +137,11 @@ class ShardedSolve:
         *,
         A_data: jax.Array | None = None,
     ) -> tuple[jax.Array, ShardedInfo]:
-        """Solve with the cached values or a differentiable ``A_data`` operand."""
+        """Solve with cached values or an explicit differentiable ``A_data``.
+
+        ``A_data`` may be omitted for a direct call but is required inside a
+        JAX transformation so matrix values remain a dynamic operand.
+        """
         return self._solve_fn(b, x0, A_data=A_data)
 
     def local_vector(self, value: jax.Array) -> jax.Array:
@@ -424,7 +457,6 @@ def _pack_sharded_matrix(
     return ShardedMatrix(
         A_bcsr,
         data,
-        local_packed_data,
         comm,
         mesh,
         axis_name,
@@ -516,10 +548,10 @@ def _transpose_distributed_matrix(
     A: jsp.BCSR,
     recvcounts: tuple[int, ...],
     partition_info: tuple[int, int],
-    max_nnz: int,
     comm: Comm,
-) -> tuple[jsp.BCSR, np.ndarray]:
-    """Transpose fixed CSR structure and return its packed value-source map."""
+    local_device: jax.Device,
+) -> tuple[jsp.BCSR, _TransposeValuePlan]:
+    """Transpose fixed CSR structure and build a sparse value-exchange plan."""
     from mpi4py import MPI
 
     row_start, row_end = partition_info
@@ -548,12 +580,10 @@ def _transpose_distributed_matrix(
 
     send_rows = np.ascontiguousarray(indices[send_order])
     send_cols = np.ascontiguousarray(source_rows[send_order])
-    packed_ids = comm.Get_rank() * max_nnz + np.arange(len(indices), dtype=np.int64)
-    send_ids = np.ascontiguousarray(packed_ids[send_order])
+    send_ids = np.ascontiguousarray(np.arange(len(indices), dtype=np.int64)[send_order])
     recv_nnz = int(recv_counts.sum())
     recv_rows = np.empty(recv_nnz, dtype=np.int64)
     recv_cols = np.empty(recv_nnz, dtype=np.int64)
-    recv_ids = np.empty(recv_nnz, dtype=np.int64)
     comm.Alltoallv(
         [send_rows, send_counts, send_displs, MPI.INT64_T],
         [recv_rows, recv_counts, recv_displs, MPI.INT64_T],
@@ -562,31 +592,72 @@ def _transpose_distributed_matrix(
         [send_cols, send_counts, send_displs, MPI.INT64_T],
         [recv_cols, recv_counts, recv_displs, MPI.INT64_T],
     )
-    comm.Alltoallv(
-        [send_ids, send_counts, send_displs, MPI.INT64_T],
-        [recv_ids, recv_counts, recv_displs, MPI.INT64_T],
-    )
-
     local_rows = recv_rows - row_start
     order = np.lexsort((recv_cols, local_rows))
     local_rows = local_rows[order]
     recv_cols = recv_cols[order]
-    recv_ids = recv_ids[order]
     row_counts = np.bincount(local_rows, minlength=n_local)
     transpose_indptr = np.concatenate(([0], np.cumsum(row_counts))).astype(np.int32)
 
+    # The dynamic transpose communicates only off-rank values. Entries whose
+    # transpose rows remain on this rank are gathered locally, so the padded
+    # all-to-all chunk is governed by the largest remote rank pair rather than
+    # by the (usually much larger) on-rank diagonal block.
+    rank = comm.Get_rank()
+    remote_send_counts = send_counts.copy()
+    remote_recv_counts = recv_counts.copy()
+    remote_send_counts[rank] = 0
+    remote_recv_counts[rank] = 0
+    local_pair_max = int(max(remote_send_counts.max(), remote_recv_counts.max()))
+    max_per_rank = max(int(comm.allreduce(local_pair_max, op=MPI.MAX)), 1)
+
+    send_ids_2d = np.zeros((nranks, max_per_rank), dtype=np.int32)
+    recv_target_ids_2d = np.full((nranks, max_per_rank), recv_nnz, dtype=np.int32)
+    inverse_order = np.empty(recv_nnz, dtype=np.int32)
+    inverse_order[order] = np.arange(recv_nnz, dtype=np.int32)
+    for peer in range(nranks):
+        if peer == rank:
+            continue
+        send_count = int(send_counts[peer])
+        if send_count:
+            start = int(send_displs[peer])
+            send_ids_2d[peer, :send_count] = send_ids[start : start + send_count]
+        recv_count = int(recv_counts[peer])
+        if recv_count:
+            start = int(recv_displs[peer])
+            recv_target_ids_2d[peer, :recv_count] = inverse_order[
+                start : start + recv_count
+            ]
+
+    local_send_start = int(send_displs[rank])
+    local_recv_start = int(recv_displs[rank])
+    local_count = int(send_counts[rank])
+    local_source_ids = send_ids[
+        local_send_start : local_send_start + local_count
+    ].astype(np.int32)
+    local_target_ids = inverse_order[local_recv_start : local_recv_start + local_count]
+
     with temp_enable_x64():
-        transpose_data = jnp.zeros(recv_nnz, dtype=A.data.dtype)
-        transpose_indices = jnp.asarray(recv_cols, dtype=jnp.int64)
+        transpose_data = jax.device_put(
+            np.zeros(recv_nnz, dtype=np.dtype(A.data.dtype)), local_device
+        )
+        transpose_indices = jax.device_put(
+            np.asarray(recv_cols, dtype=np.int64), local_device
+        )
         transpose = jsp.BCSR(
             (
                 transpose_data,
                 transpose_indices,
-                jnp.asarray(transpose_indptr),
+                jax.device_put(transpose_indptr, local_device),
             ),
             shape=(n_local, n_global),
         )
-    return transpose, recv_ids
+    return transpose, _TransposeValuePlan(
+        local_source_ids,
+        local_target_ids,
+        send_ids_2d,
+        recv_target_ids_2d,
+    )
 
 
 def make_sharded_solver(
@@ -633,9 +704,11 @@ def make_sharded_solver(
         A callable ``solver(b, x0=None, *, A_data=None)``. Use
         ``A.local_matrix(gradient)`` to convert packed matrix gradients to this
         rank's unpadded BCSR structure. ``solver.local_vector(value)`` removes
-        vector padding. For a vector RHS, info values have one entry per rank.
-        For a batched RHS they have shape ``(nranks, nrhs)`` and
-        ``residual_history`` has an additional trailing ``max_iters + 1`` axis.
+        vector padding. ``A_data`` may be omitted for a direct call but must be
+        explicit under ``jax.jit``, ``jax.grad``, or another JAX transform. For
+        a vector RHS, info values have one entry per rank. For a batched RHS
+        they have shape ``(nranks, nrhs)`` and ``residual_history`` has an
+        additional trailing ``max_iters + 1`` axis.
     """
     _require_shard_map()
     if not isinstance(A, ShardedMatrix):
@@ -694,20 +767,29 @@ def make_sharded_solver(
             "matrix packing and MPI cache disagree about the maximum local nnz"
         )
     local_nnz = A.local_nnz
-    local_packed_data = A._local_packed_data
     A_data = A.data
+    A_structure = _CSRStructure(
+        A_bcsr.indices,
+        A_bcsr.indptr,
+        tuple(A_bcsr.shape),
+        local_nnz,
+    )
 
     if is_symmetric:
-        A_transpose = None
+        transpose_structure = None
         transpose_cache = None
-        transpose_source_ids = None
+        max_transpose_nnz = None
+        transpose_local_source_ids = None
+        transpose_local_target_ids = None
+        transpose_send_ids = None
+        transpose_recv_target_ids = None
     else:
-        A_transpose, source_ids = _transpose_distributed_matrix(
+        A_transpose, transpose_plan = _transpose_distributed_matrix(
             A_bcsr,
             mpi_cache["recvcounts_tuple"],
             partition_info,
-            max_nnz,
             comm,
+            local_device,
         )
         transpose_cache = cache_mpi_metadata(
             config or {},
@@ -719,7 +801,26 @@ def make_sharded_solver(
             block_dim=block_dim,
         )
         transpose_cache["lrank"] = int(local_hardware_id)
-        transpose_source_ids = jnp.asarray(source_ids, dtype=jnp.int32)
+        transpose_structure = _CSRStructure(
+            A_transpose.indices,
+            A_transpose.indptr,
+            tuple(A_transpose.shape),
+            int(A_transpose.data.shape[0]),
+        )
+        max_transpose_nnz = int(transpose_cache["max_nnz"])
+        # Explicit single-device placement keeps rank-local constants local even
+        # when solver construction happens inside a global ``jax.set_mesh``
+        # context.
+        transpose_local_source_ids = jax.device_put(
+            transpose_plan.local_source_ids, local_device
+        )
+        transpose_local_target_ids = jax.device_put(
+            transpose_plan.local_target_ids, local_device
+        )
+        transpose_send_ids = jax.device_put(transpose_plan.send_ids_2d, local_device)
+        transpose_recv_target_ids = jax.device_put(
+            transpose_plan.recv_target_ids_2d, local_device
+        )
 
     if is_batched:
         info_specs = {
@@ -753,13 +854,17 @@ def make_sharded_solver(
 
     def matrix_with_data(
         data_local: jax.Array,
-        template: jsp.BCSR,
+        structure: _CSRStructure,
         cache: dict[str, Any],
         symmetric: bool,
     ) -> jsp.BCSR:
         matrix = jsp.BCSR(
-            (data_local[: template.data.shape[0]], template.indices, template.indptr),
-            shape=template.shape,
+            (
+                data_local[: structure.nnz],
+                structure.indices,
+                structure.indptr,
+            ),
+            shape=structure.shape,
         )
         return with_cache(matrix, mpi=cache, is_symmetric=symmetric)
 
@@ -771,13 +876,15 @@ def make_sharded_solver(
         A_dynamic: jsp.BCSR,
         rhs_local: jax.Array,
         x0_local: jax.Array | None = None,
+        *,
+        reuse: bool = reuse_setup,
     ) -> tuple[jax.Array, ShardedInfo]:
         return solve(
             A_dynamic,
             rhs_local[:n_local],
             x0=None if x0_local is None else x0_local[:n_local],
             block_dim=block_dim,
-            reuse_setup=reuse_setup,
+            reuse_setup=reuse,
         )
 
     def solve_local_rhs(
@@ -809,6 +916,10 @@ def make_sharded_solver(
                 A_dynamic,
                 rhs_column,
                 x0_column,
+                # All columns use identical matrix values. Once the first
+                # column has prepared the hierarchy, resetting it again is
+                # unnecessary even when cross-call reuse was not requested.
+                reuse=reuse_setup or column > 0,
             )
             solutions.append(solution)
             column_info.append(info)
@@ -819,33 +930,65 @@ def make_sharded_solver(
     def local_solve(
         A_data_local: jax.Array, rhs_local: jax.Array
     ) -> tuple[jax.Array, ShardedInfo]:
-        A_dynamic = matrix_with_data(A_data_local, A_bcsr, mpi_cache, is_symmetric)
+        A_dynamic = matrix_with_data(A_data_local, A_structure, mpi_cache, is_symmetric)
         x_local, info = solve_local_rhs(A_dynamic, rhs_local)
         return pad_local_vector(x_local), pack_info(info)
 
     def local_solve_x0(
         A_data_local: jax.Array, rhs_local: jax.Array, x0_local: jax.Array
     ) -> tuple[jax.Array, ShardedInfo]:
-        A_dynamic = matrix_with_data(A_data_local, A_bcsr, mpi_cache, is_symmetric)
+        A_dynamic = matrix_with_data(A_data_local, A_structure, mpi_cache, is_symmetric)
         x_local, info = solve_local_rhs(A_dynamic, rhs_local, x0_local)
         return pad_local_vector(x_local), pack_info(info)
 
-    def local_adjoint(A_data_local: jax.Array, g_local: jax.Array) -> jax.Array:
-        if is_symmetric:
+    def local_transpose_values(A_data_local: jax.Array) -> jax.Array:
+        assert transpose_structure is not None
+        assert max_transpose_nnz is not None
+        assert transpose_local_source_ids is not None
+        assert transpose_local_target_ids is not None
+        assert transpose_send_ids is not None
+        assert transpose_recv_target_ids is not None
+
+        transpose_values = jnp.zeros(
+            transpose_structure.nnz + 1, dtype=A_data_local.dtype
+        )
+        transpose_values = transpose_values.at[transpose_local_target_ids].set(
+            A_data_local[transpose_local_source_ids]
+        )
+        send_buffer = A_data_local[transpose_send_ids]
+        recv_buffer = jax.lax.all_to_all(
+            send_buffer,
+            axis_name,
+            split_axis=0,
+            concat_axis=0,
+        )
+        transpose_values = transpose_values.at[
+            transpose_recv_target_ids.reshape(-1)
+        ].set(recv_buffer.reshape(-1))
+        return jnp.pad(
+            transpose_values[:-1],
+            (0, max_transpose_nnz - transpose_structure.nnz),
+        )
+
+    def make_local_adjoint(reuse: bool):
+        def local_adjoint(
+            adjoint_data_local: jax.Array, g_local: jax.Array
+        ) -> jax.Array:
+            if is_symmetric:
+                structure = A_structure
+                cache = mpi_cache
+            else:
+                assert transpose_structure is not None
+                assert transpose_cache is not None
+                structure = transpose_structure
+                cache = transpose_cache
             A_adjoint = matrix_with_data(
-                A_data_local, A_bcsr, mpi_cache, symmetric=True
+                adjoint_data_local, structure, cache, symmetric=is_symmetric
             )
-        else:
-            assert A_transpose is not None
-            assert transpose_cache is not None
-            assert transpose_source_ids is not None
-            all_A_data = jax.lax.all_gather(A_data_local, axis_name, axis=0, tiled=True)
-            transpose_data = all_A_data[transpose_source_ids]
-            A_adjoint = matrix_with_data(
-                transpose_data, A_transpose, transpose_cache, symmetric=False
-            )
-        adjoint_local, _ = solve_one_rhs(A_adjoint, g_local)
-        return adjoint_local
+            adjoint_local, _ = solve_one_rhs(A_adjoint, g_local, reuse=reuse)
+            return pad_local_vector(adjoint_local)
+
+        return local_adjoint
 
     halo_plan = mpi_cache["halo_plan"]
     max_n_ghost = max(comm.allgather(halo_plan.n_ghost))
@@ -853,21 +996,15 @@ def make_sharded_solver(
         np.arange(A_bcsr.shape[0], dtype=np.int32),
         np.diff(np.asarray(A_bcsr.indptr, dtype=np.int64)),
     )
-    padded_row_indices = np.zeros(max_nnz, dtype=np.int32)
-    padded_row_indices[:local_nnz] = local_row_indices
-    padded_col_to_combined = np.zeros(max_nnz, dtype=np.int32)
-    padded_col_to_combined[:local_nnz] = halo_plan.col_to_combined
-    local_valid_values = np.arange(max_nnz) < local_nnz
 
     # Keep rank-local halo metadata inside the shard_map bodies. Making these
     # arrays global and closing over them in the custom VJP prevents an outer
     # multi-process jax.jit from lowering because their remote shards are not
     # addressable by the current process.
-    row_indices = jnp.asarray(padded_row_indices)
-    col_to_combined = jnp.asarray(padded_col_to_combined)
-    valid_values = jnp.asarray(local_valid_values)
-    send_ids = jnp.asarray(halo_plan.send_ids_2d)
-    recv_ghost_slot = jnp.asarray(halo_plan.recv_ghost_slot_2d)
+    row_indices = jax.device_put(local_row_indices, local_device)
+    col_to_combined = jax.device_put(halo_plan.col_to_combined, local_device)
+    send_ids = jax.device_put(halo_plan.send_ids_2d, local_device)
+    recv_ghost_slot = jax.device_put(halo_plan.recv_ghost_slot_2d, local_device)
 
     def gather_solution_halo(
         x_local: jax.Array,
@@ -888,22 +1025,20 @@ def make_sharded_solver(
         )
         return jnp.concatenate([x_local, x_ghost[:max_n_ghost]], axis=0)
 
-    def local_gather_matrix_columns(x_local: jax.Array) -> jax.Array:
-        x_combined = gather_solution_halo(x_local[:n_local], send_ids, recv_ghost_slot)
-        return jnp.where(valid_values, x_combined[col_to_combined], 0)
-
-    def local_backward(
-        A_data_local: jax.Array,
-        x_at_columns: jax.Array,
-        g_local: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        A_data_ordered, g_ordered, x_at_columns = jax.lax.optimization_barrier(
-            (A_data_local, g_local, x_at_columns)
+    def local_matrix_gradient(
+        x_local: jax.Array, adjoint_local: jax.Array
+    ) -> jax.Array:
+        # Order the JAX halo exchange after the preceding AmgX adjoint solve.
+        x_ordered, adjoint_ordered = jax.lax.optimization_barrier(
+            (x_local, adjoint_local)
         )
-        adjoint_local = local_adjoint(A_data_ordered, g_ordered)
-        grad_values = -adjoint_local[row_indices] * x_at_columns
-        grad_A_data_local = jnp.where(valid_values, grad_values, 0)
-        return pad_local_vector(adjoint_local), grad_A_data_local
+        x_combined = gather_solution_halo(
+            x_ordered[:n_local], send_ids, recv_ghost_slot
+        )
+        grad_values = (
+            -adjoint_ordered[:n_local][row_indices] * x_combined[col_to_combined]
+        )
+        return jnp.pad(grad_values, (0, max_nnz - local_nnz))
 
     mapped_solve = jax.jit(
         jax.shard_map(
@@ -922,33 +1057,44 @@ def make_sharded_solver(
         )
     )
 
-    def local_cached_matrix_data(rhs_local: jax.Array) -> jax.Array:
-        del rhs_local
-        return jnp.asarray(local_packed_data)
-
-    mapped_cached_matrix_data = jax.jit(
-        jax.shard_map(
-            local_cached_matrix_data,
-            mesh=mesh,
-            in_specs=(rhs_spec,),
-            out_specs=A_data_spec,
-        )
-    )
     scalar_spec = P(axis_name)
-    mapped_gather_matrix_columns = jax.jit(
+    if is_symmetric:
+        mapped_transpose_values = None
+    else:
+        mapped_transpose_values = jax.jit(
+            jax.shard_map(
+                local_transpose_values,
+                mesh=mesh,
+                in_specs=(A_data_spec,),
+                out_specs=A_data_spec,
+            )
+        )
+    mapped_adjoint = jax.jit(
         jax.shard_map(
-            local_gather_matrix_columns,
+            make_local_adjoint(reuse_setup),
             mesh=mesh,
-            in_specs=(scalar_spec,),
+            in_specs=(A_data_spec, scalar_spec),
             out_specs=scalar_spec,
         )
     )
-    mapped_backward = jax.jit(
+    mapped_adjoint_reuse = (
+        mapped_adjoint
+        if reuse_setup or not is_batched
+        else jax.jit(
+            jax.shard_map(
+                make_local_adjoint(True),
+                mesh=mesh,
+                in_specs=(A_data_spec, scalar_spec),
+                out_specs=scalar_spec,
+            )
+        )
+    )
+    mapped_matrix_gradient = jax.jit(
         jax.shard_map(
-            local_backward,
+            local_matrix_gradient,
             mesh=mesh,
-            in_specs=(A_data_spec, scalar_spec, scalar_spec),
-            out_specs=(scalar_spec, A_data_spec),
+            in_specs=(scalar_spec, scalar_spec),
+            out_specs=A_data_spec,
         )
     )
 
@@ -970,30 +1116,56 @@ def make_sharded_solver(
     def differentiated_solve_backward(
         matrix_data: jax.Array, x: jax.Array, g_x: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
+        if is_symmetric:
+            adjoint_data = matrix_data
+        else:
+            assert mapped_transpose_values is not None
+            # Matrix values are identical for every RHS column, so prepare the
+            # distributed transpose exactly once per backward pass. Tie the
+            # exchange to the completed forward solution so XLA cannot overlap
+            # its JAX collective with AmgX's preceding MPI collectives.
+            matrix_data_ordered, _ = jax.lax.optimization_barrier((matrix_data, x))
+            adjoint_data = mapped_transpose_values(matrix_data_ordered)
+
         if not is_batched:
-            x_at_columns = mapped_gather_matrix_columns(x)
-            return mapped_backward(matrix_data, x_at_columns, g_x)
+            adjoint = mapped_adjoint(adjoint_data, g_x)
+            return adjoint, mapped_matrix_gradient(x, adjoint)
 
         adjoint_columns: list[jax.Array] = []
-        matrix_gradients: list[jax.Array] = []
         for column in range(x.shape[1]):
-            x_column = x[:, column]
             g_column = g_x[:, column]
-            # Preserve the same collective ordering for adjoint solves and
-            # their preceding halo exchanges.
+            # Preserve one cross-rank order for the sequential AmgX solves.
             if adjoint_columns:
-                x_column, g_column, _ = jax.lax.optimization_barrier(
-                    (x_column, g_column, adjoint_columns[-1])
+                g_column, _ = jax.lax.optimization_barrier(
+                    (g_column, adjoint_columns[-1])
                 )
-            x_at_columns = mapped_gather_matrix_columns(x_column)
-            adjoint, matrix_gradient = mapped_backward(
-                matrix_data, x_at_columns, g_column
+            adjoint = (mapped_adjoint if column == 0 else mapped_adjoint_reuse)(
+                adjoint_data,
+                g_column,
             )
             adjoint_columns.append(adjoint)
-            matrix_gradients.append(matrix_gradient)
-        return jnp.stack(adjoint_columns, axis=1), jnp.sum(
-            jnp.stack(matrix_gradients), axis=0
-        )
+
+        # Run matrix-gradient halo exchanges only after all AmgX adjoint
+        # collectives have completed. Accumulating immediately avoids an
+        # ``(nrhs, nnz)`` stack of temporary matrix gradients.
+        matrix_gradient_sum = None
+        last_adjoint = adjoint_columns[-1]
+        for column, adjoint in enumerate(adjoint_columns):
+            x_column = x[:, column]
+            order_dependency = (
+                last_adjoint if matrix_gradient_sum is None else matrix_gradient_sum
+            )
+            x_column, adjoint, _ = jax.lax.optimization_barrier(
+                (x_column, adjoint, order_dependency)
+            )
+            matrix_gradient = mapped_matrix_gradient(x_column, adjoint)
+            matrix_gradient_sum = (
+                matrix_gradient
+                if matrix_gradient_sum is None
+                else matrix_gradient_sum + matrix_gradient
+            )
+        assert matrix_gradient_sum is not None
+        return jnp.stack(adjoint_columns, axis=1), matrix_gradient_sum
 
     def differentiated_solve_bwd(residuals, cotangents):
         matrix_data, x = residuals
@@ -1034,14 +1206,12 @@ def make_sharded_solver(
     ) -> tuple[jax.Array, ShardedInfo]:
         _validate_operand(rhs, b, mesh, axis_name, "b")
         if A_data_override is None:
-            # A non-addressable global array cannot be captured as a constant
-            # by an outer multi-process jax.jit. Materialize the same cached
-            # rank-local values through shard_map while tracing instead.
-            matrix_data = (
-                mapped_cached_matrix_data(rhs)
-                if isinstance(rhs, jax.core.Tracer)
-                else A_data
-            )
+            if isinstance(rhs, jax.core.Tracer):
+                raise ValueError(
+                    "A_data must be passed explicitly when a sharded solver is "
+                    "used inside jax.jit, jax.grad, or another JAX transform"
+                )
+            matrix_data = A_data
         else:
             matrix_data = A_data_override
         _validate_operand(matrix_data, A_data, mesh, axis_name, "A_data")
