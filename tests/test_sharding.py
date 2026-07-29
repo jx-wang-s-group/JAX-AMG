@@ -34,11 +34,20 @@ def _single_device_array(values):
 
 def _single_rank_transpose_plan(A):
     nnz = len(A.data)
-    return sharding_module._TransposeValuePlan(
+    return sharding_module._TransposePlan(
         np.arange(nnz, dtype=np.int32),
         np.arange(nnz, dtype=np.int32),
         np.zeros((1, 1), dtype=np.int32),
         np.full((1, 1), nnz, dtype=np.int32),
+        np.asarray(A.indices),
+        np.asarray(A.indptr),
+        nnz,
+    )
+
+
+def _single_rank_transpose_structure(A):
+    return sharding_module._CSRStructure(
+        A.indices, A.indptr, tuple(A.shape), len(A.data)
     )
 
 
@@ -82,13 +91,20 @@ def test_sharded_inputs_preserve_device_arrays(monkeypatch):
 def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     mesh, b = _single_device_array(np.arange(4, dtype=np.float32))
     A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
+    allgather_calls = []
+
+    def allgather(value):
+        allgather_calls.append(value)
+        return [value]
+
     comm = SimpleNamespace(
         Get_size=lambda: 1,
         Get_rank=lambda: 0,
-        allgather=lambda value: [value],
+        allgather=allgather,
     )
     halo_plan = SimpleNamespace(
         n_ghost=0,
+        max_n_ghost=0,
         col_to_combined=np.arange(4, dtype=np.int32),
         send_ids_2d=np.zeros((1, 1), dtype=np.int32),
         recv_ghost_slot_2d=np.zeros((1, 1), dtype=np.int32),
@@ -97,12 +113,18 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
     monkeypatch.setattr(
         sharding_module,
-        "cache_mpi_metadata",
-        lambda *args, **kwargs: {
+        "build_halo_plan",
+        lambda *args, **kwargs: halo_plan,
+    )
+    monkeypatch.setattr(
+        sharding_module,
+        "_build_mpi_cache",
+        lambda config, comm, nglobal, row_counts, max_nnz, nnz_out, plan, **kwargs: {
             "lrank": 99,
-            "recvcounts_tuple": (4,),
-            "max_nnz": 4,
-            "halo_plan": halo_plan,
+            "recvcounts_tuple": row_counts,
+            "max_nnz": max_nnz,
+            "nnz_out": nnz_out,
+            "halo_plan": plan,
         },
     )
     monkeypatch.setattr(
@@ -110,16 +132,20 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
         "with_cache",
         lambda A, **kwargs: A,
     )
-    monkeypatch.setattr(
-        sharding_module,
-        "to_bcsr_matrix",
-        lambda A, **kwargs: A,
-    )
+    normalization_calls = []
+
+    def fake_to_bcsr(A, **kwargs):
+        normalization_calls.append(A)
+        return A
+
+    monkeypatch.setattr(sharding_module, "to_bcsr_matrix", fake_to_bcsr)
     transpose_calls = []
 
-    def fake_transpose(A, *args):
-        transpose_calls.append(A)
-        return A, _single_rank_transpose_plan(A)
+    def fake_transpose(*args):
+        transpose_calls.append(A_local)
+        return _single_rank_transpose_structure(A_local), _single_rank_transpose_plan(
+            A_local
+        )
 
     monkeypatch.setattr(
         sharding_module, "_transpose_distributed_matrix", fake_transpose
@@ -142,6 +168,8 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm)
     # Omit mesh to exercise inference from b.sharding.
     solver = jaxamg.make_sharded_solver(matrix, b)
+    assert len(allgather_calls) == 2
+    assert len(normalization_calls) == 1
     x, info = solver(b)
     np.testing.assert_array_equal(np.asarray(x), np.asarray(b))
     np.testing.assert_array_equal(np.asarray(solver.local_vector(x)), np.asarray(b))
@@ -199,6 +227,7 @@ def test_sharded_solver_supports_batched_rhs(monkeypatch):
     A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
     halo_plan = SimpleNamespace(
         n_ghost=0,
+        max_n_ghost=0,
         col_to_combined=np.arange(4, dtype=np.int32),
         send_ids_2d=np.zeros((1, 1), dtype=np.int32),
         recv_ghost_slot_2d=np.zeros((1, 1), dtype=np.int32),
@@ -207,12 +236,18 @@ def test_sharded_solver_supports_batched_rhs(monkeypatch):
     monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
     monkeypatch.setattr(
         sharding_module,
-        "cache_mpi_metadata",
-        lambda *args, **kwargs: {
+        "build_halo_plan",
+        lambda *args, **kwargs: halo_plan,
+    )
+    monkeypatch.setattr(
+        sharding_module,
+        "_build_mpi_cache",
+        lambda config, comm, nglobal, row_counts, max_nnz, nnz_out, plan, **kwargs: {
             "lrank": 0,
-            "recvcounts_tuple": (4,),
-            "max_nnz": 4,
-            "halo_plan": halo_plan,
+            "recvcounts_tuple": row_counts,
+            "max_nnz": max_nnz,
+            "nnz_out": nnz_out,
+            "halo_plan": plan,
         },
     )
     monkeypatch.setattr(sharding_module, "with_cache", lambda A, **kwargs: A)
@@ -220,7 +255,10 @@ def test_sharded_solver_supports_batched_rhs(monkeypatch):
     monkeypatch.setattr(
         sharding_module,
         "_transpose_distributed_matrix",
-        lambda A, *args: (A, _single_rank_transpose_plan(A)),
+        lambda *args: (
+            _single_rank_transpose_structure(A_local),
+            _single_rank_transpose_plan(A_local),
+        ),
     )
 
     def fake_solve(A, rhs, x0=None, **kwargs):

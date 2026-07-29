@@ -15,6 +15,45 @@ from .utils import *
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
 
+    from .mpi_utils import HaloPlan
+
+
+def _build_mpi_cache(
+    config: dict,
+    comm: "Comm",
+    nglobal: int,
+    recvcounts_tuple: tuple[int, ...],
+    max_nnz: int,
+    nnz_out: int | None,
+    halo_plan: "HaloPlan",
+    *,
+    save_stats: bool = False,
+    block_dim: int = 1,
+    lrank: int | None = None,
+) -> dict[str, Any]:
+    """Assemble MPI metadata after structure-dependent collectives are done."""
+    from .mpi_utils import register_comm
+
+    rank = comm.Get_rank()
+    comm_ptr = register_comm(comm)
+    if lrank is None:
+        lrank = rank % jax.device_count()
+
+    config_str = amgx_config.prepare_config(
+        config, save_stats=save_stats, mpi=True, block_dim=block_dim
+    )
+    return {
+        "recvcounts_tuple": recvcounts_tuple,
+        "comm_ptr": comm_ptr,
+        "lrank": lrank,
+        "nglobal": nglobal,
+        "config_str": config_str,
+        "max_nnz": max_nnz,
+        "nnz_out": nnz_out,
+        "halo_plan": halo_plan,
+        "block_dim": block_dim,
+    }
+
 
 def with_cache(
     A: MatrixOrOperator,
@@ -129,7 +168,6 @@ def cache_mpi_metadata(
         - `halo_plan`: Backward-pass halo-exchange plan for the gradient w.r.t.
           A (fetches only referenced remote solution entries)
     """
-    rank = comm.Get_rank()
     row_start, row_end = partition_info
     n_local = row_end - row_start
 
@@ -145,18 +183,7 @@ def cache_mpi_metadata(
     # Compute MPI communication metadata
     all_sizes = comm.allgather(n_local)
 
-    from .mpi_utils import build_halo_plan, local_transpose_nnz, register_comm
-
-    # Register the communicator so the cached solver's backward pass can recover
-    # it for its collectives; comm_ptr is its address.
-    comm_ptr = register_comm(comm)
-    gpu_count = jax.device_count()
-    lrank = rank % gpu_count
-
-    # Prepare config string
-    config_str = amgx_config.prepare_config(
-        config, save_stats=save_stats, mpi=True, block_dim=block_dim
-    )
+    from .mpi_utils import build_halo_plan, local_transpose_nnz
 
     # Compute max_nnz across all ranks, and capture this rank's global column
     # indices (needed for nnz_out, the transpose output sizing).
@@ -209,16 +236,14 @@ def cache_mpi_metadata(
         local_col_indices, recvcounts_tuple, partition_info, comm
     )
 
-    cache_dict = {
-        "recvcounts_tuple": recvcounts_tuple,
-        "comm_ptr": comm_ptr,
-        "lrank": lrank,
-        "nglobal": nglobal,
-        "config_str": config_str,
-        "max_nnz": max_nnz,
-        "nnz_out": nnz_out,
-        "halo_plan": halo_plan,
-        "block_dim": block_dim,
-    }
-
-    return cache_dict
+    return _build_mpi_cache(
+        config,
+        comm,
+        nglobal,
+        recvcounts_tuple,
+        max_nnz,
+        nnz_out,
+        halo_plan,
+        save_stats=save_stats,
+        block_dim=block_dim,
+    )

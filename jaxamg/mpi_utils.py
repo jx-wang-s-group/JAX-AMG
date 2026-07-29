@@ -119,6 +119,8 @@ class HaloPlan(NamedTuple):
     Fields (all static, captured at setup):
         n_local: Rows owned by this rank.
         n_ghost: Distinct remote columns this rank references.
+        max_n_ghost: Largest ``n_ghost`` across ranks, used for equal shard
+            shapes in the JAX sharding interface.
         max_per_rank: Padded per-rank chunk size for the ``alltoall`` (a global
             max, so every rank uses the same buffer size).
         col_to_combined: For each local nonzero, its index into the combined
@@ -131,6 +133,7 @@ class HaloPlan(NamedTuple):
 
     n_local: int
     n_ghost: int
+    max_n_ghost: int
     max_per_rank: int
     col_to_combined: np.ndarray
     send_ids_2d: np.ndarray
@@ -189,11 +192,15 @@ def build_halo_plan(
     )
     send_local_ids = (requested_ids - row_start).astype(np.int32)
 
-    # alltoall needs one shared chunk size across all ranks.
-    max_per_rank = int(
-        comm.allreduce(int(max(send_counts.max(), recv_counts.max())), op=MPI.MAX)
+    # The all-to-all chunk and sharded ghost-vector sizes must agree globally.
+    # Reduce both maxima together so sharding does not need another collective.
+    local_maxima = np.array(
+        [max(send_counts.max(), recv_counts.max()), n_ghost], dtype=np.int64
     )
-    max_per_rank = max(max_per_rank, 1)
+    global_maxima = np.empty_like(local_maxima)
+    comm.Allreduce(local_maxima, global_maxima, op=MPI.MAX)
+    max_per_rank = max(int(global_maxima[0]), 1)
+    max_n_ghost = int(global_maxima[1])
 
     send_ids_2d = np.zeros((nranks, max_per_rank), dtype=np.int32)
     recv_ghost_slot_2d = np.full((nranks, max_per_rank), n_ghost, dtype=np.int32)
@@ -215,7 +222,13 @@ def build_halo_plan(
     ).astype(np.int32)
 
     return HaloPlan(
-        n_local, n_ghost, max_per_rank, col_to_combined, send_ids_2d, recv_ghost_slot_2d
+        n_local,
+        n_ghost,
+        max_n_ghost,
+        max_per_rank,
+        col_to_combined,
+        send_ids_2d,
+        recv_ghost_slot_2d,
     )
 
 

@@ -17,9 +17,15 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from .cache import cache_mpi_metadata, with_cache
+from .cache import _build_mpi_cache, with_cache
 from .jaxamg import solve
-from .utils import MatrixOrOperator, temp_enable_x64, to_bcsr_matrix
+from .mpi_utils import build_halo_plan
+from .utils import (
+    MatrixOrOperator,
+    get_preferred_dtype,
+    temp_enable_x64,
+    to_bcsr_matrix,
+)
 
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
@@ -36,13 +42,16 @@ class _CSRStructure(NamedTuple):
     nnz: int
 
 
-class _TransposeValuePlan(NamedTuple):
-    """Static sparse exchange plan for values of a distributed transpose."""
+class _TransposePlan(NamedTuple):
+    """Static structure and sparse value-exchange plan for a transpose."""
 
     local_source_ids: np.ndarray
     local_target_ids: np.ndarray
     send_ids_2d: np.ndarray
     recv_target_ids_2d: np.ndarray
+    indices_host: np.ndarray
+    indptr_host: np.ndarray
+    max_nnz: int
 
 
 def _resolve_comm(comm: Comm | None) -> Comm:
@@ -75,6 +84,7 @@ class ShardedMatrix:
         mesh: Mesh,
         axis_name: str,
         partition_info: tuple[int, int],
+        row_counts: tuple[int, ...],
         max_local_size: int,
     ) -> None:
         local_device = mesh.local_devices[0]
@@ -95,6 +105,7 @@ class ShardedMatrix:
         self.mesh = mesh
         self.axis_name = axis_name
         self.partition_info = partition_info
+        self.row_counts = row_counts
         self.max_local_size = max_local_size
         self.data = data
         self.global_size = int(local_bcsr.shape[1])
@@ -375,7 +386,7 @@ def _local_partition(
     comm: Comm,
     n_local: int,
     n_global: int,
-) -> tuple[tuple[int, int], int]:
+) -> tuple[tuple[int, int], tuple[int, ...], int]:
     local_sizes = tuple(int(size) for size in comm.allgather(n_local))
     if sum(local_sizes) != n_global:
         raise ValueError(
@@ -387,7 +398,7 @@ def _local_partition(
 
     comm_rank = comm.Get_rank()
     row_start = sum(local_sizes[:comm_rank])
-    return (row_start, row_start + n_local), max_local_size
+    return (row_start, row_start + n_local), local_sizes, max_local_size
 
 
 def _validate_matrix(
@@ -436,6 +447,7 @@ def _pack_sharded_matrix(
     mesh: Mesh,
     axis_name: str,
     partition_info: tuple[int, int],
+    row_counts: tuple[int, ...],
     max_local_size: int,
     max_nnz: int | None = None,
 ) -> ShardedMatrix:
@@ -461,6 +473,7 @@ def _pack_sharded_matrix(
         mesh,
         axis_name,
         partition_info,
+        row_counts,
         max_local_size,
     )
 
@@ -507,7 +520,7 @@ def make_sharded_matrix(
         raise ValueError("A_local must have a two-dimensional shape")
     n_local = int(matrix_shape[0])
     nglobal = int(matrix_shape[1])
-    partition_info, max_local_size = _local_partition(
+    partition_info, row_counts, max_local_size = _local_partition(
         b, mesh, axis_name, comm, n_local, nglobal
     )
     A_bcsr = _normalize_local_matrix(A_local, b, partition_info)
@@ -517,6 +530,7 @@ def make_sharded_matrix(
         mesh,
         axis_name,
         partition_info,
+        row_counts,
         max_local_size,
     )
 
@@ -545,12 +559,13 @@ def _validate_operand(
 
 
 def _transpose_distributed_matrix(
-    A: jsp.BCSR,
+    indices: np.ndarray,
+    indptr: np.ndarray,
     recvcounts: tuple[int, ...],
     partition_info: tuple[int, int],
     comm: Comm,
     local_device: jax.Device,
-) -> tuple[jsp.BCSR, _TransposeValuePlan]:
+) -> tuple[_CSRStructure, _TransposePlan]:
     """Transpose fixed CSR structure and build a sparse value-exchange plan."""
     from mpi4py import MPI
 
@@ -559,8 +574,6 @@ def _transpose_distributed_matrix(
     n_global = sum(recvcounts)
     nranks = len(recvcounts)
 
-    indices = np.asarray(A.indices, dtype=np.int64)
-    indptr = np.asarray(A.indptr, dtype=np.int64)
     source_rows = np.repeat(
         np.arange(row_start, row_end, dtype=np.int64), np.diff(indptr)
     )
@@ -578,20 +591,32 @@ def _transpose_distributed_matrix(
     send_displs = np.insert(np.cumsum(send_counts[:-1]), 0, 0).astype(np.int32)
     recv_displs = np.insert(np.cumsum(recv_counts[:-1]), 0, 0).astype(np.int32)
 
-    send_rows = np.ascontiguousarray(indices[send_order])
-    send_cols = np.ascontiguousarray(source_rows[send_order])
+    send_coordinates = np.ascontiguousarray(
+        np.column_stack((indices[send_order], source_rows[send_order]))
+    )
     send_ids = np.ascontiguousarray(np.arange(len(indices), dtype=np.int64)[send_order])
     recv_nnz = int(recv_counts.sum())
-    recv_rows = np.empty(recv_nnz, dtype=np.int64)
-    recv_cols = np.empty(recv_nnz, dtype=np.int64)
+    recv_coordinates = np.empty((recv_nnz, 2), dtype=np.int64)
+    coordinate_send_counts = 2 * send_counts
+    coordinate_recv_counts = 2 * recv_counts
+    coordinate_send_displs = 2 * send_displs
+    coordinate_recv_displs = 2 * recv_displs
     comm.Alltoallv(
-        [send_rows, send_counts, send_displs, MPI.INT64_T],
-        [recv_rows, recv_counts, recv_displs, MPI.INT64_T],
+        [
+            send_coordinates,
+            coordinate_send_counts,
+            coordinate_send_displs,
+            MPI.INT64_T,
+        ],
+        [
+            recv_coordinates,
+            coordinate_recv_counts,
+            coordinate_recv_displs,
+            MPI.INT64_T,
+        ],
     )
-    comm.Alltoallv(
-        [send_cols, send_counts, send_displs, MPI.INT64_T],
-        [recv_cols, recv_counts, recv_displs, MPI.INT64_T],
-    )
+    recv_rows = recv_coordinates[:, 0]
+    recv_cols = recv_coordinates[:, 1]
     local_rows = recv_rows - row_start
     order = np.lexsort((recv_cols, local_rows))
     local_rows = local_rows[order]
@@ -608,8 +633,14 @@ def _transpose_distributed_matrix(
     remote_recv_counts = recv_counts.copy()
     remote_send_counts[rank] = 0
     remote_recv_counts[rank] = 0
-    local_pair_max = int(max(remote_send_counts.max(), remote_recv_counts.max()))
-    max_per_rank = max(int(comm.allreduce(local_pair_max, op=MPI.MAX)), 1)
+    local_maxima = np.array(
+        [max(remote_send_counts.max(), remote_recv_counts.max()), recv_nnz],
+        dtype=np.int64,
+    )
+    global_maxima = np.empty_like(local_maxima)
+    comm.Allreduce(local_maxima, global_maxima, op=MPI.MAX)
+    max_per_rank = max(int(global_maxima[0]), 1)
+    max_nnz = int(global_maxima[1])
 
     send_ids_2d = np.zeros((nranks, max_per_rank), dtype=np.int32)
     recv_target_ids_2d = np.full((nranks, max_per_rank), recv_nnz, dtype=np.int32)
@@ -638,25 +669,23 @@ def _transpose_distributed_matrix(
     local_target_ids = inverse_order[local_recv_start : local_recv_start + local_count]
 
     with temp_enable_x64():
-        transpose_data = jax.device_put(
-            np.zeros(recv_nnz, dtype=np.dtype(A.data.dtype)), local_device
-        )
         transpose_indices = jax.device_put(
             np.asarray(recv_cols, dtype=np.int64), local_device
         )
-        transpose = jsp.BCSR(
-            (
-                transpose_data,
-                transpose_indices,
-                jax.device_put(transpose_indptr, local_device),
-            ),
-            shape=(n_local, n_global),
+        transpose_structure = _CSRStructure(
+            transpose_indices,
+            jax.device_put(transpose_indptr, local_device),
+            (n_local, n_global),
+            recv_nnz,
         )
-    return transpose, _TransposeValuePlan(
+    return transpose_structure, _TransposePlan(
         local_source_ids,
         local_target_ids,
         send_ids_2d,
         recv_target_ids_2d,
+        recv_cols,
+        transpose_indptr,
+        max_nnz,
     )
 
 
@@ -730,42 +759,26 @@ def make_sharded_solver(
     is_batched = b.ndim == 2
     local_rhs = b.addressable_shards[0].data[:n_local]
     matrix_probe_rhs = local_rhs[:, 0] if is_batched else local_rhs
-    normalized_matrix = to_bcsr_matrix(
-        A._local_bcsr,
-        b=matrix_probe_rhs,
-        use_int64_indices=True,
-    )
-    if normalized_matrix.data.dtype != A.data.dtype:
+    A_bcsr = A._local_bcsr
+    if get_preferred_dtype(A_bcsr, matrix_probe_rhs) != A.data.dtype:
         raise ValueError(
             "the sharded matrix dtype is incompatible with b; rebuild it "
             "with make_sharded_matrix(A_local, b)"
         )
-    A_bcsr = A._local_bcsr
 
     _validate_matrix(A_bcsr, nglobal, partition_info, block_dim)
-    mpi_cache = cache_mpi_metadata(
-        config or {},
-        comm,
-        nglobal,
-        partition_info,
-        A_bcsr,
-        is_symmetric=is_symmetric,
-        block_dim=block_dim,
-    )
-    # cache_mpi_metadata's lrank preserves the existing MPI API's device
-    # selection. In sharded mode JAX has already selected this process's one
-    # mesh-local GPU, so pass its CUDA-local hardware ordinal to AmgX.
     local_device = mesh.local_devices[0]
     local_hardware_id = getattr(local_device, "local_hardware_id", local_device.id)
-    mpi_cache["lrank"] = int(local_hardware_id)
+
+    # MPI setup needs CSR structure on the host. Materialize it exactly once;
+    # the halo and transpose plans below share these arrays.
+    indices_host = np.asarray(A_bcsr.indices, dtype=np.int64)
+    indptr_host = np.asarray(A_bcsr.indptr, dtype=np.int64)
+    halo_plan = build_halo_plan(indices_host, A.row_counts, partition_info, comm)
 
     rhs_spec = _row_partition_spec(b.ndim, axis_name)
     A_data_spec = P(axis_name)
-    max_nnz = int(mpi_cache["max_nnz"])
-    if max_nnz != A.max_local_nnz:
-        raise RuntimeError(
-            "matrix packing and MPI cache disagree about the maximum local nnz"
-        )
+    max_nnz = A.max_local_nnz
     local_nnz = A.local_nnz
     A_data = A.data
     A_structure = _CSRStructure(
@@ -776,6 +789,7 @@ def make_sharded_solver(
     )
 
     if is_symmetric:
+        nnz_out = None
         transpose_structure = None
         transpose_cache = None
         max_transpose_nnz = None
@@ -784,30 +798,22 @@ def make_sharded_solver(
         transpose_send_ids = None
         transpose_recv_target_ids = None
     else:
-        A_transpose, transpose_plan = _transpose_distributed_matrix(
-            A_bcsr,
-            mpi_cache["recvcounts_tuple"],
+        transpose_structure, transpose_plan = _transpose_distributed_matrix(
+            indices_host,
+            indptr_host,
+            A.row_counts,
             partition_info,
             comm,
             local_device,
         )
-        transpose_cache = cache_mpi_metadata(
-            config or {},
-            comm,
-            nglobal,
+        nnz_out = transpose_structure.nnz
+        max_transpose_nnz = transpose_plan.max_nnz
+        transpose_halo_plan = build_halo_plan(
+            transpose_plan.indices_host,
+            A.row_counts,
             partition_info,
-            A_transpose,
-            is_symmetric=False,
-            block_dim=block_dim,
+            comm,
         )
-        transpose_cache["lrank"] = int(local_hardware_id)
-        transpose_structure = _CSRStructure(
-            A_transpose.indices,
-            A_transpose.indptr,
-            tuple(A_transpose.shape),
-            int(A_transpose.data.shape[0]),
-        )
-        max_transpose_nnz = int(transpose_cache["max_nnz"])
         # Explicit single-device placement keeps rank-local constants local even
         # when solver construction happens inside a global ``jax.set_mesh``
         # context.
@@ -821,6 +827,28 @@ def make_sharded_solver(
         transpose_recv_target_ids = jax.device_put(
             transpose_plan.recv_target_ids_2d, local_device
         )
+
+    mpi_cache = _build_mpi_cache(
+        config or {},
+        comm,
+        nglobal,
+        A.row_counts,
+        max_nnz,
+        nnz_out,
+        halo_plan,
+        block_dim=block_dim,
+        lrank=int(local_hardware_id),
+    )
+    if not is_symmetric:
+        # A and A^T share the communicator, row partition, configuration, and
+        # device. Only structure-dependent buffer and halo metadata differ.
+        assert transpose_halo_plan is not None
+        transpose_cache = {
+            **mpi_cache,
+            "max_nnz": max_transpose_nnz,
+            "nnz_out": local_nnz,
+            "halo_plan": transpose_halo_plan,
+        }
 
     if is_batched:
         info_specs = {
@@ -991,10 +1019,10 @@ def make_sharded_solver(
         return local_adjoint
 
     halo_plan = mpi_cache["halo_plan"]
-    max_n_ghost = max(comm.allgather(halo_plan.n_ghost))
+    max_n_ghost = halo_plan.max_n_ghost
     local_row_indices = np.repeat(
         np.arange(A_bcsr.shape[0], dtype=np.int32),
-        np.diff(np.asarray(A_bcsr.indptr, dtype=np.int64)),
+        np.diff(indptr_host),
     )
 
     # Keep rank-local halo metadata inside the shard_map bodies. Making these
