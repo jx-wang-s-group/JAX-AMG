@@ -19,7 +19,12 @@ from jax.sharding import PartitionSpec as P
 
 from .cache import _build_mpi_cache, with_cache
 from .jaxamg import solve
-from .mpi_utils import HaloPlan, build_halo_plan
+from .mpi_utils import (
+    HaloPlan,
+    _apply_transpose_plan,
+    build_halo_plan,
+    build_transpose_plan,
+)
 from .utils import (
     MatrixOrOperator,
     get_preferred_dtype,
@@ -40,16 +45,6 @@ class _CSRStructure(NamedTuple):
     indptr: jax.Array
     shape: tuple[int, int]
     nnz: int
-
-
-class _TransposePlan(NamedTuple):
-    """Static structure and sparse value-exchange plan for a transpose."""
-
-    local_source_ids: np.ndarray
-    local_target_ids: np.ndarray
-    send_ids_2d: np.ndarray
-    recv_target_ids_2d: np.ndarray
-    max_nnz: int
 
 
 def _primal_halo_placeholder(n_local: int, nranks: int) -> HaloPlan:
@@ -547,135 +542,6 @@ def _validate_operand(
             raise ValueError(f"{name} must use the same NamedSharding as its template")
 
 
-def _transpose_distributed_matrix(
-    indices: np.ndarray,
-    indptr: np.ndarray,
-    recvcounts: tuple[int, ...],
-    partition_info: tuple[int, int],
-    comm: Comm,
-    local_device: jax.Device,
-) -> tuple[_CSRStructure, _TransposePlan]:
-    """Transpose fixed CSR structure and build a sparse value-exchange plan."""
-    from mpi4py import MPI
-
-    row_start, row_end = partition_info
-    n_local = row_end - row_start
-    n_global = sum(recvcounts)
-    nranks = len(recvcounts)
-
-    source_rows = np.repeat(
-        np.arange(row_start, row_end, dtype=np.int64), np.diff(indptr)
-    )
-
-    invalid_columns = bool(np.any(indices < 0) or np.any(indices >= n_global))
-    if comm.allreduce(invalid_columns, op=MPI.LOR):
-        raise ValueError("A_local contains a global column index outside the matrix")
-
-    row_bounds = np.cumsum(np.array([0, *recvcounts], dtype=np.int64))
-    owners = np.searchsorted(row_bounds, indices, side="right") - 1
-    send_order = np.argsort(owners, kind="stable")
-    send_counts = np.bincount(owners, minlength=nranks).astype(np.int32)
-    recv_counts = np.empty(nranks, dtype=np.int32)
-    comm.Alltoall(send_counts, recv_counts)
-    send_displs = np.insert(np.cumsum(send_counts[:-1]), 0, 0).astype(np.int32)
-    recv_displs = np.insert(np.cumsum(recv_counts[:-1]), 0, 0).astype(np.int32)
-
-    send_coordinates = np.ascontiguousarray(
-        np.column_stack((indices[send_order], source_rows[send_order]))
-    )
-    send_ids = np.ascontiguousarray(np.arange(len(indices), dtype=np.int64)[send_order])
-    recv_nnz = int(recv_counts.sum())
-    recv_coordinates = np.empty((recv_nnz, 2), dtype=np.int64)
-    coordinate_send_counts = 2 * send_counts
-    coordinate_recv_counts = 2 * recv_counts
-    coordinate_send_displs = 2 * send_displs
-    coordinate_recv_displs = 2 * recv_displs
-    comm.Alltoallv(
-        [
-            send_coordinates,
-            coordinate_send_counts,
-            coordinate_send_displs,
-            MPI.INT64_T,
-        ],
-        [
-            recv_coordinates,
-            coordinate_recv_counts,
-            coordinate_recv_displs,
-            MPI.INT64_T,
-        ],
-    )
-    recv_rows = recv_coordinates[:, 0]
-    recv_cols = recv_coordinates[:, 1]
-    local_rows = recv_rows - row_start
-    order = np.lexsort((recv_cols, local_rows))
-    local_rows = local_rows[order]
-    recv_cols = recv_cols[order]
-    row_counts = np.bincount(local_rows, minlength=n_local)
-    transpose_indptr = np.concatenate(([0], np.cumsum(row_counts))).astype(np.int32)
-
-    # The dynamic transpose communicates only off-rank values. Entries whose
-    # transpose rows remain on this rank are gathered locally, so the padded
-    # all-to-all chunk is governed by the largest remote rank pair rather than
-    # by the (usually much larger) on-rank diagonal block.
-    rank = comm.Get_rank()
-    remote_send_counts = send_counts.copy()
-    remote_recv_counts = recv_counts.copy()
-    remote_send_counts[rank] = 0
-    remote_recv_counts[rank] = 0
-    local_maxima = np.array(
-        [max(remote_send_counts.max(), remote_recv_counts.max()), recv_nnz],
-        dtype=np.int64,
-    )
-    global_maxima = np.empty_like(local_maxima)
-    comm.Allreduce(local_maxima, global_maxima, op=MPI.MAX)
-    max_per_rank = max(int(global_maxima[0]), 1)
-    max_nnz = int(global_maxima[1])
-
-    send_ids_2d = np.zeros((nranks, max_per_rank), dtype=np.int32)
-    recv_target_ids_2d = np.full((nranks, max_per_rank), recv_nnz, dtype=np.int32)
-    inverse_order = np.empty(recv_nnz, dtype=np.int32)
-    inverse_order[order] = np.arange(recv_nnz, dtype=np.int32)
-    for peer in range(nranks):
-        if peer == rank:
-            continue
-        send_count = int(send_counts[peer])
-        if send_count:
-            start = int(send_displs[peer])
-            send_ids_2d[peer, :send_count] = send_ids[start : start + send_count]
-        recv_count = int(recv_counts[peer])
-        if recv_count:
-            start = int(recv_displs[peer])
-            recv_target_ids_2d[peer, :recv_count] = inverse_order[
-                start : start + recv_count
-            ]
-
-    local_send_start = int(send_displs[rank])
-    local_recv_start = int(recv_displs[rank])
-    local_count = int(send_counts[rank])
-    local_source_ids = send_ids[
-        local_send_start : local_send_start + local_count
-    ].astype(np.int32)
-    local_target_ids = inverse_order[local_recv_start : local_recv_start + local_count]
-
-    with temp_enable_x64():
-        transpose_indices = jax.device_put(
-            np.asarray(recv_cols, dtype=np.int64), local_device
-        )
-        transpose_structure = _CSRStructure(
-            transpose_indices,
-            jax.device_put(transpose_indptr, local_device),
-            (n_local, n_global),
-            recv_nnz,
-        )
-    return transpose_structure, _TransposePlan(
-        local_source_ids,
-        local_target_ids,
-        send_ids_2d,
-        recv_target_ids_2d,
-        max_nnz,
-    )
-
-
 def make_sharded_solver(
     A: ShardedMatrix,
     b: jax.Array,
@@ -780,15 +646,21 @@ def make_sharded_solver(
         transpose_send_ids = None
         transpose_recv_target_ids = None
     else:
-        transpose_structure, transpose_plan = _transpose_distributed_matrix(
+        transpose_plan = build_transpose_plan(
             indices_host,
             indptr_host,
             A.row_counts,
             partition_info,
             comm,
-            local_device,
         )
-        nnz_out = transpose_structure.nnz
+        with temp_enable_x64():
+            transpose_structure = _CSRStructure(
+                jax.device_put(transpose_plan.indices, local_device),
+                jax.device_put(transpose_plan.indptr, local_device),
+                (n_local, nglobal),
+                transpose_plan.nnz,
+            )
+        nnz_out = transpose_plan.nnz
         max_transpose_nnz = transpose_plan.max_nnz
         # Explicit single-device placement keeps rank-local constants local even
         # when solver construction happens inside a global ``jax.set_mesh``
@@ -895,24 +767,22 @@ def make_sharded_solver(
         assert transpose_send_ids is not None
         assert transpose_recv_target_ids is not None
 
-        transpose_values = jnp.zeros(
-            transpose_structure.nnz + 1, dtype=A_data_local.dtype
+        transpose_values = _apply_transpose_plan(
+            A_data_local,
+            transpose_local_source_ids,
+            transpose_local_target_ids,
+            transpose_send_ids,
+            transpose_recv_target_ids,
+            transpose_structure.nnz,
+            lambda values: jax.lax.all_to_all(
+                values,
+                axis_name,
+                split_axis=0,
+                concat_axis=0,
+            ),
         )
-        transpose_values = transpose_values.at[transpose_local_target_ids].set(
-            A_data_local[transpose_local_source_ids]
-        )
-        send_buffer = A_data_local[transpose_send_ids]
-        recv_buffer = jax.lax.all_to_all(
-            send_buffer,
-            axis_name,
-            split_axis=0,
-            concat_axis=0,
-        )
-        transpose_values = transpose_values.at[
-            transpose_recv_target_ids.reshape(-1)
-        ].set(recv_buffer.reshape(-1))
         return jnp.pad(
-            transpose_values[:-1],
+            transpose_values,
             (0, max_transpose_nnz - transpose_structure.nnz),
         )
 
@@ -937,7 +807,6 @@ def make_sharded_solver(
         np.arange(A_bcsr.shape[0], dtype=np.int32),
         np.diff(indptr_host),
     )
-
     # Keep rank-local halo metadata inside the shard_map bodies. Making these
     # arrays global and closing over them in the custom VJP prevents an outer
     # multi-process jax.jit from lowering because their remote shards are not

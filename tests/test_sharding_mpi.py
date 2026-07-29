@@ -269,11 +269,13 @@ def test_sharded_symmetric_warm_start_gradients(sharding_context):
         )
         compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
         compiled_vmap = jax.jit(
-            jax.vmap(lambda rhs: solver(rhs, A_data=matrix.data)[0])
+            lambda matrix_data, rhs_batch: jax.vmap(
+                lambda rhs: solver(rhs, A_data=matrix_data)[0]
+            )(rhs_batch)
         )
         x, info = compiled_solve(matrix.data, b, x0)
         grad_A_data, grad_b, grad_x0 = compiled_grad(matrix.data, b, x0)
-        x_batched = compiled_vmap(jnp.stack((b, 2 * b)))
+        x_batched = compiled_vmap(matrix.data, jnp.stack((b, 2 * b)))
     x.block_until_ready()
     grad_A_data.block_until_ready()
     grad_b.block_until_ready()

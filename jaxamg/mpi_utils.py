@@ -10,8 +10,6 @@ import numpy as np
 import scipy.sparse as sp
 from jax.typing import ArrayLike
 
-from .utils import temp_enable_x64
-
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
 
@@ -76,34 +74,126 @@ def resolve_comm(comm_ptr: int) -> "Comm":
     return _COMM_BY_PTR.get(comm_ptr, MPI.COMM_WORLD)
 
 
-def local_transpose_nnz(
-    col_indices: ArrayLike, recvcounts_tuple: tuple[int, ...], comm: "Comm"
-) -> int:
-    """This rank's local nonzero count of A^T (for transpose output sizing).
+class TransposePlan(NamedTuple):
+    """Fixed CSR structure and value routing for a distributed transpose."""
 
-    Rank r's A^T rows receive every A nonzero whose column it owns, so the local
-    nnz of A^T equals the local nnz of A only for structurally symmetric
-    patterns; in general it differs per rank, so the distributed transpose sizes
-    its output by this value rather than the input nnz. Computed once on the host
-    via an ``Alltoall`` of per-destination counts.
+    indices: np.ndarray | jax.Array
+    indptr: np.ndarray | jax.Array
+    local_source_ids: np.ndarray | jax.Array
+    local_target_ids: np.ndarray | jax.Array
+    send_ids_2d: np.ndarray | jax.Array
+    recv_target_ids_2d: np.ndarray | jax.Array
+    max_nnz: int
 
-    Args:
-        col_indices: This rank's local (global-numbered) CSR column indices.
-        recvcounts_tuple: Rows owned per rank (the row partition).
-        comm: MPI communicator.
+    @property
+    def nnz(self) -> int:
+        return len(self.indices)
 
-    Returns:
-        This rank's local nnz of A^T (a static Python int).
-    """
-    nranks = len(recvcounts_tuple)
-    # Half-open row-block boundaries [0, r0, r0+r1, ..., n_global].
-    row_bounds = np.cumsum(np.array([0, *recvcounts_tuple], dtype=np.int64))
-    cols = np.asarray(col_indices).astype(np.int64)
-    owner = np.clip(np.searchsorted(row_bounds, cols, side="right") - 1, 0, nranks - 1)
-    send_counts = np.bincount(owner, minlength=nranks).astype(np.int32)
+
+def build_transpose_plan(
+    indices: ArrayLike,
+    indptr: ArrayLike,
+    recvcounts: tuple[int, ...],
+    partition_info: tuple[int, int],
+    comm: "Comm",
+) -> TransposePlan:
+    """Precompute the structure and value routing for ``A.T``."""
+    from mpi4py import MPI
+
+    indices = np.asarray(indices, dtype=np.int64)
+    indptr = np.asarray(indptr, dtype=np.int64)
+    row_start, row_end = partition_info
+    n_local = row_end - row_start
+    n_global = sum(recvcounts)
+    nranks = len(recvcounts)
+
+    source_rows = np.repeat(
+        np.arange(row_start, row_end, dtype=np.int64), np.diff(indptr)
+    )
+    invalid_columns = bool(np.any(indices < 0) or np.any(indices >= n_global))
+    if comm.allreduce(invalid_columns, op=MPI.LOR):
+        raise ValueError("A_local contains a global column index outside the matrix")
+
+    row_bounds = np.cumsum(np.array([0, *recvcounts], dtype=np.int64))
+    owners = np.searchsorted(row_bounds, indices, side="right") - 1
+    send_order = np.argsort(owners, kind="stable")
+    send_counts = np.bincount(owners, minlength=nranks).astype(np.int32)
     recv_counts = np.empty(nranks, dtype=np.int32)
     comm.Alltoall(send_counts, recv_counts)
-    return int(recv_counts.sum())
+    send_displs = np.insert(np.cumsum(send_counts[:-1]), 0, 0).astype(np.int32)
+    recv_displs = np.insert(np.cumsum(recv_counts[:-1]), 0, 0).astype(np.int32)
+
+    send_coordinates = np.ascontiguousarray(
+        np.column_stack((indices[send_order], source_rows[send_order]))
+    )
+    send_ids = np.ascontiguousarray(np.arange(len(indices), dtype=np.int64)[send_order])
+    recv_nnz = int(recv_counts.sum())
+    recv_coordinates = np.empty((recv_nnz, 2), dtype=np.int64)
+    comm.Alltoallv(
+        [send_coordinates, 2 * send_counts, 2 * send_displs, MPI.INT64_T],
+        [recv_coordinates, 2 * recv_counts, 2 * recv_displs, MPI.INT64_T],
+    )
+    recv_rows = recv_coordinates[:, 0]
+    recv_cols = recv_coordinates[:, 1]
+    local_rows = recv_rows - row_start
+    order = np.lexsort((recv_cols, local_rows))
+    local_rows = local_rows[order]
+    recv_cols = recv_cols[order]
+    row_counts = np.bincount(local_rows, minlength=n_local)
+    transpose_indptr = np.concatenate(([0], np.cumsum(row_counts))).astype(np.int32)
+
+    rank = comm.Get_rank()
+    remote_send_counts = send_counts.copy()
+    remote_recv_counts = recv_counts.copy()
+    remote_send_counts[rank] = 0
+    remote_recv_counts[rank] = 0
+    local_maxima = np.array(
+        [max(remote_send_counts.max(), remote_recv_counts.max()), recv_nnz],
+        dtype=np.int64,
+    )
+    global_maxima = np.empty_like(local_maxima)
+    comm.Allreduce(local_maxima, global_maxima, op=MPI.MAX)
+    max_per_rank = max(int(global_maxima[0]), 1)
+    max_nnz = int(global_maxima[1])
+
+    # Padding uses a one-past-the-end sentinel. Applying the plan pads both the
+    # input and output by one zero, so reversing the four routing arrays also
+    # gives the value routing for ``A.T.T``.
+    send_ids_2d = np.full((nranks, max_per_rank), len(indices), dtype=np.int32)
+    recv_target_ids_2d = np.full((nranks, max_per_rank), recv_nnz, dtype=np.int32)
+    inverse_order = np.empty(recv_nnz, dtype=np.int32)
+    inverse_order[order] = np.arange(recv_nnz, dtype=np.int32)
+    for peer in range(nranks):
+        if peer == rank:
+            continue
+        send_count = int(send_counts[peer])
+        if send_count:
+            start = int(send_displs[peer])
+            send_ids_2d[peer, :send_count] = send_ids[start : start + send_count]
+        recv_count = int(recv_counts[peer])
+        if recv_count:
+            start = int(recv_displs[peer])
+            recv_target_ids_2d[peer, :recv_count] = inverse_order[
+                start : start + recv_count
+            ]
+
+    local_send_start = int(send_displs[rank])
+    local_recv_start = int(recv_displs[rank])
+    local_count = int(send_counts[rank])
+    local_source_ids = send_ids[
+        local_send_start : local_send_start + local_count
+    ].astype(np.int32)
+    local_target_ids = inverse_order[local_recv_start : local_recv_start + local_count]
+
+    return TransposePlan(
+        np.asarray(recv_cols, dtype=np.int64),
+        transpose_indptr,
+        local_source_ids,
+        local_target_ids,
+        send_ids_2d,
+        recv_target_ids_2d,
+        max_nnz,
+    )
 
 
 class HaloPlan(NamedTuple):
@@ -135,9 +225,9 @@ class HaloPlan(NamedTuple):
     n_ghost: int
     max_n_ghost: int
     max_per_rank: int
-    col_to_combined: np.ndarray
-    send_ids_2d: np.ndarray
-    recv_ghost_slot_2d: np.ndarray
+    col_to_combined: np.ndarray | jax.Array
+    send_ids_2d: np.ndarray | jax.Array
+    recv_ghost_slot_2d: np.ndarray | jax.Array
 
 
 def build_halo_plan(
@@ -255,236 +345,45 @@ def _mpi4jax_halo_gather(
     return jnp.concatenate([x_local, x_ghost[:n_ghost]])
 
 
-def _mpi4jax_alltoallv_transpose(
+def _apply_transpose_plan(
     data: jax.Array,
-    indices: jax.Array,
-    indptr: jax.Array,
-    recvcounts_tuple: tuple[int, ...],
-    comm: "Comm",
-    max_nnz: int,
+    local_source_ids: jax.Array,
+    local_target_ids: jax.Array,
+    send_ids: jax.Array,
+    recv_target_ids: jax.Array,
     nnz_out: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """
-    Pure JAX implementation of distributed matrix transpose using mpi4jax.
+    exchange: Callable[[jax.Array], jax.Array],
+) -> jax.Array:
+    """Apply a fixed transpose plan using the supplied all-to-all operation."""
+    data = jnp.pad(data, (0, 1))
+    values = jnp.zeros(nnz_out + 1, dtype=data.dtype)
+    values = values.at[local_target_ids].set(data[local_source_ids])
+    received = exchange(data[send_ids])
+    values = values.at[recv_target_ids.reshape(-1)].set(received.reshape(-1))
+    return values[:-1]
 
-    This version uses only JAX operations and mpi4jax collectives,
-    making it fully JIT-compatible. All operations stay on GPU.
 
-    The algorithm:
-    1. Convert local CSR to COO format
-    2. Determine destination rank for each element (based on column -> row mapping)
-    3. Exchange element counts via alltoall
-    4. Build padded send buffers using scatter operations
-    5. Exchange data via GPU-direct alltoall
-    6. Extract valid data and rebuild CSR for A^T
-
-    Args:
-        data: CSR data array
-        indices: CSR column indices
-        indptr: CSR row pointers
-        recvcounts_tuple: Partition sizes (rows per rank)
-        comm: MPI communicator
-        max_nnz: Max local nnz of A across ranks, for send-buffer sizing (the
-            send buffers are collective, so all ranks share this size).
-        nnz_out: This rank's local nnz of A^T, the exact output length. Under row
-            partitioning it differs from the input nnz whenever the pattern is
-            structurally nonsymmetric, so it must be provided (see
-            :func:`local_transpose_nnz`). Any slots beyond the actual received
-            count are padded with in-range explicit zeros (a no-op when the count
-            is exact).
-    """
+def _mpi4jax_transpose_values(
+    data: jax.Array,
+    local_source_ids: jax.Array,
+    local_target_ids: jax.Array,
+    send_ids: jax.Array,
+    recv_target_ids: jax.Array,
+    nnz_out: int,
+    comm: "Comm",
+) -> jax.Array:
+    """Exchange only matrix values for a preplanned distributed transpose."""
     import mpi4jax
 
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-    nnz = data.shape[0]
-
-    # Use static Python values from recvcounts_tuple (known at trace time)
-    # This avoids traced array issues with jnp.arange
-    n_local = recvcounts_tuple[rank]  # Python int, not traced
-    my_row_start = sum(recvcounts_tuple[:rank])  # Python int, not traced
-
-    # Compute partition info as JAX arrays for operations that need them
-    r_counts = jnp.array(recvcounts_tuple, dtype=jnp.int32)
-    displs = jnp.concatenate(
-        [jnp.array([0], dtype=jnp.int32), jnp.cumsum(r_counts[:-1]).astype(jnp.int32)]
+    return _apply_transpose_plan(
+        data,
+        local_source_ids,
+        local_target_ids,
+        send_ids,
+        recv_target_ids,
+        nnz_out,
+        lambda values: mpi4jax.alltoall(values, comm=comm),
     )
-
-    # --- Step 1: Convert CSR to COO format ---
-    row_counts = indptr[1:] - indptr[:-1]
-    # Use static n_local for jnp.arange
-    row_indices_local = jnp.repeat(
-        jnp.arange(n_local, dtype=jnp.int32), row_counts, total_repeat_length=nnz
-    )
-    row_indices_global = row_indices_local + my_row_start
-    col_indices_global = indices.astype(jnp.int32)
-
-    # --- Step 2: Determine destination ranks ---
-    dest_ranks = jnp.searchsorted(displs, col_indices_global, side="right") - 1
-    dest_ranks = jnp.clip(dest_ranks, 0, size - 1).astype(jnp.int32)
-
-    # --- Step 3: Sort by destination rank ---
-    sort_order = jnp.argsort(dest_ranks)
-    data_sorted = data[sort_order]
-    rows_sorted = row_indices_global[sort_order]
-    cols_sorted = col_indices_global[sort_order]
-    dest_ranks_sorted = dest_ranks[sort_order]
-
-    # --- Step 4: Count elements per destination ---
-    # Use bincount (much lighter than one_hot for large nnz)
-    send_counts = jnp.bincount(dest_ranks_sorted, length=size).astype(jnp.int32)
-
-    # --- Step 5: Exchange counts and compute buffer sizes ---
-    recv_counts = mpi4jax.alltoall(send_counts, comm=comm)
-
-    # --- Step 6: Build padded send buffers ---
-    # Since dest_ranks_sorted is sorted by destination rank, positions can be
-    # computed via segment offsets (avoids O(nnz*nranks) one-hot masks).
-    send_displs = jnp.concatenate(
-        [
-            jnp.array([0], dtype=jnp.int32),
-            jnp.cumsum(send_counts[:-1]).astype(jnp.int32),
-        ]
-    )
-    positions = jnp.arange(nnz, dtype=jnp.int32) - send_displs[dest_ranks_sorted]
-
-    # Use precalculated max_nnz for buffer sizing
-    # This ensures all ranks use the same buffer size for alltoall
-    max_per_rank = max_nnz
-
-    # Initialize send buffers with zeros
-    send_data = jnp.zeros((size, max_per_rank), dtype=data.dtype)
-    send_rows = jnp.zeros((size, max_per_rank), dtype=jnp.int32)
-    send_cols = jnp.zeros((size, max_per_rank), dtype=jnp.int32)
-
-    # Scatter data into send buffers
-    # 2D indexing: send_data[dest_ranks_sorted[i], positions[i]] = data_sorted[i]
-    send_data = send_data.at[dest_ranks_sorted, positions].set(data_sorted)
-    send_rows = send_rows.at[dest_ranks_sorted, positions].set(
-        rows_sorted.astype(jnp.int32)
-    )
-    send_cols = send_cols.at[dest_ranks_sorted, positions].set(
-        cols_sorted.astype(jnp.int32)
-    )
-
-    # --- Step 7: Exchange data via GPU-direct alltoall ---
-    recv_data = mpi4jax.alltoall(send_data, comm=comm)
-    recv_rows = mpi4jax.alltoall(send_rows, comm=comm)
-    recv_cols = mpi4jax.alltoall(send_cols, comm=comm)
-
-    # --- Step 8: Extract valid received data and build A^T ---
-    # Flatten and concatenate valid portions from each rank
-    recv_displs = jnp.concatenate(
-        [
-            jnp.array([0], dtype=jnp.int32),
-            jnp.cumsum(recv_counts[:-1]).astype(jnp.int32),
-        ]
-    )
-
-    # Create index arrays for gathering valid data
-    # For each rank r, we take recv_data[r, 0:recv_counts[r]]
-    # We'll use a masked approach that works with JIT
-
-    # Build flat indices: for rank r, positions 0..recv_counts[r]-1 are valid
-    # Create a mask for valid positions
-    rank_indices = jnp.repeat(jnp.arange(size, dtype=jnp.int32), max_per_rank)
-    pos_indices = jnp.tile(jnp.arange(max_per_rank, dtype=jnp.int32), size)
-    valid_mask = pos_indices < recv_counts[rank_indices]
-
-    # Flatten recv arrays
-    recv_data_flat_all = recv_data.flatten()
-    recv_rows_flat_all = recv_rows.flatten()
-    recv_cols_flat_all = recv_cols.flatten()
-
-    # Extract valid elements using boolean indexing equivalent
-    # Since we can't use dynamic boolean indexing in JIT, use where + scatter
-    # Compute destination indices in the output array
-    within_rank_pos = pos_indices
-    # Cumsum of recv_counts gives starting position for each rank in output
-    # Position in output = recv_displs[rank] + within_rank_pos (if valid)
-
-    # Create output position for each element (invalid elements get -1 or beyond)
-    flat_output_pos = jnp.where(
-        valid_mask,
-        recv_displs[rank_indices] + within_rank_pos,
-        -1,  # Invalid positions (will be ignored)
-    )
-
-    # Size the output by nnz_out (this rank's local nnz of A^T), not the input
-    # nnz: they differ per rank for structurally nonsymmetric patterns, and using
-    # the input nnz would drop or strand received entries. real_count is the
-    # runtime count and equals nnz_out, so the scatter fills [0, nnz_out) exactly.
-    real_count = jnp.sum(recv_counts).astype(jnp.int32)
-
-    recv_data_flat = jnp.zeros(nnz_out, dtype=data.dtype)
-    recv_rows_flat = jnp.zeros(nnz_out, dtype=jnp.int32)
-    recv_cols_flat = jnp.zeros(nnz_out, dtype=jnp.int32)
-
-    # Scatter valid elements to their positions
-    # Use segment_sum pattern: only positions >= 0 are valid
-    valid_positions = jnp.maximum(flat_output_pos, 0).astype(jnp.int32)
-    scatter_mask = flat_output_pos >= 0
-
-    # Use jnp.where to mask values before scatter (preserves dtype)
-    masked_data = jnp.where(
-        scatter_mask, recv_data_flat_all, jnp.zeros_like(recv_data_flat_all)
-    )
-    masked_rows = jnp.where(
-        scatter_mask, recv_rows_flat_all, jnp.zeros_like(recv_rows_flat_all)
-    )
-    masked_cols = jnp.where(
-        scatter_mask, recv_cols_flat_all, jnp.zeros_like(recv_cols_flat_all)
-    )
-
-    # Use at[].add to scatter (avoids overwrite issues)
-    recv_data_flat = recv_data_flat.at[valid_positions].add(masked_data)
-    recv_rows_flat = recv_rows_flat.at[valid_positions].add(masked_rows)
-    recv_cols_flat = recv_cols_flat.at[valid_positions].add(masked_cols)
-
-    # Defensive: if nnz_out exceeds the received count, pad the tail slots with an
-    # on-rank explicit zero at (A^T row 0, column my_row_start) -- harmless to
-    # AmgX and a no-op when nnz_out is exact (as from local_transpose_nnz). The
-    # pre-transpose fields map recv_cols -> local row, recv_rows -> global column.
-    pad_mask = jnp.arange(nnz_out, dtype=jnp.int32) >= real_count
-    recv_cols_flat = jnp.where(pad_mask, my_row_start, recv_cols_flat)
-    recv_rows_flat = jnp.where(pad_mask, my_row_start, recv_rows_flat)
-
-    # For A^T: recv_cols becomes local row (was column in A), recv_rows becomes col (was row in A)
-    at_rows_local = recv_cols_flat - my_row_start  # Local row index in A^T
-    at_cols = recv_rows_flat  # Column index in A^T (global row in A)
-
-    # Sort by (row, col) for CSR format
-    # Create composite key for sorting: row * n_global + col. This must be int64:
-    # for large grids row*n_global overflows int32 (e.g. 48^3 -> ~6.1e9 > 2.1e9),
-    # which would scramble the row ordering and produce a malformed A^T.
-    n_global = sum(recvcounts_tuple)  # Static Python int
-    with temp_enable_x64():
-        sort_key = at_rows_local.astype(jnp.int64) * n_global + at_cols.astype(
-            jnp.int64
-        )
-        sort_idx = jnp.argsort(sort_key)
-
-    r_sorted = at_rows_local[sort_idx]
-    c_sorted = at_cols[sort_idx]
-    v_sorted = recv_data_flat[sort_idx]
-
-    # Build indptr from row counts (which sum to nnz_out).
-    row_counts_at = jnp.bincount(r_sorted, length=n_local).astype(jnp.int32)
-
-    out_indptr = jnp.zeros(n_local + 1, dtype=indptr.dtype)
-    out_indptr = out_indptr.at[1:].set(jnp.cumsum(row_counts_at).astype(jnp.int32))
-
-    # Output data and indices (already sorted); length is nnz_out, this rank's
-    # local nnz(A^T).
-    out_data = v_sorted
-    out_indices = c_sorted
-    out_indptr = out_indptr.at[-1].set(nnz_out)
-
-    # Convert output indices to int64
-    with temp_enable_x64():
-        out_indices_int64 = out_indices.astype(jnp.int64)
-
-    return out_data, out_indices_int64, out_indptr
 
 
 def partition_csr_matrix(

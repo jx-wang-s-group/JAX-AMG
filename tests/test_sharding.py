@@ -9,6 +9,7 @@ import pytest
 
 import jaxamg
 import jaxamg.sharding as sharding_module
+from jaxamg.mpi_utils import TransposePlan
 
 pytestmark = pytest.mark.skipif(
     not hasattr(jax, "shard_map"), reason="jax.shard_map is unavailable"
@@ -34,18 +35,14 @@ def _single_device_array(values):
 
 def _single_rank_transpose_plan(A):
     nnz = len(A.data)
-    return sharding_module._TransposePlan(
+    return TransposePlan(
+        np.asarray(A.indices),
+        np.asarray(A.indptr),
         np.arange(nnz, dtype=np.int32),
         np.arange(nnz, dtype=np.int32),
-        np.zeros((1, 1), dtype=np.int32),
+        np.full((1, 1), nnz, dtype=np.int32),
         np.full((1, 1), nnz, dtype=np.int32),
         nnz,
-    )
-
-
-def _single_rank_transpose_structure(A):
-    return sharding_module._CSRStructure(
-        A.indices, A.indptr, tuple(A.shape), len(A.data)
     )
 
 
@@ -159,13 +156,9 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
 
     def fake_transpose(*args):
         transpose_calls.append(A_local)
-        return _single_rank_transpose_structure(A_local), _single_rank_transpose_plan(
-            A_local
-        )
+        return _single_rank_transpose_plan(A_local)
 
-    monkeypatch.setattr(
-        sharding_module, "_transpose_distributed_matrix", fake_transpose
-    )
+    monkeypatch.setattr(sharding_module, "build_transpose_plan", fake_transpose)
 
     def fake_solve(A, rhs, x0=None, **kwargs):
         x = A.data * rhs
