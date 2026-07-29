@@ -1,4 +1,5 @@
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import jax
 import jax.experimental.sparse as jsp
@@ -12,6 +13,17 @@ import jaxamg.sharding as sharding_module
 pytestmark = pytest.mark.skipif(
     not hasattr(jax, "shard_map"), reason="jax.shard_map is unavailable"
 )
+
+
+def test_sharding_comm_defaults_to_world(monkeypatch):
+    default_comm = object()
+    mpi4py = ModuleType("mpi4py")
+    mpi4py.MPI = SimpleNamespace(COMM_WORLD=default_comm)
+    monkeypatch.setitem(sys.modules, "mpi4py", mpi4py)
+
+    explicit_comm = object()
+    assert sharding_module._resolve_comm(None) is default_comm
+    assert sharding_module._resolve_comm(explicit_comm) is explicit_comm
 
 
 def _single_device_array(values):

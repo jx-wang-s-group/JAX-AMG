@@ -10,10 +10,11 @@ Single-node usage:
 import jax
 import jax.numpy as jnp
 import numpy as np
-from mpi4py import MPI
 
 # Initialize before importing JAX-AMG modules that may initialize XLA.
 jax.distributed.initialize(cluster_detection_method="mpi4py")
+
+from jax.experimental import multihost_utils
 
 import jaxamg
 from jaxamg.matrices import poisson_matrix_distributed
@@ -23,9 +24,8 @@ def main() -> None:
 
     jax.config.update("jax_logging_level", "ERROR")
 
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    nranks = comm.Get_size()
+    rank = jax.process_index()
+    nranks = jax.process_count()
     grid_size = 32
     n_global = grid_size**2
 
@@ -38,7 +38,6 @@ def main() -> None:
     mesh = jax.make_mesh((nranks,), ("rank",))
     b = jaxamg.make_sharded_vector(
         b_local,
-        comm=comm,
         mesh=mesh,
         global_size=n_global,
     )
@@ -47,7 +46,6 @@ def main() -> None:
     solver = jaxamg.make_sharded_solver(
         A_local,
         b,
-        comm=comm,
         mesh=mesh,
         config={
             "solver": "CG",
@@ -81,9 +79,9 @@ def main() -> None:
         flush=True,
     )
 
-    comm.Barrier()
+    multihost_utils.sync_global_devices("before jaxamg finalize")
     jaxamg.finalize()
-    comm.Barrier()
+    multihost_utils.sync_global_devices("before jax distributed shutdown")
     jax.distributed.shutdown()
 
 

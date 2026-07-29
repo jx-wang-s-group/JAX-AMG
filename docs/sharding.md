@@ -59,7 +59,6 @@ import jaxamg
 mesh = jax.make_mesh((nranks,), ("rank",))
 b = jaxamg.make_sharded_vector(
     np.asarray(b_local),
-    comm=comm,
     mesh=mesh,
     global_size=n_global,
 )
@@ -67,13 +66,15 @@ b = jaxamg.make_sharded_vector(
 solver = jaxamg.make_sharded_solver(
     A_local,
     b,
-    comm=comm,
     mesh=mesh,
     config={"solver": "GMRES", "communicator": "MPI_DIRECT"},
 )
 
 x, info = solver(b)
 ```
+
+The sharding helpers use `MPI.COMM_WORLD` by default. Pass `comm=` explicitly
+when using an MPI subcommunicator.
 
 For a coupled block system, pass `block_dim=k` to `make_sharded_solver`. The
 matrix and vectors retain their ordinary scalar CSR/vector representation;

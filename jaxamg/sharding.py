@@ -27,6 +27,20 @@ if TYPE_CHECKING:
 ShardedInfo = dict[str, jax.Array]
 
 
+def _resolve_comm(comm: Comm | None) -> Comm:
+    """Use MPI.COMM_WORLD when the caller does not supply a communicator."""
+    if comm is not None:
+        return comm
+
+    try:
+        from mpi4py import MPI
+    except ImportError as exc:
+        raise RuntimeError(
+            "mpi4py is required when comm is omitted from the sharding API"
+        ) from exc
+    return MPI.COMM_WORLD
+
+
 def _row_partition_spec(ndim: int, axis_name: str) -> P:
     """Partition the leading row axis and replicate all trailing axes."""
     return P(axis_name, *(None for _ in range(ndim - 1)))
@@ -73,7 +87,7 @@ class ShardedSolve:
 def make_sharded_vector(
     local_values: Any,
     *,
-    comm: Comm,
+    comm: Comm | None = None,
     mesh: Mesh,
     global_size: int | None = None,
     axis_name: str = "rank",
@@ -87,7 +101,8 @@ def make_sharded_vector(
     Args:
         local_values: This rank's unpadded values with shape ``(n_local,)`` or
             ``(n_local, nrhs)``.
-        comm: MPI communicator whose rank order matches ``mesh``.
+        comm: MPI communicator whose rank order matches ``mesh``. Defaults to
+            ``MPI.COMM_WORLD``.
         mesh: One-dimensional JAX device mesh with one device per MPI rank.
         global_size: Optional true global length. When provided, it is checked
             against the sum of local lengths.
@@ -98,6 +113,7 @@ def make_sharded_vector(
         optional RHS-column axis is replicated. Its physical leading-axis
         length is ``comm.size * max(local_sizes)``.
     """
+    comm = _resolve_comm(comm)
     values = np.asarray(local_values)
     if values.ndim not in (1, 2):
         raise ValueError(
@@ -421,7 +437,7 @@ def make_sharded_solver(
     A_local: MatrixOrOperator,
     b: jax.Array,
     *,
-    comm: Comm,
+    comm: Comm | None = None,
     mesh: Mesh | None = None,
     axis_name: str = "rank",
     config: dict[str, Any] | None = None,
@@ -453,6 +469,7 @@ def make_sharded_solver(
             shards are padded to the largest local partition. Batched RHS
             columns are replicated within each row shard.
         comm: MPI communicator whose rank order matches the JAX process order.
+            Defaults to ``MPI.COMM_WORLD``.
         mesh: One-dimensional JAX device mesh. If omitted, use the mesh from
             ``b.sharding``.
         axis_name: Name of the mesh axis that partitions rows.
@@ -480,6 +497,7 @@ def make_sharded_solver(
     _require_shard_map()
     if not isinstance(b, jax.Array):
         raise TypeError("b must be a global jax.Array")
+    comm = _resolve_comm(comm)
     mesh = _resolve_mesh(b, mesh, axis_name)
     _validate_runtime(comm, mesh, axis_name)
 
@@ -915,7 +933,7 @@ def solve_sharded(
     b: jax.Array,
     x0: jax.Array | None = None,
     *,
-    comm: Comm,
+    comm: Comm | None = None,
     mesh: Mesh | None = None,
     axis_name: str = "rank",
     config: dict[str, Any] | None = None,
