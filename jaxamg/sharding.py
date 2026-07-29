@@ -19,7 +19,7 @@ from jax.sharding import PartitionSpec as P
 
 from .cache import _build_mpi_cache, with_cache
 from .jaxamg import solve
-from .mpi_utils import build_halo_plan
+from .mpi_utils import HaloPlan, build_halo_plan
 from .utils import (
     MatrixOrOperator,
     get_preferred_dtype,
@@ -49,9 +49,20 @@ class _TransposePlan(NamedTuple):
     local_target_ids: np.ndarray
     send_ids_2d: np.ndarray
     recv_target_ids_2d: np.ndarray
-    indices_host: np.ndarray
-    indptr_host: np.ndarray
     max_nnz: int
+
+
+def _primal_halo_placeholder(n_local: int, nranks: int) -> HaloPlan:
+    """Minimal halo operands for an MPI solve whose primal does not use them."""
+    return HaloPlan(
+        n_local=n_local,
+        n_ghost=0,
+        max_n_ghost=0,
+        max_per_rank=1,
+        col_to_combined=np.empty(0, dtype=np.int32),
+        send_ids_2d=np.zeros((nranks, 1), dtype=np.int32),
+        recv_ghost_slot_2d=np.zeros((nranks, 1), dtype=np.int32),
+    )
 
 
 def _resolve_comm(comm: Comm | None) -> Comm:
@@ -683,8 +694,6 @@ def _transpose_distributed_matrix(
         local_target_ids,
         send_ids_2d,
         recv_target_ids_2d,
-        recv_cols,
-        transpose_indptr,
         max_nnz,
     )
 
@@ -808,12 +817,6 @@ def make_sharded_solver(
         )
         nnz_out = transpose_structure.nnz
         max_transpose_nnz = transpose_plan.max_nnz
-        transpose_halo_plan = build_halo_plan(
-            transpose_plan.indices_host,
-            A.row_counts,
-            partition_info,
-            comm,
-        )
         # Explicit single-device placement keeps rank-local constants local even
         # when solver construction happens inside a global ``jax.set_mesh``
         # context.
@@ -840,14 +843,14 @@ def make_sharded_solver(
         lrank=int(local_hardware_id),
     )
     if not is_symmetric:
-        # A and A^T share the communicator, row partition, configuration, and
-        # device. Only structure-dependent buffer and halo metadata differ.
-        assert transpose_halo_plan is not None
+        # The MPI solve's primal does not consume halo operands, and sharding's
+        # outer VJP computes its matrix gradient from A's existing halo plan.
+        # Therefore the nested A^T solve needs only placeholder halo operands.
         transpose_cache = {
             **mpi_cache,
             "max_nnz": max_transpose_nnz,
             "nnz_out": local_nnz,
-            "halo_plan": transpose_halo_plan,
+            "halo_plan": _primal_halo_placeholder(n_local, len(A.row_counts)),
         }
 
     if is_batched:

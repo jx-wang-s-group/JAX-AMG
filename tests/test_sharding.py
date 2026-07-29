@@ -39,8 +39,6 @@ def _single_rank_transpose_plan(A):
         np.arange(nnz, dtype=np.int32),
         np.zeros((1, 1), dtype=np.int32),
         np.full((1, 1), nnz, dtype=np.int32),
-        np.asarray(A.indices),
-        np.asarray(A.indptr),
         nnz,
     )
 
@@ -109,12 +107,17 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
         send_ids_2d=np.zeros((1, 1), dtype=np.int32),
         recv_ghost_slot_2d=np.zeros((1, 1), dtype=np.int32),
     )
+    halo_plan_calls = []
+
+    def fake_build_halo_plan(*args, **kwargs):
+        halo_plan_calls.append(args)
+        return halo_plan
 
     monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
     monkeypatch.setattr(
         sharding_module,
         "build_halo_plan",
-        lambda *args, **kwargs: halo_plan,
+        fake_build_halo_plan,
     )
     monkeypatch.setattr(
         sharding_module,
@@ -170,6 +173,7 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     solver = jaxamg.make_sharded_solver(matrix, b)
     assert len(allgather_calls) == 2
     assert len(normalization_calls) == 1
+    assert len(halo_plan_calls) == 1
     x, info = solver(b)
     np.testing.assert_array_equal(np.asarray(x), np.asarray(b))
     np.testing.assert_array_equal(np.asarray(solver.local_vector(x)), np.asarray(b))
