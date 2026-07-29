@@ -150,8 +150,10 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
         shape=(n_local, n_global),
     )
     b_local = np.arange(row_start + 1, row_start + n_local + 1, dtype=np.float32)
-    b = _global_vector(b_local, n_global, mesh)
-    matrix = jaxamg.make_sharded_matrix(A_local, b)
+    b_local_device = jnp.asarray(b_local)
+    with jax.transfer_guard_device_to_host("disallow"):
+        b = jaxamg.make_sharded_vector(b_local_device, mesh=mesh, global_size=n_global)
+        matrix = jaxamg.make_sharded_matrix(A_local, b)
     solver = jaxamg.make_sharded_solver(
         matrix,
         b,
@@ -312,8 +314,10 @@ def test_sharded_uneven_row_partitions(sharding_context):
     )
     n_local = row_end - row_start
     b_local = np.arange(row_start + 1, row_end + 1, dtype=np.float32)
+    b_local_device = jnp.asarray(b_local)
     x0_local = np.full(n_local, 0.25, dtype=np.float32)
-    b = jaxamg.make_sharded_vector(b_local, global_size=n_global)
+    with jax.transfer_guard_device_to_host("disallow"):
+        b = jaxamg.make_sharded_vector(b_local_device, global_size=n_global)
     x0 = jaxamg.make_sharded_vector(
         x0_local, comm=comm, mesh=mesh, global_size=n_global
     )

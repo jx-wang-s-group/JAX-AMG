@@ -53,7 +53,7 @@ class ShardedMatrix:
         self,
         local_bcsr: jsp.BCSR,
         data: jax.Array,
-        local_packed_data: np.ndarray,
+        local_packed_data: jax.Array,
         comm: Comm,
         mesh: Mesh,
         axis_name: str,
@@ -136,7 +136,8 @@ def make_sharded_vector(
 
     The returned JAX array has equal physical shard sizes, as required by
     ``NamedSharding``. ``make_sharded_solver`` ignores each shard's padding and
-    uses the true row counts from ``A_local``.
+    uses the true row counts from ``A_local``. JAX array inputs are padded and
+    assembled on device; other array-like inputs use a NumPy host staging path.
 
     Args:
         local_values: This rank's unpadded values with shape ``(n_local,)`` or
@@ -157,7 +158,16 @@ def make_sharded_vector(
     comm = _resolve_comm(comm)
     if mesh is None:
         mesh = jax.make_mesh((jax.device_count(),), (axis_name,))
-    values = np.asarray(local_values)
+    values: jax.Array | np.ndarray
+    if isinstance(local_values, jax.Array):
+        if not local_values.is_fully_addressable:
+            raise ValueError(
+                "local_values must be a process-local JAX array, not an already "
+                "distributed global array"
+            )
+        values = local_values
+    else:
+        values = np.asarray(local_values)
     if values.ndim not in (1, 2):
         raise ValueError(
             f"local_values must be one- or two-dimensional; got shape {values.shape}"
@@ -191,8 +201,13 @@ def make_sharded_vector(
         )
 
     max_local_size = max(local_sizes)
-    padded_values = np.zeros((max_local_size, *trailing_shape), dtype=values.dtype)
-    padded_values[: values.shape[0]] = values
+    padding = ((0, max_local_size - values.shape[0]),) + ((0, 0),) * (values.ndim - 1)
+    if max_local_size == values.shape[0]:
+        padded_values = values
+    elif isinstance(values, jax.Array):
+        padded_values = jnp.pad(values, padding)
+    else:
+        padded_values = np.pad(values, padding)
     sharding = NamedSharding(mesh, _row_partition_spec(values.ndim, axis_name))
     return jax.make_array_from_process_local_data(
         sharding,
@@ -393,8 +408,11 @@ def _pack_sharded_matrix(
     local_nnz = int(A_bcsr.data.shape[0])
     if max_nnz is None:
         max_nnz = max(int(value) for value in comm.allgather(local_nnz))
-    local_packed_data = np.zeros(max_nnz, dtype=np.asarray(A_bcsr.data).dtype)
-    local_packed_data[:local_nnz] = np.asarray(A_bcsr.data)
+    local_packed_data = (
+        A_bcsr.data
+        if max_nnz == local_nnz
+        else jnp.pad(A_bcsr.data, (0, max_nnz - local_nnz))
+    )
     data_sharding = NamedSharding(mesh, P(axis_name))
     data = jax.make_array_from_process_local_data(
         data_sharding,
@@ -507,7 +525,6 @@ def _transpose_distributed_matrix(
     n_global = sum(recvcounts)
     nranks = len(recvcounts)
 
-    data = np.asarray(A.data)
     indices = np.asarray(A.indices, dtype=np.int64)
     indptr = np.asarray(A.indptr, dtype=np.int64)
     source_rows = np.repeat(
@@ -527,22 +544,14 @@ def _transpose_distributed_matrix(
     send_displs = np.insert(np.cumsum(send_counts[:-1]), 0, 0).astype(np.int32)
     recv_displs = np.insert(np.cumsum(recv_counts[:-1]), 0, 0).astype(np.int32)
 
-    send_data = np.ascontiguousarray(data[send_order])
     send_rows = np.ascontiguousarray(indices[send_order])
     send_cols = np.ascontiguousarray(source_rows[send_order])
-    packed_ids = comm.Get_rank() * max_nnz + np.arange(len(data), dtype=np.int64)
+    packed_ids = comm.Get_rank() * max_nnz + np.arange(len(indices), dtype=np.int64)
     send_ids = np.ascontiguousarray(packed_ids[send_order])
     recv_nnz = int(recv_counts.sum())
-    recv_data = np.empty(recv_nnz, dtype=data.dtype)
     recv_rows = np.empty(recv_nnz, dtype=np.int64)
     recv_cols = np.empty(recv_nnz, dtype=np.int64)
     recv_ids = np.empty(recv_nnz, dtype=np.int64)
-    value_mpi_type = MPI.FLOAT if data.dtype == np.float32 else MPI.DOUBLE
-
-    comm.Alltoallv(
-        [send_data, send_counts, send_displs, value_mpi_type],
-        [recv_data, recv_counts, recv_displs, value_mpi_type],
-    )
     comm.Alltoallv(
         [send_rows, send_counts, send_displs, MPI.INT64_T],
         [recv_rows, recv_counts, recv_displs, MPI.INT64_T],
@@ -560,16 +569,16 @@ def _transpose_distributed_matrix(
     order = np.lexsort((recv_cols, local_rows))
     local_rows = local_rows[order]
     recv_cols = recv_cols[order]
-    recv_data = recv_data[order]
     recv_ids = recv_ids[order]
     row_counts = np.bincount(local_rows, minlength=n_local)
     transpose_indptr = np.concatenate(([0], np.cumsum(row_counts))).astype(np.int32)
 
     with temp_enable_x64():
+        transpose_data = jnp.zeros(recv_nnz, dtype=A.data.dtype)
         transpose_indices = jnp.asarray(recv_cols, dtype=jnp.int64)
         transpose = jsp.BCSR(
             (
-                jnp.asarray(recv_data),
+                transpose_data,
                 transpose_indices,
                 jnp.asarray(transpose_indptr),
             ),

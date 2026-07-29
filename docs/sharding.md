@@ -53,11 +53,10 @@ Build a global RHS from each process's local partition, then create the solver
 once and reuse it:
 
 ```python
-import numpy as np
 import jaxamg
 
 b = jaxamg.make_sharded_vector(
-    np.asarray(b_local),
+    b_local,
     global_size=n_global,
 )
 
@@ -79,6 +78,11 @@ the matrix and solver otherwise infer the mesh from `b`.
 globally sharded values as `A.data`; it does not replicate the global matrix.
 The original local-matrix form remains supported by
 `make_sharded_solver(A_local, b)` as a convenience.
+
+When `b_local` or the local matrix values are JAX device arrays, vector and
+matrix packing stays on device. NumPy inputs are transferred to the target GPU
+once during construction. Solver setup inspects only static CSR structure on
+the host to build MPI partition, transpose, and halo metadata.
 
 For a coupled block system, pass `block_dim=k` to `make_sharded_solver`. The
 matrix and vectors retain their ordinary scalar CSR/vector representation;

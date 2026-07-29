@@ -47,6 +47,28 @@ def test_make_sharded_vector_constructs_default_mesh():
     np.testing.assert_array_equal(np.asarray(b), values)
 
 
+def test_sharded_inputs_preserve_device_arrays(monkeypatch):
+    mesh, local_values = _single_device_array(np.arange(4, dtype=np.float32))
+    A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
+    comm = SimpleNamespace(
+        Get_size=lambda: 1,
+        Get_rank=lambda: 0,
+        allgather=lambda value: [value],
+    )
+    monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
+
+    with jax.transfer_guard_device_to_host("disallow"):
+        b = jaxamg.make_sharded_vector(
+            local_values, comm=comm, mesh=mesh, global_size=4
+        )
+        matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
+
+    assert b.addressable_shards[0].device == next(iter(local_values.devices()))
+    assert matrix.data.addressable_shards[0].device == next(
+        iter(A_local.data.devices())
+    )
+
+
 def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     mesh, b = _single_device_array(np.arange(4, dtype=np.float32))
     A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
