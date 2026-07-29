@@ -72,12 +72,11 @@ x, info = solver(b)
 
 The sharding helpers use `MPI.COMM_WORLD` and a one-dimensional mesh over all
 JAX devices by default. Pass `comm=` or `mesh=` explicitly to override them;
-the matrix and solver otherwise infer the mesh from `b`.
+the matrix otherwise infers the mesh from `b`, and the solver uses the matrix's
+communicator and mesh.
 
 `A` stores the CSR structure only on its owning rank and exposes its padded,
 globally sharded values as `A.data`; it does not replicate the global matrix.
-The original local-matrix form remains supported by
-`make_sharded_solver(A_local, b)` as a convenience.
 
 When `b_local` or the local matrix values are JAX device arrays, vector and
 matrix packing stays on device. NumPy inputs are transferred to the target GPU
@@ -103,9 +102,8 @@ RHS gradients retain the padded shape and sharding of the RHS. The scalar info
 values have shape `(nranks, nrhs)`, and residual history has shape
 `(nranks, nrhs, max_iters + 1)`.
 
-Pass `A.data` to the solve when differentiating matrix values. The
-backward-compatible `solver.A_data` attribute aliases the same array. Enter the
-mesh context for an outer transformation:
+Pass `A.data` to the solve when differentiating matrix values. Enter the mesh
+context for an outer transformation:
 
 ```python
 import jax.numpy as jnp
@@ -126,10 +124,6 @@ grad_A_local = A.local_matrix(grad_A_data)
 
 The solver is compiled internally and also composes with an enclosing
 `jax.jit`, including JIT-compiled reverse-mode differentiation.
-
-For a one-off solve, `jaxamg.solve_sharded(...)` accepts the same setup arguments
-and immediately invokes the resulting solver. Prefer `make_sharded_solver` in
-loops so metadata and compiled executables are reused.
 
 Run the complete single-node example with:
 

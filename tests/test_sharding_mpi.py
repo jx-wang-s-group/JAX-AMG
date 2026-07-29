@@ -168,7 +168,6 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
 
     # Change every real matrix value after setup. Padding is also changed but
     # must remain disconnected from both the solve and its gradient.
-    assert solver.A_data is matrix.data
     A_data = matrix.data + jnp.asarray(0.1, dtype=matrix.data.dtype)
 
     def loss(matrix_data, rhs):
@@ -246,11 +245,10 @@ def test_sharded_symmetric_warm_start_gradients(sharding_context):
     x0_local = np.full(n_local, 0.25, dtype=np.float32)
     b = _global_vector(b_local, n_global, mesh)
     x0 = _global_vector(x0_local, n_global, mesh)
+    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
     solver = jaxamg.make_sharded_solver(
-        A_local,
+        matrix,
         b,
-        comm=comm,
-        mesh=mesh,
         is_symmetric=True,
         config={
             "solver": "CG",
@@ -270,8 +268,8 @@ def test_sharded_symmetric_warm_start_gradients(sharding_context):
             lambda matrix_data, rhs, guess: solver(rhs, guess, A_data=matrix_data)
         )
         compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
-        x, info = compiled_solve(solver.A_data, b, x0)
-        grad_A_data, grad_b, grad_x0 = compiled_grad(solver.A_data, b, x0)
+        x, info = compiled_solve(matrix.data, b, x0)
+        grad_A_data, grad_b, grad_x0 = compiled_grad(matrix.data, b, x0)
     x.block_until_ready()
     grad_A_data.block_until_ready()
     grad_b.block_until_ready()
@@ -291,7 +289,7 @@ def test_sharded_symmetric_warm_start_gradients(sharding_context):
     np.testing.assert_allclose(grad_b_global, adjoint_ref, rtol=1e-5, atol=1e-6)
     np.testing.assert_array_equal(grad_x0_global, 0)
 
-    grad_A_local = solver.local_matrix_gradient(grad_A_data)
+    grad_A_local = matrix.local_matrix(grad_A_data)
     row_indices = np.repeat(
         np.arange(row_start, row_end), np.diff(np.asarray(A_local.indptr))
     )
@@ -321,11 +319,10 @@ def test_sharded_uneven_row_partitions(sharding_context):
     x0 = jaxamg.make_sharded_vector(
         x0_local, comm=comm, mesh=mesh, global_size=n_global
     )
+    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
     solver = jaxamg.make_sharded_solver(
-        A_local,
+        matrix,
         b,
-        comm=comm,
-        mesh=mesh,
         config={
             "solver": "GMRES",
             "preconditioner": {"solver": "JACOBI_L1"},
@@ -334,7 +331,7 @@ def test_sharded_uneven_row_partitions(sharding_context):
             "tolerance": 1e-8,
         },
     )
-    A_data = solver.A_data + jnp.asarray(0.05, solver.A_data.dtype)
+    A_data = matrix.data + jnp.asarray(0.05, matrix.data.dtype)
 
     def loss(matrix_data, rhs, guess):
         x, _ = solver(rhs, guess, A_data=matrix_data)
@@ -366,7 +363,7 @@ def test_sharded_uneven_row_partitions(sharding_context):
     np.testing.assert_allclose(grad_b_global, adjoint_ref, rtol=1e-5, atol=1e-6)
     np.testing.assert_array_equal(grad_x0_global, 0)
 
-    grad_A_local = solver.local_matrix_gradient(grad_A_data)
+    grad_A_local = matrix.local_matrix(grad_A_data)
     row_indices = np.repeat(
         np.arange(row_start, row_end), np.diff(np.asarray(A_local.indptr))
     )
@@ -399,11 +396,10 @@ def test_sharded_block_matrix_gradients(sharding_context, is_symmetric):
     n_local = row_end - row_start
     b_local = np.linspace(row_start + 1.0, row_end, n_local, dtype=np.float32)
     b = jaxamg.make_sharded_vector(b_local, global_size=n_global)
+    matrix = jaxamg.make_sharded_matrix(A_local, b)
     solver = jaxamg.make_sharded_solver(
-        A_local,
+        matrix,
         b,
-        comm=comm,
-        mesh=mesh,
         is_symmetric=is_symmetric,
         block_dim=block_dim,
         config={
@@ -424,8 +420,8 @@ def test_sharded_block_matrix_gradients(sharding_context, is_symmetric):
             lambda matrix_data, rhs: solver(rhs, A_data=matrix_data)
         )
         compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1)))
-        x, info = compiled_solve(solver.A_data, b)
-        grad_A_data, grad_b = compiled_grad(solver.A_data, b)
+        x, info = compiled_solve(matrix.data, b)
+        grad_A_data, grad_b = compiled_grad(matrix.data, b)
     x.block_until_ready()
     grad_A_data.block_until_ready()
     grad_b.block_until_ready()
@@ -444,7 +440,7 @@ def test_sharded_block_matrix_gradients(sharding_context, is_symmetric):
         atol=1e-6,
     )
 
-    grad_A_local = solver.local_matrix_gradient(grad_A_data)
+    grad_A_local = matrix.local_matrix(grad_A_data)
     local_rows = np.repeat(
         np.arange(row_start, row_end), np.diff(np.asarray(A_local.indptr))
     )
@@ -508,11 +504,10 @@ def test_sharded_batched_rhs_gradients(sharding_context):
     x0 = jaxamg.make_sharded_vector(
         x0_local, comm=comm, mesh=mesh, global_size=n_global
     )
+    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
     solver = jaxamg.make_sharded_solver(
-        A_local,
+        matrix,
         b,
-        comm=comm,
-        mesh=mesh,
         config={
             "solver": "FGMRES",
             "preconditioner": {"solver": "JACOBI_L1"},
@@ -521,7 +516,7 @@ def test_sharded_batched_rhs_gradients(sharding_context):
             "tolerance": 1e-8,
         },
     )
-    A_data = solver.A_data + jnp.asarray(0.05, solver.A_data.dtype)
+    A_data = matrix.data + jnp.asarray(0.05, matrix.data.dtype)
 
     def loss(matrix_data, rhs, guess):
         x, _ = solver(rhs, guess, A_data=matrix_data)
@@ -565,7 +560,7 @@ def test_sharded_batched_rhs_gradients(sharding_context):
         _gather_unpadded(grad_x0, solver, comm), np.zeros_like(b_reference)
     )
 
-    grad_A_local = solver.local_matrix_gradient(grad_A_data)
+    grad_A_local = matrix.local_matrix(grad_A_data)
     grad_A_reference = -np.sum(
         adjoint_reference[local_rows]
         * x_reference[np.asarray(A_local.indices, dtype=np.int64)],

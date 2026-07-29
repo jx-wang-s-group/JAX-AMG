@@ -16,7 +16,6 @@ from .sharding import (
     make_sharded_matrix,
     make_sharded_solver,
     make_sharded_vector,
-    solve_sharded,
 )
 from .sparsity import cache_coloring
 
@@ -30,7 +29,6 @@ __all__ = [
     "make_sharded_matrix",
     "make_sharded_solver",
     "make_sharded_vector",
-    "solve_sharded",
     "AMGXStatus",
     "make_preconditioner",
     "make_lineax_preconditioner",

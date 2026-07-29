@@ -277,11 +277,12 @@ def main() -> None:
     b_sharded = jax.make_array_from_process_local_data(
         sharding, b_local_np, global_shape=(n_global,)
     )
+    sharded_matrix = jaxamg.make_sharded_matrix(
+        A_local, b_sharded, comm=comm, mesh=mesh
+    )
     sharded_solver = jaxamg.make_sharded_solver(
-        A_local,
+        sharded_matrix,
         b_sharded,
-        comm=comm,
-        mesh=mesh,
         config=config,
         is_symmetric=False,
         reuse_setup=True,
@@ -300,13 +301,13 @@ def main() -> None:
         sharding_timings = _run_interface(
             "Sharding",
             _sharding_functions(sharded_solver),
-            (sharded_solver.A_data, b_sharded),
+            (sharded_matrix.data, b_sharded),
             n_runs,
         )
 
     sharded_x_local = sharding_timings["forward"].output.addressable_shards[0].data
     sharded_db_local = sharding_timings["dL/db"].output.addressable_shards[0].data
-    sharded_dA_local = sharded_solver.local_matrix_gradient(
+    sharded_dA_local = sharded_matrix.local_matrix(
         sharding_timings["dL/dA"].output
     ).data
     forward_error = _relative_error(sharded_x_local, mpi_timings["forward"].output)

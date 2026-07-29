@@ -44,12 +44,6 @@ This page documents the public API of JAX-AMG.
         show_source: false
         heading_level: 3
 
-::: jaxamg.solve_sharded
-    options:
-        show_root_heading: true
-        show_source: false
-        heading_level: 3
-
 ## Caching
 
 ::: jaxamg.with_cache
