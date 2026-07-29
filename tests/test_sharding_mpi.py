@@ -28,6 +28,7 @@ if _SHARDING_TEST:
 
 import jaxamg  # noqa: E402
 from jaxamg.matrices import tridiagonal_matrix_distributed  # noqa: E402
+from jaxamg.mpi_utils import get_partition_info  # noqa: E402
 from jaxamg.sharding import ShardedSolve  # noqa: E402
 
 pytestmark = [
@@ -80,6 +81,44 @@ def _gather_unpadded(
 def _local_status(info: dict[str, jax.Array]) -> int:
     status = np.asarray(info["status"].addressable_shards[0].data)
     return int(status.item())
+
+
+def _distributed_block_system(
+    n_blocks: int,
+    rank: int,
+    nranks: int,
+    *,
+    symmetric: bool,
+) -> tuple[jsp.BCSR, np.ndarray, int, int]:
+    """Build a block-aligned local partition and its small dense reference."""
+    import scipy.sparse
+
+    block_dim = 2
+    lower = -np.ones(n_blocks - 1, dtype=np.float32)
+    upper = lower if symmetric else -1.25 * np.ones_like(lower)
+    node_matrix = scipy.sparse.diags(
+        (lower, 4.0 * np.ones(n_blocks, dtype=np.float32), upper),
+        offsets=(-1, 0, 1),
+        format="csr",
+    )
+    coupling = np.array(
+        [[2.0, 0.25], [0.25 if symmetric else 0.5, 1.5]], dtype=np.float32
+    )
+    A_global = scipy.sparse.kron(node_matrix, coupling, format="csr")
+
+    block_start, block_end, _ = get_partition_info(n_blocks, rank, nranks)
+    row_start = block_start * block_dim
+    row_end = block_end * block_dim
+    A_partition = A_global[row_start:row_end]
+    A_local = jsp.BCSR(
+        (
+            jnp.asarray(A_partition.data, dtype=jnp.float32),
+            jnp.asarray(A_partition.indices, dtype=jnp.int32),
+            jnp.asarray(A_partition.indptr, dtype=jnp.int32),
+        ),
+        shape=A_partition.shape,
+    )
+    return A_local, A_global.toarray(), row_start, row_end
 
 
 def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
@@ -338,6 +377,91 @@ def test_sharded_uneven_row_partitions(sharding_context):
     grad_b_physical = np.asarray(grad_b.addressable_shards[0].data)
     np.testing.assert_array_equal(x_physical[n_local:], 0)
     np.testing.assert_array_equal(grad_b_physical[n_local:], 0)
+    assert solver.global_size == n_global
+    assert solver.local_size == n_local
+    assert _local_status(info) == 0
+
+
+@pytest.mark.parametrize("is_symmetric", [True, False])
+def test_sharded_block_matrix_gradients(sharding_context, is_symmetric):
+    """Cover block solves and VJPs with uneven block-aligned partitions."""
+    comm, rank, nranks, mesh = sharding_context
+    block_dim = 2
+    n_blocks = 2 * nranks + 1
+    n_global = block_dim * n_blocks
+    A_local, A_global, row_start, row_end = _distributed_block_system(
+        n_blocks, rank, nranks, symmetric=is_symmetric
+    )
+    n_local = row_end - row_start
+    b_local = np.linspace(row_start + 1.0, row_end, n_local, dtype=np.float32)
+    b = jaxamg.make_sharded_vector(b_local, comm=comm, mesh=mesh, global_size=n_global)
+    solver = jaxamg.make_sharded_solver(
+        A_local,
+        b,
+        comm=comm,
+        mesh=mesh,
+        is_symmetric=is_symmetric,
+        block_dim=block_dim,
+        config={
+            "solver": "FGMRES",
+            "preconditioner": {"solver": "BLOCK_JACOBI"},
+            "communicator": "MPI_DIRECT",
+            "max_iters": 200,
+            "tolerance": 1e-8,
+        },
+    )
+
+    def loss(matrix_data, rhs):
+        x, _ = solver(rhs, A_data=matrix_data)
+        return jnp.sum(x**2)
+
+    with jax.set_mesh(mesh):
+        compiled_solve = jax.jit(
+            lambda matrix_data, rhs: solver(rhs, A_data=matrix_data)
+        )
+        compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1)))
+        x, info = compiled_solve(solver.A_data, b)
+        grad_A_data, grad_b = compiled_grad(solver.A_data, b)
+    x.block_until_ready()
+    grad_A_data.block_until_ready()
+    grad_b.block_until_ready()
+
+    b_global = np.arange(1, n_global + 1, dtype=np.float64)
+    A_reference = np.asarray(A_global, dtype=np.float64)
+    x_reference = np.linalg.solve(A_reference, b_global)
+    adjoint_reference = np.linalg.solve(A_reference.T, 2.0 * x_reference)
+    np.testing.assert_allclose(
+        _gather_unpadded(x, solver, comm), x_reference, rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        _gather_unpadded(grad_b, solver, comm),
+        adjoint_reference,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    grad_A_local = solver.local_matrix_gradient(grad_A_data)
+    local_rows = np.repeat(
+        np.arange(row_start, row_end), np.diff(np.asarray(A_local.indptr))
+    )
+    grad_A_reference = (
+        -adjoint_reference[local_rows]
+        * x_reference[np.asarray(A_local.indices, dtype=np.int64)]
+    )
+    np.testing.assert_allclose(
+        np.asarray(grad_A_local.data),
+        grad_A_reference,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    x_physical = np.asarray(x.addressable_shards[0].data)
+    grad_b_physical = np.asarray(grad_b.addressable_shards[0].data)
+    grad_A_physical = np.asarray(grad_A_data.addressable_shards[0].data)
+    np.testing.assert_array_equal(x_physical[n_local:], 0)
+    np.testing.assert_array_equal(grad_b_physical[n_local:], 0)
+    np.testing.assert_array_equal(grad_A_physical[len(A_local.data) :], 0)
+    assert n_local % block_dim == 0
     assert solver.global_size == n_global
     assert solver.local_size == n_local
     assert _local_status(info) == 0

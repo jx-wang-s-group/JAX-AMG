@@ -17,6 +17,8 @@ The initial interface supports:
 - a one-dimensional JAX mesh where device position `i` belongs to MPI rank `i`;
 - a row-sharded, one-dimensional right-hand side with equal or unequal local
   row counts;
+- scalar and block matrices, provided every rank's true row count is divisible
+  by `block_dim`;
 - symmetric and nonsymmetric distributed matrices; and
 - JIT compilation and reverse-mode differentiation with respect to matrix
   values and the RHS.
@@ -72,6 +74,11 @@ solver = jaxamg.make_sharded_solver(
 
 x, info = solver(b)
 ```
+
+For a coupled block system, pass `block_dim=k` to `make_sharded_solver`. The
+matrix and vectors retain their ordinary scalar CSR/vector representation;
+AmgX performs the internal block conversion. Unequal rank partitions remain
+supported as long as each partition ends on a block boundary.
 
 `x` is a global array with the same row sharding as `b`. For unequal row counts,
 JAX's equal physical shards are padded to the largest local partition; the

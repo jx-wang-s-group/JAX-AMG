@@ -438,7 +438,9 @@ def make_sharded_solver(
         is_symmetric: Whether the global matrix is symmetric. When ``False``
             (the default), the distributed transpose is prepared once during
             solver creation for the reverse-mode adjoint.
-        block_dim: AmgX block dimension.
+        block_dim: AmgX block dimension. The matrix retains its scalar CSR
+            representation, and every local row partition must be divisible by
+            this value.
         reuse_setup: Reuse the cached AmgX hierarchy across solves with the
             same sparsity pattern.
 
