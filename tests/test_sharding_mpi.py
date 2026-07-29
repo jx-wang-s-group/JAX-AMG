@@ -154,7 +154,6 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
     solver = jaxamg.make_sharded_solver(
         A_local,
         b,
-        mesh=mesh,
         config={
             "solver": "GMRES",
             "preconditioner": {"solver": "JACOBI_L1"},
@@ -312,7 +311,7 @@ def test_sharded_uneven_row_partitions(sharding_context):
     n_local = row_end - row_start
     b_local = np.arange(row_start + 1, row_end + 1, dtype=np.float32)
     x0_local = np.full(n_local, 0.25, dtype=np.float32)
-    b = jaxamg.make_sharded_vector(b_local, mesh=mesh, global_size=n_global)
+    b = jaxamg.make_sharded_vector(b_local, global_size=n_global)
     x0 = jaxamg.make_sharded_vector(
         x0_local, comm=comm, mesh=mesh, global_size=n_global
     )
@@ -393,7 +392,7 @@ def test_sharded_block_matrix_gradients(sharding_context, is_symmetric):
     )
     n_local = row_end - row_start
     b_local = np.linspace(row_start + 1.0, row_end, n_local, dtype=np.float32)
-    b = jaxamg.make_sharded_vector(b_local, mesh=mesh, global_size=n_global)
+    b = jaxamg.make_sharded_vector(b_local, global_size=n_global)
     solver = jaxamg.make_sharded_solver(
         A_local,
         b,

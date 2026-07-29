@@ -56,25 +56,23 @@ once and reuse it:
 import numpy as np
 import jaxamg
 
-mesh = jax.make_mesh((nranks,), ("rank",))
 b = jaxamg.make_sharded_vector(
     np.asarray(b_local),
-    mesh=mesh,
     global_size=n_global,
 )
 
 solver = jaxamg.make_sharded_solver(
     A_local,
     b,
-    mesh=mesh,
     config={"solver": "GMRES", "communicator": "MPI_DIRECT"},
 )
 
 x, info = solver(b)
 ```
 
-The sharding helpers use `MPI.COMM_WORLD` by default. Pass `comm=` explicitly
-when using an MPI subcommunicator.
+The sharding helpers use `MPI.COMM_WORLD` and a one-dimensional mesh over all
+JAX devices by default. Pass `comm=` or `mesh=` explicitly to override them;
+the solver otherwise infers the mesh from `b`.
 
 For a coupled block system, pass `block_dim=k` to `make_sharded_solver`. The
 matrix and vectors retain their ordinary scalar CSR/vector representation;

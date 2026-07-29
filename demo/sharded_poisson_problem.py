@@ -34,11 +34,9 @@ def main() -> None:
     )
     b_local = np.ones(row_end - row_start)
 
-    # Create a mesh and sharding for the distributed vector
-    mesh = jax.make_mesh((nranks,), ("rank",))
+    # Create a global sharded vector from this process's local values.
     b = jaxamg.make_sharded_vector(
         b_local,
-        mesh=mesh,
         global_size=n_global,
     )
 
@@ -46,7 +44,6 @@ def main() -> None:
     solver = jaxamg.make_sharded_solver(
         A_local,
         b,
-        mesh=mesh,
         config={
             "solver": "CG",
             "preconditioner": {"solver": "JACOBI_L1"},
@@ -61,7 +58,7 @@ def main() -> None:
         solution, _ = solver(rhs, A_data=A_data)
         return jnp.sum(solution**2)
 
-    with jax.set_mesh(mesh):
+    with jax.set_mesh(b.sharding.mesh):
         grad_A_data, grad_b = jax.grad(loss, argnums=(0, 1))(solver.A_data, b)
     grad_A_data.block_until_ready()
     grad_b.block_until_ready()

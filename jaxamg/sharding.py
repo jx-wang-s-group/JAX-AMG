@@ -88,7 +88,7 @@ def make_sharded_vector(
     local_values: Any,
     *,
     comm: Comm | None = None,
-    mesh: Mesh,
+    mesh: Mesh | None = None,
     global_size: int | None = None,
     axis_name: str = "rank",
 ) -> jax.Array:
@@ -104,6 +104,7 @@ def make_sharded_vector(
         comm: MPI communicator whose rank order matches ``mesh``. Defaults to
             ``MPI.COMM_WORLD``.
         mesh: One-dimensional JAX device mesh with one device per MPI rank.
+            Defaults to a mesh containing all JAX devices.
         global_size: Optional true global length. When provided, it is checked
             against the sum of local lengths.
         axis_name: Mesh axis used to partition the vector.
@@ -114,6 +115,8 @@ def make_sharded_vector(
         length is ``comm.size * max(local_sizes)``.
     """
     comm = _resolve_comm(comm)
+    if mesh is None:
+        mesh = jax.make_mesh((jax.device_count(),), (axis_name,))
     values = np.asarray(local_values)
     if values.ndim not in (1, 2):
         raise ValueError(

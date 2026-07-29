@@ -32,6 +32,21 @@ def _single_device_array(values):
     return mesh, jax.device_put(jnp.asarray(values), sharding)
 
 
+def test_make_sharded_vector_constructs_default_mesh():
+    comm = SimpleNamespace(
+        Get_size=lambda: 1,
+        allgather=lambda value: [value],
+    )
+    values = np.arange(4, dtype=np.float32)
+
+    b = jaxamg.make_sharded_vector(values, comm=comm, global_size=4)
+
+    assert isinstance(b.sharding, jax.NamedSharding)
+    assert b.sharding.mesh.size == jax.device_count()
+    assert b.sharding.spec == jax.P("rank")
+    np.testing.assert_array_equal(np.asarray(b), values)
+
+
 def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     mesh, b = _single_device_array(np.arange(4, dtype=np.float32))
     A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
