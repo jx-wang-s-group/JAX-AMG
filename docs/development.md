@@ -55,6 +55,19 @@ mpirun -n 2 python -m pytest --only-mpi tests/
   [MPI Guide](mpi.md#gpu-aware-mpi) and
   [Environment Variables Reference](environ.md) for details.
 
+### JAX sharding tests
+
+Run the sharding integration tests separately so every MPI process retains
+visibility of all participating GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+mpirun -n 2 python -m pytest --only-mpi tests/test_sharding_mpi.py
+```
+
+Selecting this test module prevents the ordinary MPI test fixture from narrowing
+each rank to one visible CUDA device and enables early `jax.distributed` setup.
+
 !!! tip
     The MPI demos under `demo/` (e.g. `mpirun -n 4 python demo/mpi_autodiff.py`)
     are a quick way to sanity-check distributed behavior end to end.

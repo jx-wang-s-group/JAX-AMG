@@ -1,6 +1,7 @@
 """Pytest configuration and fixtures for jaxamg tests."""
 
 import os
+import sys
 
 # Under mpirun, pin each rank to a single distinct GPU before JAX initializes
 # its CUDA backend (test collection already allocates on device). Otherwise
@@ -8,7 +9,8 @@ import os
 # once a few ranks preallocate on it.
 _local_rank = os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK")
 _visible_gpus = os.environ.get("CUDA_VISIBLE_DEVICES")
-if _local_rank is not None and _visible_gpus:
+_sharding_test = any("test_sharding_mpi.py" in arg for arg in sys.argv[1:])
+if _local_rank is not None and _visible_gpus and not _sharding_test:
     _gpus = _visible_gpus.split(",")
     os.environ["CUDA_VISIBLE_DEVICES"] = _gpus[int(_local_rank) % len(_gpus)]
 

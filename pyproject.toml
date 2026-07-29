@@ -99,6 +99,7 @@ testpaths = ["tests"]
 markers = [
     "gpu: tests that run the native AmgX solver (skipped without a GPU JAX backend)",
     "mpi: distributed tests; run under mpirun with pytest-mpi's --only-mpi flag",
+    "sharding: multi-process JAX sharding tests",
 ]
 
 [tool.ruff]
