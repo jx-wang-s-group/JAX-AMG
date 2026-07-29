@@ -27,6 +27,11 @@ if TYPE_CHECKING:
 ShardedInfo = dict[str, jax.Array]
 
 
+def _row_partition_spec(ndim: int, axis_name: str) -> P:
+    """Partition the leading row axis and replicate all trailing axes."""
+    return P(axis_name, *(None for _ in range(ndim - 1)))
+
+
 class ShardedSolve:
     """Callable sharded solver with differentiable packed matrix values."""
 
@@ -61,7 +66,7 @@ class ShardedSolve:
         return self._local_matrix_gradient_fn(gradient)
 
     def local_vector(self, value: jax.Array) -> jax.Array:
-        """Return this rank's unpadded portion of a solver vector."""
+        """Return this rank's unpadded rows of a solver vector or RHS matrix."""
         return self._local_vector_fn(value)
 
 
@@ -73,14 +78,15 @@ def make_sharded_vector(
     global_size: int | None = None,
     axis_name: str = "rank",
 ) -> jax.Array:
-    """Create a row-sharded vector, padding unequal local partitions.
+    """Create a row-sharded vector or RHS matrix, padding unequal partitions.
 
     The returned JAX array has equal physical shard sizes, as required by
     ``NamedSharding``. ``make_sharded_solver`` ignores each shard's padding and
     uses the true row counts from ``A_local``.
 
     Args:
-        local_values: This rank's unpadded one-dimensional values.
+        local_values: This rank's unpadded values with shape ``(n_local,)`` or
+            ``(n_local, nrhs)``.
         comm: MPI communicator whose rank order matches ``mesh``.
         mesh: One-dimensional JAX device mesh with one device per MPI rank.
         global_size: Optional true global length. When provided, it is checked
@@ -88,12 +94,17 @@ def make_sharded_vector(
         axis_name: Mesh axis used to partition the vector.
 
     Returns:
-        A global JAX array with ``NamedSharding(mesh, P(axis_name))``. Its
-        physical length is ``comm.size * max(local_sizes)``.
+        A global JAX array whose leading axis uses ``P(axis_name)`` and whose
+        optional RHS-column axis is replicated. Its physical leading-axis
+        length is ``comm.size * max(local_sizes)``.
     """
     values = np.asarray(local_values)
-    if values.ndim != 1:
-        raise ValueError(f"local_values must be one-dimensional; got {values.shape}")
+    if values.ndim not in (1, 2):
+        raise ValueError(
+            f"local_values must be one- or two-dimensional; got shape {values.shape}"
+        )
+    if values.ndim == 2 and values.shape[1] == 0:
+        raise ValueError("a batched RHS must contain at least one column")
     if tuple(mesh.axis_names) != (axis_name,):
         raise ValueError(
             f"mesh must have the single axis {axis_name!r}; got {mesh.axis_names!r}"
@@ -106,7 +117,13 @@ def make_sharded_vector(
             f"mesh size {mesh.size} and communicator size {comm_size}"
         )
 
-    local_sizes = tuple(int(size) for size in comm.allgather(values.shape[0]))
+    local_shapes = tuple(tuple(shape) for shape in comm.allgather(values.shape))
+    trailing_shape = values.shape[1:]
+    if any(shape[1:] != trailing_shape for shape in local_shapes):
+        raise ValueError(
+            f"all MPI ranks must use the same trailing RHS shape; got {local_shapes}"
+        )
+    local_sizes = tuple(int(shape[0]) for shape in local_shapes)
     inferred_global_size = sum(local_sizes)
     if global_size is not None and int(global_size) != inferred_global_size:
         raise ValueError(
@@ -115,13 +132,13 @@ def make_sharded_vector(
         )
 
     max_local_size = max(local_sizes)
-    padded_values = np.zeros(max_local_size, dtype=values.dtype)
+    padded_values = np.zeros((max_local_size, *trailing_shape), dtype=values.dtype)
     padded_values[: values.shape[0]] = values
-    sharding = NamedSharding(mesh, P(axis_name))
+    sharding = NamedSharding(mesh, _row_partition_spec(values.ndim, axis_name))
     return jax.make_array_from_process_local_data(
         sharding,
         padded_values,
-        global_shape=(comm_size * max_local_size,),
+        global_shape=(comm_size * max_local_size, *trailing_shape),
     )
 
 
@@ -210,11 +227,13 @@ def _local_partition(
     n_local: int,
     n_global: int,
 ) -> tuple[tuple[int, int], int]:
-    if b.ndim != 1:
-        raise ValueError(f"b must be one-dimensional; got shape {b.shape}")
+    if b.ndim not in (1, 2):
+        raise ValueError(f"b must be one- or two-dimensional; got shape {b.shape}")
+    if b.ndim == 2 and b.shape[1] == 0:
+        raise ValueError("a batched RHS must contain at least one column")
 
     sharding = getattr(b, "sharding", None)
-    expected_spec = P(axis_name)
+    expected_spec = _row_partition_spec(b.ndim, axis_name)
     if not isinstance(sharding, NamedSharding):
         raise ValueError("b must use NamedSharding")
     if sharding.mesh != mesh or sharding.spec != expected_spec:
@@ -229,7 +248,7 @@ def _local_partition(
             f"count; got row counts {local_sizes} and {n_global} columns"
         )
     max_local_size = max(local_sizes)
-    expected_shape = (comm.Get_size() * max_local_size,)
+    expected_shape = (comm.Get_size() * max_local_size, *b.shape[1:])
     if b.shape != expected_shape:
         raise ValueError(
             f"b must have padded sharded shape {expected_shape}; got {b.shape}. "
@@ -243,7 +262,7 @@ def _local_partition(
             f"{len(shards)}"
         )
     index = shards[0].index
-    if len(index) != 1 or not isinstance(index[0], slice):
+    if len(index) != b.ndim or not isinstance(index[0], slice):
         raise ValueError(f"b must have one contiguous local shard; got index {index!r}")
 
     row_slice = index[0]
@@ -304,7 +323,9 @@ def _validate_operand(
         sharding = getattr(value, "sharding", None)
         if not isinstance(sharding, NamedSharding):
             raise ValueError(f"{name} must use NamedSharding")
-        if sharding.mesh != mesh or sharding.spec != P(axis_name):
+        if sharding.mesh != mesh or sharding.spec != _row_partition_spec(
+            value.ndim, axis_name
+        ):
             raise ValueError(
                 f"{name} must use the same NamedSharding as the template RHS"
             )
@@ -426,10 +447,11 @@ def make_sharded_solver(
     Args:
         A_local: Local row partition with shape ``(n_local, n_global)`` and
             global column indices.
-        b: Global one-dimensional JAX array using
-            ``NamedSharding(mesh, PartitionSpec(axis_name))``. For unequal row
+        b: Global JAX array with shape ``(n_global,)`` or
+            ``(n_global, nrhs)`` using row ``NamedSharding``. For unequal row
             counts, construct it with :func:`make_sharded_vector`; physical
-            shards are padded to the largest local partition.
+            shards are padded to the largest local partition. Batched RHS
+            columns are replicated within each row shard.
         comm: MPI communicator whose rank order matches the JAX process order.
         mesh: One-dimensional JAX device mesh. If omitted, use the mesh from
             ``b.sharding``.
@@ -450,9 +472,10 @@ def make_sharded_solver(
         nonzero count. ``solver.local_matrix_gradient(gradient)`` converts its
         gradient back to this rank's unpadded BCSR structure, while
         ``solver.local_vector(value)`` removes vector padding. The solve returns
-        a global sharded solution and an info dictionary. Info values are global
-        arrays with one entry per rank; ``residual_history`` has shape
-        ``(nranks, max_iters + 1)``.
+        a global sharded solution and an info dictionary. For a vector RHS,
+        info values have one entry per rank. For a batched RHS they have shape
+        ``(nranks, nrhs)`` and ``residual_history`` has an additional trailing
+        ``max_iters + 1`` axis.
     """
     _require_shard_map()
     if not isinstance(b, jax.Array):
@@ -472,8 +495,10 @@ def make_sharded_solver(
     block_dim = int(block_dim)
     _validate_matrix(A_local, nglobal, partition_info, block_dim)
 
+    is_batched = b.ndim == 2
     local_rhs = b.addressable_shards[0].data[:n_local]
-    A_bcsr = to_bcsr_matrix(A_local, b=local_rhs, use_int64_indices=True)
+    matrix_probe_rhs = local_rhs[:, 0] if is_batched else local_rhs
+    A_bcsr = to_bcsr_matrix(A_local, b=matrix_probe_rhs, use_int64_indices=True)
     mpi_cache = cache_mpi_metadata(
         config or {},
         comm,
@@ -490,8 +515,9 @@ def make_sharded_solver(
     local_hardware_id = getattr(local_device, "local_hardware_id", local_device.id)
     mpi_cache["lrank"] = int(local_hardware_id)
 
-    row_spec = P(axis_name)
-    A_data_sharding = NamedSharding(mesh, row_spec)
+    rhs_spec = _row_partition_spec(b.ndim, axis_name)
+    A_data_spec = P(axis_name)
+    A_data_sharding = NamedSharding(mesh, A_data_spec)
     local_nnz = int(A_bcsr.data.shape[0])
     max_nnz = int(mpi_cache["max_nnz"])
     local_packed_data = np.zeros(max_nnz, dtype=np.asarray(A_bcsr.data).dtype)
@@ -526,14 +552,29 @@ def make_sharded_solver(
         transpose_cache["lrank"] = int(local_hardware_id)
         transpose_source_ids = jnp.asarray(source_ids, dtype=jnp.int32)
 
-    info_specs = {
-        "iterations": row_spec,
-        "residual": row_spec,
-        "status": row_spec,
-        "residual_history": P(axis_name, None),
-    }
+    if is_batched:
+        info_specs = {
+            "iterations": P(axis_name, None),
+            "residual": P(axis_name, None),
+            "status": P(axis_name, None),
+            "residual_history": P(axis_name, None, None),
+        }
+    else:
+        info_specs = {
+            "iterations": P(axis_name),
+            "residual": P(axis_name),
+            "status": P(axis_name),
+            "residual_history": P(axis_name, None),
+        }
 
     def pack_info(info: ShardedInfo) -> ShardedInfo:
+        if is_batched:
+            return {
+                "iterations": jnp.asarray(info["iterations"], dtype=jnp.int32)[None, :],
+                "residual": jnp.asarray(info["residual"])[None, :],
+                "status": jnp.asarray(info["status"], dtype=jnp.int32)[None, :],
+                "residual_history": jnp.asarray(info["residual_history"])[None, :, :],
+            }
         return {
             "iterations": jnp.asarray(info["iterations"], dtype=jnp.int32)[None],
             "residual": jnp.asarray(info["residual"])[None],
@@ -554,31 +595,70 @@ def make_sharded_solver(
         return with_cache(matrix, mpi=cache, is_symmetric=symmetric)
 
     def pad_local_vector(value: jax.Array) -> jax.Array:
-        return jnp.pad(value, (0, max_n_local - n_local))
+        padding = ((0, max_n_local - n_local),) + ((0, 0),) * (value.ndim - 1)
+        return jnp.pad(value, padding)
+
+    def solve_one_rhs(
+        A_dynamic: jsp.BCSR,
+        rhs_local: jax.Array,
+        x0_local: jax.Array | None = None,
+    ) -> tuple[jax.Array, ShardedInfo]:
+        return solve(
+            A_dynamic,
+            rhs_local[:n_local],
+            x0=None if x0_local is None else x0_local[:n_local],
+            block_dim=block_dim,
+            reuse_setup=reuse_setup,
+        )
+
+    def solve_local_rhs(
+        A_dynamic: jsp.BCSR,
+        rhs_local: jax.Array,
+        x0_local: jax.Array | None = None,
+    ) -> tuple[jax.Array, ShardedInfo]:
+        if not is_batched:
+            return solve_one_rhs(A_dynamic, rhs_local, x0_local)
+
+        solutions: list[jax.Array] = []
+        column_info: list[ShardedInfo] = []
+        for column in range(rhs_local.shape[1]):
+            rhs_column = rhs_local[:, column]
+            x0_column = None if x0_local is None else x0_local[:, column]
+            # XLA schedules each rank independently. Tie every column to the
+            # previous result so all ranks enter AmgX collectives in the same
+            # order.
+            if solutions:
+                if x0_column is None:
+                    rhs_column, _ = jax.lax.optimization_barrier(
+                        (rhs_column, solutions[-1])
+                    )
+                else:
+                    rhs_column, x0_column, _ = jax.lax.optimization_barrier(
+                        (rhs_column, x0_column, solutions[-1])
+                    )
+            solution, info = solve_one_rhs(
+                A_dynamic,
+                rhs_column,
+                x0_column,
+            )
+            solutions.append(solution)
+            column_info.append(info)
+        return jnp.stack(solutions, axis=1), jax.tree.map(
+            lambda *values: jnp.stack(values), *column_info
+        )
 
     def local_solve(
         A_data_local: jax.Array, rhs_local: jax.Array
     ) -> tuple[jax.Array, ShardedInfo]:
         A_dynamic = matrix_with_data(A_data_local, A_bcsr, mpi_cache, is_symmetric)
-        x_local, info = solve(
-            A_dynamic,
-            rhs_local[:n_local],
-            block_dim=block_dim,
-            reuse_setup=reuse_setup,
-        )
+        x_local, info = solve_local_rhs(A_dynamic, rhs_local)
         return pad_local_vector(x_local), pack_info(info)
 
     def local_solve_x0(
         A_data_local: jax.Array, rhs_local: jax.Array, x0_local: jax.Array
     ) -> tuple[jax.Array, ShardedInfo]:
         A_dynamic = matrix_with_data(A_data_local, A_bcsr, mpi_cache, is_symmetric)
-        x_local, info = solve(
-            A_dynamic,
-            rhs_local[:n_local],
-            x0=x0_local[:n_local],
-            block_dim=block_dim,
-            reuse_setup=reuse_setup,
-        )
+        x_local, info = solve_local_rhs(A_dynamic, rhs_local, x0_local)
         return pad_local_vector(x_local), pack_info(info)
 
     def local_adjoint(A_data_local: jax.Array, g_local: jax.Array) -> jax.Array:
@@ -595,12 +675,7 @@ def make_sharded_solver(
             A_adjoint = matrix_with_data(
                 transpose_data, A_transpose, transpose_cache, symmetric=False
             )
-        adjoint_local, _ = solve(
-            A_adjoint,
-            g_local[:n_local],
-            block_dim=block_dim,
-            reuse_setup=reuse_setup,
-        )
+        adjoint_local, _ = solve_one_rhs(A_adjoint, g_local)
         return adjoint_local
 
     halo_plan = mpi_cache["halo_plan"]
@@ -637,20 +712,12 @@ def make_sharded_solver(
             split_axis=0,
             concat_axis=0,
         )
-        x_ghost = jnp.zeros(max_n_ghost + 1, dtype=x_local.dtype)
+        trailing_shape = x_local.shape[1:]
+        x_ghost = jnp.zeros((max_n_ghost + 1, *trailing_shape), dtype=x_local.dtype)
         x_ghost = x_ghost.at[recv_ghost_slot_local.reshape(-1)].set(
-            recv_buffer.reshape(-1)
+            recv_buffer.reshape((-1, *trailing_shape))
         )
-        return jnp.concatenate([x_local, x_ghost[:max_n_ghost]])
-
-    def local_matrix_gradient(
-        A_data_local: jax.Array,
-        x_at_columns: jax.Array,
-        adjoint_local: jax.Array,
-    ) -> jax.Array:
-        del A_data_local
-        grad_values = -adjoint_local[row_indices] * x_at_columns
-        return jnp.where(valid_values, grad_values, 0)
+        return jnp.concatenate([x_local, x_ghost[:max_n_ghost]], axis=0)
 
     def local_gather_matrix_columns(x_local: jax.Array) -> jax.Array:
         x_combined = gather_solution_halo(x_local[:n_local], send_ids, recv_ghost_slot)
@@ -665,27 +732,24 @@ def make_sharded_solver(
             (A_data_local, g_local, x_at_columns)
         )
         adjoint_local = local_adjoint(A_data_ordered, g_ordered)
-        grad_A_data_local = local_matrix_gradient(
-            A_data_ordered,
-            x_at_columns,
-            adjoint_local,
-        )
+        grad_values = -adjoint_local[row_indices] * x_at_columns
+        grad_A_data_local = jnp.where(valid_values, grad_values, 0)
         return pad_local_vector(adjoint_local), grad_A_data_local
 
     mapped_solve = jax.jit(
         jax.shard_map(
             local_solve,
             mesh=mesh,
-            in_specs=(row_spec, row_spec),
-            out_specs=(row_spec, info_specs),
+            in_specs=(A_data_spec, rhs_spec),
+            out_specs=(rhs_spec, info_specs),
         )
     )
     mapped_solve_x0 = jax.jit(
         jax.shard_map(
             local_solve_x0,
             mesh=mesh,
-            in_specs=(row_spec, row_spec, row_spec),
-            out_specs=(row_spec, info_specs),
+            in_specs=(A_data_spec, rhs_spec, rhs_spec),
+            out_specs=(rhs_spec, info_specs),
         )
     )
 
@@ -697,24 +761,25 @@ def make_sharded_solver(
         jax.shard_map(
             local_cached_matrix_data,
             mesh=mesh,
-            in_specs=(row_spec,),
-            out_specs=row_spec,
+            in_specs=(rhs_spec,),
+            out_specs=A_data_spec,
         )
     )
+    scalar_spec = P(axis_name)
     mapped_gather_matrix_columns = jax.jit(
         jax.shard_map(
             local_gather_matrix_columns,
             mesh=mesh,
-            in_specs=(row_spec,),
-            out_specs=row_spec,
+            in_specs=(scalar_spec,),
+            out_specs=scalar_spec,
         )
     )
     mapped_backward = jax.jit(
         jax.shard_map(
             local_backward,
             mesh=mesh,
-            in_specs=(row_spec, row_spec, row_spec),
-            out_specs=(row_spec, row_spec),
+            in_specs=(A_data_spec, scalar_spec, scalar_spec),
+            out_specs=(scalar_spec, A_data_spec),
         )
     )
 
@@ -733,11 +798,38 @@ def make_sharded_solver(
         x, _ = result
         return result, (matrix_data, x)
 
+    def differentiated_solve_backward(
+        matrix_data: jax.Array, x: jax.Array, g_x: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        if not is_batched:
+            x_at_columns = mapped_gather_matrix_columns(x)
+            return mapped_backward(matrix_data, x_at_columns, g_x)
+
+        adjoint_columns: list[jax.Array] = []
+        matrix_gradients: list[jax.Array] = []
+        for column in range(x.shape[1]):
+            x_column = x[:, column]
+            g_column = g_x[:, column]
+            # Preserve the same collective ordering for adjoint solves and
+            # their preceding halo exchanges.
+            if adjoint_columns:
+                x_column, g_column, _ = jax.lax.optimization_barrier(
+                    (x_column, g_column, adjoint_columns[-1])
+                )
+            x_at_columns = mapped_gather_matrix_columns(x_column)
+            adjoint, matrix_gradient = mapped_backward(
+                matrix_data, x_at_columns, g_column
+            )
+            adjoint_columns.append(adjoint)
+            matrix_gradients.append(matrix_gradient)
+        return jnp.stack(adjoint_columns, axis=1), jnp.sum(
+            jnp.stack(matrix_gradients), axis=0
+        )
+
     def differentiated_solve_bwd(residuals, cotangents):
         matrix_data, x = residuals
         g_x, _ = cotangents
-        x_at_columns = mapped_gather_matrix_columns(x)
-        adjoint, grad_A_data = mapped_backward(matrix_data, x_at_columns, g_x)
+        adjoint, grad_A_data = differentiated_solve_backward(matrix_data, x, g_x)
         return grad_A_data, adjoint
 
     differentiated_solve.defvjp(differentiated_solve_fwd, differentiated_solve_bwd)
@@ -758,8 +850,7 @@ def make_sharded_solver(
     def differentiated_solve_x0_bwd(residuals, cotangents):
         matrix_data, x = residuals
         g_x, _ = cotangents
-        x_at_columns = mapped_gather_matrix_columns(x)
-        adjoint, grad_A_data = mapped_backward(matrix_data, x_at_columns, g_x)
+        adjoint, grad_A_data = differentiated_solve_backward(matrix_data, x, g_x)
         return grad_A_data, adjoint, jnp.zeros_like(adjoint)
 
     differentiated_solve_x0.defvjp(

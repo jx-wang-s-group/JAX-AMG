@@ -15,7 +15,7 @@ The initial interface supports:
 
 - one MPI process and one mesh-local GPU per rank;
 - a one-dimensional JAX mesh where device position `i` belongs to MPI rank `i`;
-- a row-sharded, one-dimensional right-hand side with equal or unequal local
+- row-sharded vector and batched right-hand sides with equal or unequal local
   row counts;
 - scalar and block matrices, provided every rank's true row count is divisible
   by `block_dim`;
@@ -85,6 +85,14 @@ JAX's equal physical shards are padded to the largest local partition; the
 solver ignores the padding and returns zeros there. Use `solver.local_vector(x)`
 to access this rank's unpadded result. The values in `info` are global arrays,
 with one entry per rank.
+
+For multiple right-hand sides sharing the same matrix, pass rank-local values
+with shape `(n_local, nrhs)` to `make_sharded_vector`. The returned array and
+solution use `PartitionSpec("rank", None)`. AmgX solves the columns sequentially
+in a fixed cross-rank order. Matrix gradients are summed over all RHS columns;
+RHS gradients retain the padded shape and sharding of the RHS. The scalar info
+values have shape `(nranks, nrhs)`, and residual history has shape
+`(nranks, nrhs, max_iters + 1)`.
 
 The solver exposes the packed, sharded CSR values as `solver.A_data`. Pass them
 to the solve when differentiating matrix values. Enter the mesh context for an

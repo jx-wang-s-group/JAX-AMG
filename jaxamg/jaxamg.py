@@ -122,9 +122,11 @@ def _amgx_solve_impl(
     if b.dtype == jnp.float64:
         call_name = _AMGX_CALL_NAME_DOUBLE
 
+    # AmgX mutates cached solver resources, so this call is not functionally pure.
     call = ffi.ffi_call(
         call_name,
         out_spec,
+        has_side_effect=True,
         input_layouts=[None, None, None, None, None],
         output_layouts=None,
         vmap_method="sequential",
@@ -179,9 +181,11 @@ def _amgx_solve_mpi_impl(
     if b.dtype == jnp.float64:
         call_name = _AMGX_CALL_NAME_MPI_DOUBLE
 
+    # MPI solves also perform collectives whose ordering must be preserved.
     call = ffi.ffi_call(
         call_name,
         out_spec,
+        has_side_effect=True,
         input_layouts=[None, None, None, None, None, None, None, None],
         output_layouts=None,
         vmap_method="sequential",
