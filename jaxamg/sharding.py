@@ -506,35 +506,15 @@ def make_sharded_solver(
     padded_col_to_combined[:local_nnz] = halo_plan.col_to_combined
     local_valid_values = np.arange(max_nnz) < local_nnz
 
-    plan_vector_sharding = NamedSharding(mesh, row_spec)
-    plan_matrix_sharding = NamedSharding(mesh, P(axis_name, None))
-
-    def global_plan_vector(local_value: np.ndarray) -> jax.Array:
-        return jax.make_array_from_process_local_data(
-            plan_vector_sharding,
-            local_value,
-            global_shape=(comm.Get_size() * local_value.shape[0],),
-        )
-
-    row_indices = global_plan_vector(padded_row_indices)
-    col_to_combined = global_plan_vector(padded_col_to_combined)
-    valid_values = global_plan_vector(local_valid_values)
-    send_ids = jax.make_array_from_process_local_data(
-        plan_matrix_sharding,
-        halo_plan.send_ids_2d,
-        global_shape=(
-            comm.Get_size() * halo_plan.send_ids_2d.shape[0],
-            halo_plan.send_ids_2d.shape[1],
-        ),
-    )
-    recv_ghost_slot = jax.make_array_from_process_local_data(
-        plan_matrix_sharding,
-        halo_plan.recv_ghost_slot_2d,
-        global_shape=(
-            comm.Get_size() * halo_plan.recv_ghost_slot_2d.shape[0],
-            halo_plan.recv_ghost_slot_2d.shape[1],
-        ),
-    )
+    # Keep rank-local halo metadata inside the shard_map bodies. Making these
+    # arrays global and closing over them in the custom VJP prevents an outer
+    # multi-process jax.jit from lowering because their remote shards are not
+    # addressable by the current process.
+    row_indices = jnp.asarray(padded_row_indices)
+    col_to_combined = jnp.asarray(padded_col_to_combined)
+    valid_values = jnp.asarray(local_valid_values)
+    send_ids = jnp.asarray(halo_plan.send_ids_2d)
+    recv_ghost_slot = jnp.asarray(halo_plan.recv_ghost_slot_2d)
 
     def gather_solution_halo(
         x_local: jax.Array,
@@ -558,30 +538,19 @@ def make_sharded_solver(
         A_data_local: jax.Array,
         x_at_columns: jax.Array,
         adjoint_local: jax.Array,
-        row_indices_local: jax.Array,
-        valid_values_local: jax.Array,
     ) -> jax.Array:
-        grad_values = -adjoint_local[row_indices_local] * x_at_columns
-        return jnp.where(valid_values_local, grad_values, 0)
+        del A_data_local
+        grad_values = -adjoint_local[row_indices] * x_at_columns
+        return jnp.where(valid_values, grad_values, 0)
 
-    def local_gather_matrix_columns(
-        x_local: jax.Array,
-        send_ids_local: jax.Array,
-        recv_ghost_slot_local: jax.Array,
-        col_to_combined_local: jax.Array,
-        valid_values_local: jax.Array,
-    ) -> jax.Array:
-        x_combined = gather_solution_halo(
-            x_local, send_ids_local, recv_ghost_slot_local
-        )
-        return jnp.where(valid_values_local, x_combined[col_to_combined_local], 0)
+    def local_gather_matrix_columns(x_local: jax.Array) -> jax.Array:
+        x_combined = gather_solution_halo(x_local, send_ids, recv_ghost_slot)
+        return jnp.where(valid_values, x_combined[col_to_combined], 0)
 
     def local_backward(
         A_data_local: jax.Array,
         x_at_columns: jax.Array,
         g_local: jax.Array,
-        row_indices_local: jax.Array,
-        valid_values_local: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         A_data_ordered, g_ordered, x_at_columns = jax.lax.optimization_barrier(
             (A_data_local, g_local, x_at_columns)
@@ -591,8 +560,6 @@ def make_sharded_solver(
             A_data_ordered,
             x_at_columns,
             adjoint_local,
-            row_indices_local,
-            valid_values_local,
         )
         return adjoint_local, grad_A_data_local
 
@@ -612,11 +579,24 @@ def make_sharded_solver(
             out_specs=(row_spec, info_specs),
         )
     )
+
+    def local_cached_matrix_data(rhs_local: jax.Array) -> jax.Array:
+        del rhs_local
+        return jnp.asarray(local_packed_data)
+
+    mapped_cached_matrix_data = jax.jit(
+        jax.shard_map(
+            local_cached_matrix_data,
+            mesh=mesh,
+            in_specs=(row_spec,),
+            out_specs=row_spec,
+        )
+    )
     mapped_gather_matrix_columns = jax.jit(
         jax.shard_map(
             local_gather_matrix_columns,
             mesh=mesh,
-            in_specs=(row_spec, row_spec, row_spec, row_spec, row_spec),
+            in_specs=(row_spec,),
             out_specs=row_spec,
         )
     )
@@ -624,7 +604,7 @@ def make_sharded_solver(
         jax.shard_map(
             local_backward,
             mesh=mesh,
-            in_specs=(row_spec, row_spec, row_spec, row_spec, row_spec),
+            in_specs=(row_spec, row_spec, row_spec),
             out_specs=(row_spec, row_spec),
         )
     )
@@ -647,12 +627,8 @@ def make_sharded_solver(
     def differentiated_solve_bwd(residuals, cotangents):
         matrix_data, x = residuals
         g_x, _ = cotangents
-        x_at_columns = mapped_gather_matrix_columns(
-            x, send_ids, recv_ghost_slot, col_to_combined, valid_values
-        )
-        adjoint, grad_A_data = mapped_backward(
-            matrix_data, x_at_columns, g_x, row_indices, valid_values
-        )
+        x_at_columns = mapped_gather_matrix_columns(x)
+        adjoint, grad_A_data = mapped_backward(matrix_data, x_at_columns, g_x)
         return grad_A_data, adjoint
 
     differentiated_solve.defvjp(differentiated_solve_fwd, differentiated_solve_bwd)
@@ -673,12 +649,8 @@ def make_sharded_solver(
     def differentiated_solve_x0_bwd(residuals, cotangents):
         matrix_data, x = residuals
         g_x, _ = cotangents
-        x_at_columns = mapped_gather_matrix_columns(
-            x, send_ids, recv_ghost_slot, col_to_combined, valid_values
-        )
-        adjoint, grad_A_data = mapped_backward(
-            matrix_data, x_at_columns, g_x, row_indices, valid_values
-        )
+        x_at_columns = mapped_gather_matrix_columns(x)
+        adjoint, grad_A_data = mapped_backward(matrix_data, x_at_columns, g_x)
         return grad_A_data, adjoint, jnp.zeros_like(adjoint)
 
     differentiated_solve_x0.defvjp(
@@ -692,7 +664,17 @@ def make_sharded_solver(
         A_data_override: jax.Array | None = None,
     ) -> tuple[jax.Array, ShardedInfo]:
         _validate_operand(rhs, b, mesh, axis_name, "b")
-        matrix_data = A_data if A_data_override is None else A_data_override
+        if A_data_override is None:
+            # A non-addressable global array cannot be captured as a constant
+            # by an outer multi-process jax.jit. Materialize the same cached
+            # rank-local values through shard_map while tracing instead.
+            matrix_data = (
+                mapped_cached_matrix_data(rhs)
+                if isinstance(rhs, jax.core.Tracer)
+                else A_data
+            )
+        else:
+            matrix_data = A_data_override
         _validate_operand(matrix_data, A_data, mesh, axis_name, "A_data")
         if x0 is None:
             return differentiated_solve(matrix_data, rhs)

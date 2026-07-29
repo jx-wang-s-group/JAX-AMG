@@ -126,12 +126,26 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
         x, _ = solver(rhs, A_data=matrix_data)
         return jnp.sum(x**2)
 
-    x, info = solver(b, A_data=A_data)
+    def cached_loss(rhs):
+        x, _ = solver(rhs)
+        return jnp.sum(x**2)
+
     with jax.set_mesh(mesh):
-        grad_A_data, grad_b = jax.grad(loss, argnums=(0, 1))(A_data, b)
+        compiled_solve = jax.jit(
+            lambda matrix_data, rhs: solver(rhs, A_data=matrix_data)
+        )
+        compiled_cached_solve = jax.jit(solver)
+        compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1)))
+        compiled_cached_grad = jax.jit(jax.grad(cached_loss))
+        x, info = compiled_solve(A_data, b)
+        x_cached, _ = compiled_cached_solve(b)
+        grad_A_data, grad_b = compiled_grad(A_data, b)
+        grad_b_cached = compiled_cached_grad(b)
     x.block_until_ready()
+    x_cached.block_until_ready()
     grad_A_data.block_until_ready()
     grad_b.block_until_ready()
+    grad_b_cached.block_until_ready()
 
     x_global = _gather_global(x, comm)
     grad_b_global = _gather_global(grad_b, comm)
@@ -142,6 +156,19 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
     adjoint_ref = np.linalg.solve(A_global.T, 2.0 * x_ref)
 
     np.testing.assert_allclose(x_global, x_ref, rtol=1e-5, atol=1e-6)
+    A_cached_global = 4.0 * np.eye(n_global, dtype=np.float64)
+    A_cached_global[1:, 0] = -0.25
+    x_cached_ref = np.linalg.solve(A_cached_global, b_global)
+    adjoint_cached_ref = np.linalg.solve(A_cached_global.T, 2.0 * x_cached_ref)
+    np.testing.assert_allclose(
+        _gather_global(x_cached, comm), x_cached_ref, rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        _gather_global(grad_b_cached, comm),
+        adjoint_cached_ref,
+        rtol=1e-5,
+        atol=1e-6,
+    )
     np.testing.assert_allclose(grad_b_global, adjoint_ref, rtol=1e-5, atol=1e-6)
 
     grad_A_local = solver.local_matrix_gradient(grad_A_data)
@@ -189,11 +216,13 @@ def test_sharded_symmetric_warm_start_gradients(sharding_context):
         x, _ = solver(rhs, guess, A_data=matrix_data)
         return jnp.sum(x**2)
 
-    x, info = solver(b, x0, A_data=solver.A_data)
     with jax.set_mesh(mesh):
-        grad_A_data, grad_b, grad_x0 = jax.grad(loss, argnums=(0, 1, 2))(
-            solver.A_data, b, x0
+        compiled_solve = jax.jit(
+            lambda matrix_data, rhs, guess: solver(rhs, guess, A_data=matrix_data)
         )
+        compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+        x, info = compiled_solve(solver.A_data, b, x0)
+        grad_A_data, grad_b, grad_x0 = compiled_grad(solver.A_data, b, x0)
     x.block_until_ready()
     grad_A_data.block_until_ready()
     grad_b.block_until_ready()

@@ -89,11 +89,18 @@ def loss(A_data, rhs):
     x, _ = solver(rhs, A_data=A_data)
     return jnp.sum(x**2)
 
+compiled_solver = jax.jit(solver)
+compiled_gradient = jax.jit(jax.grad(loss, argnums=(0, 1)))
+
 with jax.set_mesh(mesh):
-    grad_A_data, grad_b = jax.grad(loss, argnums=(0, 1))(solver.A_data, b)
+    x, info = compiled_solver(b)
+    grad_A_data, grad_b = compiled_gradient(solver.A_data, b)
 
 grad_A_local = solver.local_matrix_gradient(grad_A_data)
 ```
+
+The solver is compiled internally and also composes with an enclosing
+`jax.jit`, including JIT-compiled reverse-mode differentiation.
 
 For a one-off solve, `jaxamg.solve_sharded(...)` accepts the same setup arguments
 and immediately invokes the resulting solver. Prefer `make_sharded_solver` in
