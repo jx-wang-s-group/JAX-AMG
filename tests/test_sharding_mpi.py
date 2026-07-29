@@ -399,6 +399,40 @@ def test_sharded_uneven_row_partitions(sharding_context):
     assert _local_status(info) == 0
 
 
+def test_sharded_save_stats_file(sharding_context, tmp_path):
+    """A direct call with save_stats_file writes formatted stats on rank zero."""
+    comm, rank, nranks, mesh = sharding_context
+    n_local = 4
+    n_global = n_local * nranks
+    A_local, row_start, row_end = tridiagonal_matrix_distributed(
+        n_global, rank, nranks, diagonal_value=4.0, dtype=jnp.float32
+    )
+    b_local = np.ones(n_local, dtype=np.float32)
+    b = _global_vector(b_local, n_global, mesh)
+    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
+    solver = jaxamg.make_sharded_solver(
+        matrix,
+        b,
+        is_symmetric=True,
+        save_stats=True,
+        config={
+            "solver": "CG",
+            "preconditioner": {"solver": "AMG"},
+            "communicator": "MPI_DIRECT",
+            "max_iters": 100,
+            "tolerance": 1e-8,
+        },
+    )
+
+    stats_file = tmp_path / "sharded_stats.txt"
+    x, info = solver(b, save_stats_file=stats_file)
+    assert _local_status(info) == 0
+    if rank == 0:
+        content = stats_file.read_text()
+        assert "SOLVER ITERATIONS" in content
+    comm.Barrier()
+
+
 @pytest.mark.parametrize("is_symmetric", [True, False])
 def test_sharded_block_matrix_gradients(sharding_context, is_symmetric):
     """Cover block solves and VJPs with uneven block-aligned partitions."""

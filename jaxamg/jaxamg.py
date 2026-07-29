@@ -338,7 +338,7 @@ def _get_solver_primitive_mpi(
     comm_ptr: int,
     lrank: int,
     is_symmetric: bool = False,
-    transpose_nnz: int = 0,
+    transpose_nnz: int | None = None,
     n_ghost: int = 0,
     return_stats: bool = False,
     reuse_setup: bool = False,
@@ -447,7 +447,7 @@ def _get_solver_primitive_mpi(
         else:
             # Distributed transpose via mpi4jax (JIT-compatible, GPU-direct when
             # MPI4JAX_USE_CUDA_MPI=1).
-            if transpose_nnz == 0:
+            if transpose_nnz is None:
                 raise ValueError(
                     "a transpose plan is required for nonsymmetric MPI gradients"
                 )
@@ -520,6 +520,23 @@ def _format_and_save_stats(
     format_amgx_stats(stats_str, save_stats_file, rank=rank)
     if rank is None or rank == 0:
         print(f"Stats saved to {save_stats_file}")
+
+
+def _capture_and_save_stats(
+    save_stats_file: str | os.PathLike,
+    comm: "Comm | None" = None,
+    mpi_cache: dict | None = None,
+) -> None:
+    """Read the captured AmgX statistics from the extension and save them."""
+    try:
+        stats_str = _ensure_backend().get_stats_string()
+    except AttributeError:
+        # Older extension without stats capture; nothing to save.
+        stats_str = None
+    if stats_str is not None:
+        _format_and_save_stats(
+            stats_str, save_stats_file, comm=comm, mpi_cache=mpi_cache
+        )
 
 
 def solve(
@@ -681,7 +698,7 @@ def solve(
                 mpi_cache["comm_ptr"],
                 mpi_cache["lrank"],
                 is_symmetric=is_symmetric,
-                transpose_nnz=0 if transpose_plan is None else transpose_plan.nnz,
+                transpose_nnz=None if transpose_plan is None else transpose_plan.nnz,
                 n_ghost=halo_plan.n_ghost,
                 return_stats=1 if save_stats_file else 0,
                 reuse_setup=reuse_setup,
@@ -781,7 +798,7 @@ def solve(
                 comm_ptr,
                 lrank,
                 is_symmetric=is_symmetric,
-                transpose_nnz=0 if transpose_plan is None else transpose_plan.nnz,
+                transpose_nnz=None if transpose_plan is None else transpose_plan.nnz,
                 n_ghost=halo_plan.n_ghost,
                 return_stats=1 if save_stats_file else 0,
                 reuse_setup=reuse_setup,
@@ -838,15 +855,7 @@ def solve(
         "residual_history": info[3 : 4 + int(info[0])],
     }
     if save_stats_file is not None:
-        try:
-            stats_str = _ensure_backend().get_stats_string()
-        except AttributeError:
-            # Older extension without stats capture; nothing to save.
-            stats_str = None
-        if stats_str is not None:
-            _format_and_save_stats(
-                stats_str, save_stats_file, comm=comm, mpi_cache=mpi_cache
-            )
+        _capture_and_save_stats(save_stats_file, comm=comm, mpi_cache=mpi_cache)
     return x, info_dict
 
 

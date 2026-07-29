@@ -87,6 +87,17 @@ matrix and vectors retain their ordinary scalar CSR/vector representation;
 AmgX performs the internal block conversion. Unequal rank partitions remain
 supported as long as each partition ends on a block boundary.
 
+To save detailed AmgX solver statistics, create the solver with
+`save_stats=True` and pass a file path to a direct call:
+
+```python
+solver = jaxamg.make_sharded_solver(A, b, save_stats=True)
+x, info = solver(b, save_stats_file="stats_sharded.txt")
+```
+
+As with `jaxamg.solve`, rank 0 writes the formatted file. Statistics can only
+be saved from a direct call, not from inside `jax.jit` or another transform.
+
 `x` is a global array with the same row sharding as `b`. For unequal row counts,
 JAX's equal physical shards are padded to the largest local partition; the
 solver ignores the padding and returns zeros there. Use `solver.local_vector(x)`

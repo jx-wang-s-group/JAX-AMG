@@ -237,6 +237,27 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
 
     assert len(transpose_calls) == 1
 
+    # Stats: written after a direct call, rejected under a transform, and a
+    # solver created without save_stats warns about incomplete output.
+    stats_calls = []
+    monkeypatch.setattr(
+        sharding_module,
+        "_capture_and_save_stats",
+        lambda path, comm=None: stats_calls.append(path),
+    )
+    stats_solver = jaxamg.make_sharded_solver(matrix, b, save_stats=True)
+    stats_solver(b, save_stats_file="stats.txt")
+    assert stats_calls == ["stats.txt"]
+
+    with pytest.raises(ValueError, match="direct solver call"):
+        jax.jit(
+            lambda rhs: stats_solver(rhs, A_data=matrix.data, save_stats_file="s.txt")
+        ).lower(b)
+
+    with pytest.warns(UserWarning, match="save_stats=True"):
+        solver(b, save_stats_file="warned.txt")
+    assert stats_calls == ["stats.txt", "warned.txt"]
+
 
 def test_sharded_matrix_validates_partition(monkeypatch):
     mesh, b = _single_device_array(np.ones(4, dtype=np.float32))

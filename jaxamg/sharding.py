@@ -7,6 +7,8 @@ to use one MPI rank per GPU for the distributed solve.
 
 from __future__ import annotations
 
+import os
+import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -18,7 +20,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from .cache import _build_mpi_cache, with_cache
-from .jaxamg import solve
+from .jaxamg import _capture_and_save_stats, solve
 from .mpi_utils import (
     HaloPlan,
     _apply_transpose_plan,
@@ -114,7 +116,13 @@ class ShardedMatrix:
         self.local_shape = tuple(local_bcsr.shape)
 
     def local_matrix(self, data: jax.Array | None = None) -> jsp.BCSR:
-        """Return this rank's unpadded BCSR matrix for ``data`` or cached values."""
+        """Return this rank's unpadded BCSR matrix for ``data`` or cached values.
+
+        This is an eager helper: it reads the addressable shard of the packed
+        values (typically to unpack a computed matrix gradient), so it cannot
+        be applied to traced values inside ``jax.jit`` or another JAX
+        transformation.
+        """
         values = self.data if data is None else data
         _validate_operand(values, self.data, self.mesh, self.axis_name, "matrix data")
         local_values = values.addressable_shards[0].data[: self.local_nnz]
@@ -145,16 +153,25 @@ class ShardedSolve:
         x0: jax.Array | None = None,
         *,
         A_data: jax.Array | None = None,
+        save_stats_file: str | os.PathLike | None = None,
     ) -> tuple[jax.Array, ShardedInfo]:
         """Solve with cached values or an explicit differentiable ``A_data``.
 
         ``A_data`` may be omitted for a direct call but is required inside a
         JAX transformation so matrix values remain a dynamic operand.
+        ``save_stats_file`` writes formatted AmgX statistics after a direct
+        call (rank 0 writes the file); the solver must have been created with
+        ``save_stats=True`` for the file to contain solver statistics.
         """
-        return self._solve_fn(b, x0, A_data=A_data)
+        return self._solve_fn(b, x0, A_data=A_data, save_stats_file=save_stats_file)
 
     def local_vector(self, value: jax.Array) -> jax.Array:
-        """Return this rank's unpadded rows of a solver vector."""
+        """Return this rank's unpadded rows of a solver vector.
+
+        This is an eager helper: it reads the vector's addressable shard, so
+        it cannot be applied to traced values inside ``jax.jit`` or another
+        JAX transformation.
+        """
         return self._local_vector_fn(value)
 
 
@@ -553,6 +570,7 @@ def make_sharded_solver(
     is_symmetric: bool = False,
     block_dim: int = 1,
     reuse_setup: bool = False,
+    save_stats: bool = False,
 ) -> ShardedSolve:
     """Create a JIT-compiled solver for a globally sharded RHS.
 
@@ -581,9 +599,13 @@ def make_sharded_solver(
             this value.
         reuse_setup: Reuse the cached AmgX hierarchy across solves with the
             same sparsity pattern.
+        save_stats: Prepare the AmgX configuration with solver-statistics
+            output enabled so a later direct call with
+            ``solver(..., save_stats_file=...)`` produces a complete stats
+            file.
 
     Returns:
-        A callable ``solver(b, x0=None, *, A_data=None)``. Use
+        A callable ``solver(b, x0=None, *, A_data=None, save_stats_file=None)``. Use
         ``A.local_matrix(gradient)`` to convert packed matrix gradients to this
         rank's unpadded BCSR structure. ``solver.local_vector(value)`` removes
         vector padding. ``A_data`` may be omitted for a direct call but must be
@@ -678,6 +700,7 @@ def make_sharded_solver(
         max_nnz,
         nnz_out,
         halo_plan,
+        save_stats=save_stats,
         block_dim=block_dim,
         lrank=int(local_hardware_id),
         device=local_device,
@@ -736,6 +759,10 @@ def make_sharded_solver(
             x0=None if x0_local is None else x0_local[:n_local],
             block_dim=block_dim,
             reuse_setup=reuse_setup,
+            # Under the shard_map trace this only enables stats capture in the
+            # FFI call; solve() never writes a file for traced results. The
+            # actual file is written by ``sharded_solver`` after execution.
+            save_stats_file=os.devnull if save_stats else None,
         )
 
     def local_solve(
@@ -953,6 +980,7 @@ def make_sharded_solver(
         x0: jax.Array | None = None,
         *,
         A_data_override: jax.Array | None = None,
+        save_stats_file: str | os.PathLike | None = None,
     ) -> tuple[jax.Array, ShardedInfo]:
         _validate_operand(rhs, b, mesh, axis_name, "b")
         if A_data_override is None:
@@ -965,10 +993,34 @@ def make_sharded_solver(
         else:
             matrix_data = A_data_override
         _validate_operand(matrix_data, A_data, mesh, axis_name, "A_data")
+        if save_stats_file is not None:
+            if any(
+                isinstance(operand, jax.core.Tracer)
+                for operand in (matrix_data, rhs, x0)
+            ):
+                raise ValueError(
+                    "save_stats_file requires a direct solver call outside "
+                    "jax.jit, jax.grad, and other JAX transforms"
+                )
+            if not save_stats:
+                warnings.warn(
+                    "save_stats_file was passed, but the solver was created "
+                    "without stats output; the stats file will be missing "
+                    "solver statistics. Pass save_stats=True to "
+                    "make_sharded_solver().",
+                    stacklevel=4,
+                )
         if x0 is None:
-            return differentiated_solve(matrix_data, rhs)
-        _validate_operand(x0, b, mesh, axis_name, "x0")
-        return differentiated_solve_x0(matrix_data, rhs, x0)
+            result = differentiated_solve(matrix_data, rhs)
+        else:
+            _validate_operand(x0, b, mesh, axis_name, "x0")
+            result = differentiated_solve_x0(matrix_data, rhs, x0)
+        if save_stats_file is not None:
+            # Statistics are captured during execution, so wait for the solve
+            # to finish before reading them back from the extension.
+            result[0].block_until_ready()
+            _capture_and_save_stats(save_stats_file, comm=comm)
+        return result
 
     def unpad_local_vector(value: jax.Array) -> jax.Array:
         _validate_operand(value, b, mesh, axis_name, "solver vector")
@@ -979,8 +1031,11 @@ def make_sharded_solver(
         x0: jax.Array | None = None,
         *,
         A_data: jax.Array | None = None,
+        save_stats_file: str | os.PathLike | None = None,
     ) -> tuple[jax.Array, ShardedInfo]:
-        return sharded_solver(rhs, x0, A_data_override=A_data)
+        return sharded_solver(
+            rhs, x0, A_data_override=A_data, save_stats_file=save_stats_file
+        )
 
     return ShardedSolve(
         solve_fn,
