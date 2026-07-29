@@ -28,6 +28,7 @@ if _SHARDING_TEST:
 
 import jaxamg  # noqa: E402
 from jaxamg.matrices import tridiagonal_matrix_distributed  # noqa: E402
+from jaxamg.sharding import ShardedSolve  # noqa: E402
 
 pytestmark = [
     pytest.mark.mpi(min_size=2),
@@ -66,6 +67,13 @@ def _global_vector(
 
 def _gather_global(array: jax.Array, comm: MPI.Comm) -> np.ndarray:
     local = np.asarray(array.addressable_shards[0].data)
+    return np.concatenate(comm.allgather(local))
+
+
+def _gather_unpadded(
+    array: jax.Array, solver: ShardedSolve, comm: MPI.Comm
+) -> np.ndarray:
+    local = np.asarray(solver.local_vector(array))
     return np.concatenate(comm.allgather(local))
 
 
@@ -252,4 +260,84 @@ def test_sharded_symmetric_warm_start_gradients(sharding_context):
     np.testing.assert_allclose(
         np.asarray(grad_A_local.data), grad_A_ref, rtol=1e-5, atol=1e-6
     )
+    assert _local_status(info) == 0
+
+
+@pytest.mark.mpi(min_size=3)
+def test_sharded_uneven_row_partitions(sharding_context):
+    """Exercise padded vectors for a global size not divisible by rank count."""
+    comm, rank, nranks, mesh = sharding_context
+    n_global = 4 * nranks + 1
+    A_local, row_start, row_end = tridiagonal_matrix_distributed(
+        n_global, rank, nranks, diagonal_value=4.0, dtype=jnp.float32
+    )
+    n_local = row_end - row_start
+    b_local = np.arange(row_start + 1, row_end + 1, dtype=np.float32)
+    x0_local = np.full(n_local, 0.25, dtype=np.float32)
+    b = jaxamg.make_sharded_vector(b_local, comm=comm, mesh=mesh, global_size=n_global)
+    x0 = jaxamg.make_sharded_vector(
+        x0_local, comm=comm, mesh=mesh, global_size=n_global
+    )
+    solver = jaxamg.make_sharded_solver(
+        A_local,
+        b,
+        comm=comm,
+        mesh=mesh,
+        config={
+            "solver": "GMRES",
+            "preconditioner": {"solver": "JACOBI_L1"},
+            "communicator": "MPI_DIRECT",
+            "max_iters": 100,
+            "tolerance": 1e-8,
+        },
+    )
+    A_data = solver.A_data + jnp.asarray(0.05, solver.A_data.dtype)
+
+    def loss(matrix_data, rhs, guess):
+        x, _ = solver(rhs, guess, A_data=matrix_data)
+        return jnp.sum(x**2)
+
+    with jax.set_mesh(mesh):
+        compiled_solve = jax.jit(
+            lambda matrix_data, rhs, guess: solver(rhs, guess, A_data=matrix_data)
+        )
+        compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+        x, info = compiled_solve(A_data, b, x0)
+        grad_A_data, grad_b, grad_x0 = compiled_grad(A_data, b, x0)
+    x.block_until_ready()
+    grad_A_data.block_until_ready()
+    grad_b.block_until_ready()
+    grad_x0.block_until_ready()
+
+    x_global = _gather_unpadded(x, solver, comm)
+    grad_b_global = _gather_unpadded(grad_b, solver, comm)
+    grad_x0_global = _gather_unpadded(grad_x0, solver, comm)
+    A_global = 4.05 * np.eye(n_global, dtype=np.float64)
+    A_global += np.diag(-0.95 * np.ones(n_global - 1), 1)
+    A_global += np.diag(-0.95 * np.ones(n_global - 1), -1)
+    b_global = np.arange(1, n_global + 1, dtype=np.float64)
+    x_ref = np.linalg.solve(A_global, b_global)
+    adjoint_ref = np.linalg.solve(A_global.T, 2.0 * x_ref)
+
+    np.testing.assert_allclose(x_global, x_ref, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(grad_b_global, adjoint_ref, rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(grad_x0_global, 0)
+
+    grad_A_local = solver.local_matrix_gradient(grad_A_data)
+    row_indices = np.repeat(
+        np.arange(row_start, row_end), np.diff(np.asarray(A_local.indptr))
+    )
+    grad_A_ref = (
+        -adjoint_ref[row_indices] * x_ref[np.asarray(A_local.indices, dtype=np.int64)]
+    )
+    np.testing.assert_allclose(
+        np.asarray(grad_A_local.data), grad_A_ref, rtol=1e-5, atol=1e-6
+    )
+
+    x_physical = np.asarray(x.addressable_shards[0].data)
+    grad_b_physical = np.asarray(grad_b.addressable_shards[0].data)
+    np.testing.assert_array_equal(x_physical[n_local:], 0)
+    np.testing.assert_array_equal(grad_b_physical[n_local:], 0)
+    assert solver.global_size == n_global
+    assert solver.local_size == n_local
     assert _local_status(info) == 0

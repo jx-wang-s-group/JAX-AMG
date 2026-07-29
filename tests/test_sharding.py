@@ -23,7 +23,11 @@ def _single_device_array(values):
 def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     mesh, b = _single_device_array(np.arange(4, dtype=np.float32))
     A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
-    comm = SimpleNamespace(Get_size=lambda: 1, allgather=lambda value: [value])
+    comm = SimpleNamespace(
+        Get_size=lambda: 1,
+        Get_rank=lambda: 0,
+        allgather=lambda value: [value],
+    )
     halo_plan = SimpleNamespace(
         n_ghost=0,
         col_to_combined=np.arange(4, dtype=np.int32),
@@ -80,6 +84,9 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     solver = jaxamg.make_sharded_solver(A_local, b, comm=comm)
     x, info = solver(b)
     np.testing.assert_array_equal(np.asarray(x), np.asarray(b))
+    np.testing.assert_array_equal(np.asarray(solver.local_vector(x)), np.asarray(b))
+    assert solver.global_size == 4
+    assert solver.local_size == 4
     np.testing.assert_array_equal(np.asarray(info["iterations"]), [2])
     assert info["residual_history"].shape == (1, 3)
 
@@ -117,11 +124,16 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
 def test_sharded_solver_validates_matrix_partition(monkeypatch):
     mesh, b = _single_device_array(np.ones(4, dtype=np.float32))
     monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
+    comm = SimpleNamespace(
+        Get_size=lambda: 1,
+        Get_rank=lambda: 0,
+        allgather=lambda value: [value],
+    )
 
-    with pytest.raises(ValueError, match="expected shape"):
+    with pytest.raises(ValueError, match="row counts"):
         jaxamg.make_sharded_solver(
             SimpleNamespace(shape=(3, 4)),
             b,
-            comm=object(),
+            comm=comm,
             mesh=mesh,
         )

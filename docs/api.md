@@ -20,6 +20,12 @@ This page documents the public API of JAX-AMG.
 
 ## JAX Sharding
 
+::: jaxamg.make_sharded_vector
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
 ::: jaxamg.make_sharded_solver
     options:
         show_root_heading: true

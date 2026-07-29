@@ -15,14 +15,14 @@ The initial interface supports:
 
 - one MPI process and one mesh-local GPU per rank;
 - a one-dimensional JAX mesh where device position `i` belongs to MPI rank `i`;
-- a uniformly row-sharded, one-dimensional right-hand side;
+- a row-sharded, one-dimensional right-hand side with equal or unequal local
+  row counts;
 - symmetric and nonsymmetric distributed matrices; and
 - JIT compilation and reverse-mode differentiation with respect to matrix
   values and the RHS.
 
 The local CSR structure is fixed when the solver is created. Multiple local GPUs
-per MPI process and uneven row partitions are not supported yet. Use
-`jaxamg.solve(..., comm=...)` when you need those MPI features.
+per MPI process are not supported yet.
 
 ## Process and Device Setup
 
@@ -55,11 +55,11 @@ import numpy as np
 import jaxamg
 
 mesh = jax.make_mesh((nranks,), ("rank",))
-sharding = jax.NamedSharding(mesh, jax.P("rank"))
-b = jax.make_array_from_process_local_data(
-    sharding,
+b = jaxamg.make_sharded_vector(
     np.asarray(b_local),
-    global_shape=(n_global,),
+    comm=comm,
+    mesh=mesh,
+    global_size=n_global,
 )
 
 solver = jaxamg.make_sharded_solver(
@@ -73,10 +73,11 @@ solver = jaxamg.make_sharded_solver(
 x, info = solver(b)
 ```
 
-`x` is a global array with the same row sharding as `b`. The values in `info`
-are also global arrays, with one entry per rank. Use `addressable_shards` for
-process-local inspection or JAX multi-host utilities when you need a complete
-host copy.
+`x` is a global array with the same row sharding as `b`. For unequal row counts,
+JAX's equal physical shards are padded to the largest local partition; the
+solver ignores the padding and returns zeros there. Use `solver.local_vector(x)`
+to access this rank's unpadded result. The values in `info` are global arrays,
+with one entry per rank.
 
 The solver exposes the packed, sharded CSR values as `solver.A_data`. Pass them
 to the solve when differentiating matrix values. Enter the mesh context for an

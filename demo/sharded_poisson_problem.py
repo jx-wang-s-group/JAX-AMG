@@ -29,21 +29,18 @@ def main() -> None:
     grid_size = 32
     n_global = grid_size**2
 
-    # NamedSharding requires equal shard sizes
-    if n_global % nranks:
-        raise ValueError(
-            "JAX row sharding requires grid_size**2 to be divisible by the "
-            "number of ranks"
-        )
-
-    A_local, _, _ = poisson_matrix_distributed(grid_size, grid_size, rank, nranks)
-    b_local = np.ones(n_global // nranks)
+    A_local, row_start, row_end = poisson_matrix_distributed(
+        grid_size, grid_size, rank, nranks
+    )
+    b_local = np.ones(row_end - row_start)
 
     # Create a mesh and sharding for the distributed vector
     mesh = jax.make_mesh((nranks,), ("rank",))
-    sharding = jax.NamedSharding(mesh, jax.P("rank"))
-    b = jax.make_array_from_process_local_data(
-        sharding, b_local, global_shape=(n_global,)
+    b = jaxamg.make_sharded_vector(
+        b_local,
+        comm=comm,
+        mesh=mesh,
+        global_size=n_global,
     )
 
     # Create a sharded solver
@@ -72,10 +69,9 @@ def main() -> None:
     grad_b.block_until_ready()
     grad_A_local = solver.local_matrix_gradient(grad_A_data)
 
-    # Multi-host global arrays cannot be converted directly to NumPy. Inspect
-    # the one addressable shard owned by this process instead.
-    x_local = np.asarray(x.addressable_shards[0].data)
-    grad_b_local = np.asarray(grad_b.addressable_shards[0].data)
+    # Extract the unpadded portion owned by this process.
+    x_local = np.asarray(solver.local_vector(x))
+    grad_b_local = np.asarray(solver.local_vector(grad_b))
     local_status = np.asarray(info["status"].addressable_shards[0].data)
     print(
         f"rank {rank}: solution norm={np.linalg.norm(x_local):.6e}, "
