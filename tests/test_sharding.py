@@ -141,6 +141,9 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
             "max_nnz": max_nnz,
             "nnz_out": nnz_out,
             "halo_plan": plan,
+            "row_indices": kwargs.get("row_indices"),
+            # max_iters matching fake_solve's three residual-history entries.
+            "config_str": '{"solver": {"max_iters": 2}}',
         },
     )
     monkeypatch.setattr(

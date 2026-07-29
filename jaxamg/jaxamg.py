@@ -854,7 +854,9 @@ def solve(
         # initial residual); trim the NaN padding outside a trace.
         "residual_history": info[3 : 4 + int(info[0])],
     }
-    if save_stats_file is not None:
+    # os.devnull enables stats capture in the FFI without writing a file; the
+    # sharding interface uses it and reads the captured stats afterwards.
+    if save_stats_file is not None and str(save_stats_file) != os.devnull:
         _capture_and_save_stats(save_stats_file, comm=comm, mpi_cache=mpi_cache)
     return x, info_dict
 

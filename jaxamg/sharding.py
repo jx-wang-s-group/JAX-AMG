@@ -19,6 +19,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from . import config as amgx_config
 from .cache import _build_mpi_cache, with_cache
 from .jaxamg import _capture_and_save_stats, solve
 from .mpi_utils import (
@@ -90,14 +91,15 @@ class ShardedMatrix:
         row_counts: tuple[int, ...],
         max_local_size: int,
     ) -> None:
-        local_device = mesh.local_devices[0]
         local_nnz = int(local_bcsr.data.shape[0])
         # Keep only the rank-local CSR structure. The matrix values live solely
         # in the padded shard of ``data``; ``local_matrix`` re-slices them on
-        # demand, so no second per-rank value buffer is retained.
+        # demand, so no second per-rank value buffer is retained. These arrays
+        # stay uncommitted: an array pinned to this process's single device
+        # cannot be captured by a shard_map spanning the whole mesh.
         self._structure = _CSRStructure(
-            jax.device_put(local_bcsr.indices, local_device),
-            jax.device_put(local_bcsr.indptr, local_device),
+            jnp.asarray(local_bcsr.indices),
+            jnp.asarray(local_bcsr.indptr),
             tuple(local_bcsr.shape),
             local_nnz,
         )
@@ -408,15 +410,34 @@ def _local_partition(
     return (row_start, row_start + n_local), local_sizes, max_local_size
 
 
+def _local_matrix_shape(A_local: MatrixOrOperator) -> tuple[int, int]:
+    """Resolve the ``(n_local, n_global)`` shape of a local matrix or operator.
+
+    A matrix-free operator is a plain callable with no ``shape``, so its shape
+    comes from the coloring cache that the distributed solve needs anyway.
+    """
+    shape = getattr(A_local, "shape", None)
+    if shape is None and callable(A_local):
+        coloring = getattr(A_local, "_coloring_info", None)
+        if coloring is None:
+            raise ValueError(
+                "a callable A_local must carry cached coloring information so "
+                "its shape is known; attach it with jaxamg.with_cache(op, "
+                "coloring=jaxamg.cache_coloring(op, shape=(n_local, n_global)))"
+            )
+        shape = coloring[4]
+    if shape is None or len(shape) != 2:
+        raise ValueError("A_local must have a two-dimensional shape")
+    return int(shape[0]), int(shape[1])
+
+
 def _validate_matrix(
     A_local: MatrixOrOperator,
     nglobal: int,
     partition_info: tuple[int, int],
     block_dim: int,
 ) -> None:
-    shape = getattr(A_local, "shape", None)
-    if shape is None or len(shape) != 2:
-        raise ValueError("A_local must have a two-dimensional shape")
+    shape = _local_matrix_shape(A_local)
 
     n_local = partition_info[1] - partition_info[0]
     if tuple(shape) != (n_local, nglobal):
@@ -440,7 +461,7 @@ def _normalize_local_matrix(
 ) -> jsp.BCSR:
     """Normalize a validated local matrix partition."""
     n_local = partition_info[1] - partition_info[0]
-    nglobal = int(getattr(A_local, "shape")[1])
+    nglobal = _local_matrix_shape(A_local)[1]
     _validate_matrix(A_local, nglobal, partition_info, block_dim=1)
 
     local_rhs = b.addressable_shards[0].data[:n_local]
@@ -501,7 +522,10 @@ def make_sharded_matrix(
 
     Args:
         A_local: This process's CSR row partition with shape
-            ``(n_local, n_global)`` and global column indices.
+            ``(n_local, n_global)`` and global column indices. A matrix-free
+            operator is also accepted, provided it carries cached coloring
+            information (``jaxamg.with_cache(op, coloring=...)``) so its shape
+            and sparsity pattern are known; it is materialized once here.
         b: Global row-sharded RHS used to validate the matrix partition, mesh,
             and numerical dtype.
         comm: MPI communicator whose rank order matches the JAX process order.
@@ -521,11 +545,7 @@ def make_sharded_matrix(
     mesh = _resolve_mesh(b, mesh, axis_name)
     _validate_runtime(comm, mesh, axis_name)
 
-    matrix_shape = getattr(A_local, "shape", None)
-    if matrix_shape is None or len(matrix_shape) != 2:
-        raise ValueError("A_local must have a two-dimensional shape")
-    n_local = int(matrix_shape[0])
-    nglobal = int(matrix_shape[1])
+    n_local, nglobal = _local_matrix_shape(A_local)
     partition_info, row_counts, max_local_size = _local_partition(
         b, mesh, axis_name, comm, n_local, nglobal
     )
@@ -572,7 +592,15 @@ def make_sharded_solver(
     reuse_setup: bool = False,
     save_stats: bool = False,
 ) -> ShardedSolve:
-    """Create a JIT-compiled solver for a globally sharded RHS.
+    """Create a solver for a globally sharded RHS.
+
+    Whether the solve is compiled is entirely the caller's choice: this function
+    adds no ``jax.jit`` of its own. A caller that wraps its own function in
+    ``jax.jit`` gets the whole pipeline compiled as part of that single program
+    (through ``jax.shard_map``). A direct, untransformed call instead executes
+    the rank-local pipeline on this process's shard -- the same code path as
+    ``solve(..., comm=...)``, with mpi4jax for the gradient exchanges -- and
+    reassembles global arrays, so it matches the MPI interface's eager speed.
 
     This interface complements, rather than replaces, ``solve(..., comm=...)``.
     JAX manages the global input and output arrays through ``shard_map`` while
@@ -585,6 +613,17 @@ def make_sharded_solver(
     structure, and globally sharded packed values. Pass ``A.data`` through
     ``solver(..., A_data=A_data)`` to differentiate matrix values. Use
     ``jax.set_mesh(A.mesh)`` around outer transforms such as ``jax.grad``.
+
+    .. warning::
+        The rank-local CSR structure and communication plans are compiled into
+        each process's program as constants, so the processes compile programs
+        that differ. XLA's cross-process sharded autotuning assumes identical
+        programs and deadlocks during compilation when such a program also
+        contains an automatically partitioned collective -- which is what
+        ``jnp.sum(x)`` over a sharded solution inside ``jax.jit`` produces. Run
+        multi-process sharded jobs with ``XLA_FLAGS=--xla_gpu_shard_autotuning=false``
+        (set before JAX initializes its backend) to disable that autotuning;
+        see :doc:`sharding` for details.
 
     Args:
         A: Distributed matrix created with :func:`make_sharded_matrix`.
@@ -671,26 +710,25 @@ def make_sharded_solver(
         )
         with temp_enable_x64():
             transpose_structure = _CSRStructure(
-                jax.device_put(transpose_plan.indices, local_device),
-                jax.device_put(transpose_plan.indptr, local_device),
+                jnp.asarray(transpose_plan.indices),
+                jnp.asarray(transpose_plan.indptr),
                 (n_local, nglobal),
                 transpose_plan.nnz,
             )
         nnz_out = transpose_plan.nnz
         max_transpose_nnz = transpose_plan.max_nnz
-        # Explicit single-device placement keeps rank-local constants local even
-        # when solver construction happens inside a global ``jax.set_mesh``
-        # context.
-        transpose_local_source_ids = jax.device_put(
-            transpose_plan.local_source_ids, local_device
-        )
-        transpose_local_target_ids = jax.device_put(
-            transpose_plan.local_target_ids, local_device
-        )
-        transpose_send_ids = jax.device_put(transpose_plan.send_ids_2d, local_device)
-        transpose_recv_target_ids = jax.device_put(
-            transpose_plan.recv_target_ids_2d, local_device
-        )
+        # Uncommitted for the same reason as the CSR structure above.
+        transpose_local_source_ids = jnp.asarray(transpose_plan.local_source_ids)
+        transpose_local_target_ids = jnp.asarray(transpose_plan.local_target_ids)
+        transpose_send_ids = jnp.asarray(transpose_plan.send_ids_2d)
+        transpose_recv_target_ids = jnp.asarray(transpose_plan.recv_target_ids_2d)
+
+    # The local CSR row index of every nonzero, used by both the nested MPI
+    # solve and this module's matrix-gradient body.
+    local_row_indices = np.repeat(
+        np.arange(A_structure.shape[0], dtype=np.int32),
+        np.diff(indptr_host),
+    ).astype(np.int32)
 
     mpi_cache = _build_mpi_cache(
         config or {},
@@ -700,10 +738,12 @@ def make_sharded_solver(
         max_nnz,
         nnz_out,
         halo_plan,
+        row_indices=local_row_indices,
         save_stats=save_stats,
         block_dim=block_dim,
         lrank=int(local_hardware_id),
         device=local_device,
+        commit=False,
     )
     if not is_symmetric:
         # The MPI solve's primal does not consume halo operands, and sharding's
@@ -721,12 +761,24 @@ def make_sharded_solver(
         "residual_history": P(axis_name, None),
     }
 
+    res_history_len = amgx_config.outer_max_iters(mpi_cache["config_str"]) + 1
+
     def pack_info(info: ShardedInfo) -> ShardedInfo:
+        history = jnp.asarray(info["residual_history"])
+        if history.shape[0] < res_history_len:
+            # A direct (untraced) solve trims the history to its own iteration
+            # count, which differs per rank; restore the static traced length
+            # (NaN-padded) so every rank's info shard has one common shape.
+            history = jnp.pad(
+                history,
+                (0, res_history_len - history.shape[0]),
+                constant_values=jnp.nan,
+            )
         return {
             "iterations": jnp.asarray(info["iterations"], dtype=jnp.int32)[None],
             "residual": jnp.asarray(info["residual"])[None],
             "status": jnp.asarray(info["status"], dtype=jnp.int32)[None],
-            "residual_history": jnp.asarray(info["residual_history"])[None, :],
+            "residual_history": history[None, :],
         }
 
     def matrix_with_data(
@@ -759,9 +811,10 @@ def make_sharded_solver(
             x0=None if x0_local is None else x0_local[:n_local],
             block_dim=block_dim,
             reuse_setup=reuse_setup,
-            # Under the shard_map trace this only enables stats capture in the
-            # FFI call; solve() never writes a file for traced results. The
-            # actual file is written by ``sharded_solver`` after execution.
+            # os.devnull enables stats capture in the FFI call without writing
+            # anything: solve() never writes a file for traced results and
+            # skips the write for os.devnull on direct local calls. The actual
+            # file is written by ``sharded_solver`` after execution.
             save_stats_file=os.devnull if save_stats else None,
         )
 
@@ -779,32 +832,32 @@ def make_sharded_solver(
         x_local, info = solve_one_rhs(A_dynamic, rhs_local, x0_local)
         return pad_local_vector(x_local), pack_info(info)
 
-    def local_transpose_values(A_data_local: jax.Array) -> jax.Array:
-        assert transpose_structure is not None
-        assert max_transpose_nnz is not None
-        assert transpose_local_source_ids is not None
-        assert transpose_local_target_ids is not None
-        assert transpose_send_ids is not None
-        assert transpose_recv_target_ids is not None
+    def make_local_transpose_values(
+        exchange: Callable[[jax.Array], jax.Array],
+    ) -> Callable[[jax.Array], jax.Array]:
+        def local_transpose_values(A_data_local: jax.Array) -> jax.Array:
+            assert transpose_structure is not None
+            assert max_transpose_nnz is not None
+            assert transpose_local_source_ids is not None
+            assert transpose_local_target_ids is not None
+            assert transpose_send_ids is not None
+            assert transpose_recv_target_ids is not None
 
-        transpose_values = _apply_transpose_plan(
-            A_data_local,
-            transpose_local_source_ids,
-            transpose_local_target_ids,
-            transpose_send_ids,
-            transpose_recv_target_ids,
-            transpose_structure.nnz,
-            lambda values: jax.lax.all_to_all(
-                values,
-                axis_name,
-                split_axis=0,
-                concat_axis=0,
-            ),
-        )
-        return jnp.pad(
-            transpose_values,
-            (0, max_transpose_nnz - transpose_structure.nnz),
-        )
+            transpose_values = _apply_transpose_plan(
+                A_data_local,
+                transpose_local_source_ids,
+                transpose_local_target_ids,
+                transpose_send_ids,
+                transpose_recv_target_ids,
+                transpose_structure.nnz,
+                exchange,
+            )
+            return jnp.pad(
+                transpose_values,
+                (0, max_transpose_nnz - transpose_structure.nnz),
+            )
+
+        return local_transpose_values
 
     def local_adjoint(adjoint_data_local: jax.Array, g_local: jax.Array) -> jax.Array:
         if is_symmetric:
@@ -823,95 +876,140 @@ def make_sharded_solver(
 
     halo_plan = mpi_cache["halo_plan"]
     max_n_ghost = halo_plan.max_n_ghost
-    local_row_indices = np.repeat(
-        np.arange(A_structure.shape[0], dtype=np.int32),
-        np.diff(indptr_host),
-    )
     # Keep rank-local halo metadata inside the shard_map bodies. Making these
     # arrays global and closing over them in the custom VJP prevents an outer
     # multi-process jax.jit from lowering because their remote shards are not
     # addressable by the current process.
-    row_indices = jax.device_put(local_row_indices, local_device)
-    col_to_combined = jax.device_put(halo_plan.col_to_combined, local_device)
-    send_ids = jax.device_put(halo_plan.send_ids_2d, local_device)
-    recv_ghost_slot = jax.device_put(halo_plan.recv_ghost_slot_2d, local_device)
+    row_indices = mpi_cache["row_indices"]
+    col_to_combined = halo_plan.col_to_combined
+    send_ids = halo_plan.send_ids_2d
+    recv_ghost_slot = halo_plan.recv_ghost_slot_2d
 
     def gather_solution_halo(
         x_local: jax.Array,
-        send_ids_local: jax.Array,
-        recv_ghost_slot_local: jax.Array,
+        exchange: Callable[[jax.Array], jax.Array],
     ) -> jax.Array:
-        send_buffer = x_local[send_ids_local]
-        recv_buffer = jax.lax.all_to_all(
-            send_buffer,
-            axis_name,
-            split_axis=0,
-            concat_axis=0,
-        )
+        send_buffer = x_local[send_ids]
+        recv_buffer = exchange(send_buffer)
         x_ghost = jnp.zeros(max_n_ghost + 1, dtype=x_local.dtype)
-        x_ghost = x_ghost.at[recv_ghost_slot_local.reshape(-1)].set(
-            recv_buffer.reshape(-1)
-        )
+        x_ghost = x_ghost.at[recv_ghost_slot.reshape(-1)].set(recv_buffer.reshape(-1))
         return jnp.concatenate([x_local, x_ghost[:max_n_ghost]], axis=0)
 
-    def local_matrix_gradient(
-        x_local: jax.Array, adjoint_local: jax.Array
-    ) -> jax.Array:
-        # Order the JAX halo exchange after the preceding AmgX adjoint solve.
-        x_ordered, adjoint_ordered = jax.lax.optimization_barrier(
-            (x_local, adjoint_local)
-        )
-        x_combined = gather_solution_halo(
-            x_ordered[:n_local], send_ids, recv_ghost_slot
-        )
-        grad_values = (
-            -adjoint_ordered[:n_local][row_indices] * x_combined[col_to_combined]
-        )
-        return jnp.pad(grad_values, (0, max_nnz - local_nnz))
+    def make_local_matrix_gradient(
+        exchange: Callable[[jax.Array], jax.Array],
+    ) -> Callable[[jax.Array, jax.Array], jax.Array]:
+        def local_matrix_gradient(
+            x_local: jax.Array, adjoint_local: jax.Array
+        ) -> jax.Array:
+            # Order the halo exchange after the preceding AmgX adjoint solve.
+            x_ordered, adjoint_ordered = jax.lax.optimization_barrier(
+                (x_local, adjoint_local)
+            )
+            x_combined = gather_solution_halo(x_ordered[:n_local], exchange)
+            grad_values = (
+                -adjoint_ordered[:n_local][row_indices] * x_combined[col_to_combined]
+            )
+            return jnp.pad(grad_values, (0, max_nnz - local_nnz))
 
-    mapped_solve = jax.jit(
+        return local_matrix_gradient
+
+    nranks = comm.Get_size()
+
+    def lax_exchange(values: jax.Array) -> jax.Array:
+        return jax.lax.all_to_all(values, axis_name, split_axis=0, concat_axis=0)
+
+    if nranks == 1:
+        # A single-rank all-to-all is the identity.
+        def mpi_exchange(values: jax.Array) -> jax.Array:
+            return values
+
+    else:
+
+        def mpi_exchange(values: jax.Array) -> jax.Array:
+            import mpi4jax
+
+            return mpi4jax.alltoall(values, comm=comm)
+
+    # The mesh-local device as a one-device mesh. The eager local branch runs
+    # under it so that its single-device operations dispatch cleanly even when
+    # the caller sits inside jax.set_mesh over the whole multi-process mesh
+    # (as an eager outer transform requires for its own global-array ops).
+    local_mesh = jax.make_mesh((1,), (axis_name,), devices=[local_device])
+
+    def local_shard(value: jax.Array) -> jax.Array:
+        return value.addressable_shards[0].data
+
+    def assemble_global(local_value: jax.Array) -> jax.Array:
+        spec = P(axis_name, *(None,) * (local_value.ndim - 1))
+        return jax.make_array_from_single_device_arrays(
+            (nranks * local_value.shape[0], *local_value.shape[1:]),
+            NamedSharding(mesh, spec),
+            [jax.device_put(local_value, local_device)],
+        )
+
+    def dispatch(
+        local_fn: Callable[..., Any], shard_mapped: Callable[..., Any]
+    ) -> Callable[..., Any]:
+        # Concrete operands bypass shard_map: outside a trace, JAX executes a
+        # shard_map body primitive by primitive across the mesh, an order of
+        # magnitude slower than running the body on the local shard directly.
+        def invoke(*args: Any) -> Any:
+            if any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(args)):
+                return shard_mapped(*args)
+            with jax.set_mesh(local_mesh):
+                outputs = local_fn(*(local_shard(arg) for arg in args))
+                return jax.tree.map(assemble_global, outputs)
+
+        return invoke
+
+    mapped_solve = dispatch(
+        local_solve,
         jax.shard_map(
             local_solve,
             mesh=mesh,
             in_specs=(A_data_spec, rhs_spec),
             out_specs=(rhs_spec, info_specs),
-        )
+        ),
     )
-    mapped_solve_x0 = jax.jit(
+    mapped_solve_x0 = dispatch(
+        local_solve_x0,
         jax.shard_map(
             local_solve_x0,
             mesh=mesh,
             in_specs=(A_data_spec, rhs_spec, rhs_spec),
             out_specs=(rhs_spec, info_specs),
-        )
+        ),
     )
     scalar_spec = P(axis_name)
     if is_symmetric:
         mapped_transpose_values = None
     else:
-        mapped_transpose_values = jax.jit(
+        mapped_transpose_values = dispatch(
+            make_local_transpose_values(mpi_exchange),
             jax.shard_map(
-                local_transpose_values,
+                make_local_transpose_values(lax_exchange),
                 mesh=mesh,
                 in_specs=(A_data_spec,),
                 out_specs=A_data_spec,
-            )
+            ),
         )
-    mapped_adjoint = jax.jit(
+    mapped_adjoint = dispatch(
+        local_adjoint,
         jax.shard_map(
             local_adjoint,
             mesh=mesh,
             in_specs=(A_data_spec, scalar_spec),
             out_specs=scalar_spec,
-        )
+        ),
     )
-    mapped_matrix_gradient = jax.jit(
+    mapped_matrix_gradient = dispatch(
+        make_local_matrix_gradient(mpi_exchange),
         jax.shard_map(
-            local_matrix_gradient,
+            make_local_matrix_gradient(lax_exchange),
             mesh=mesh,
             in_specs=(scalar_spec, scalar_spec),
             out_specs=A_data_spec,
-        )
+        ),
     )
 
     def differentiated_solve_backward(
@@ -921,10 +1019,17 @@ def make_sharded_solver(
             adjoint_data = matrix_data
         else:
             assert mapped_transpose_values is not None
-            # Tie the transpose exchange to the completed forward solution so
-            # XLA cannot overlap it with AmgX's preceding MPI collectives.
-            matrix_data_ordered, _ = jax.lax.optimization_barrier((matrix_data, x))
-            adjoint_data = mapped_transpose_values(matrix_data_ordered)
+            if isinstance(matrix_data, jax.core.Tracer) or isinstance(
+                x, jax.core.Tracer
+            ):
+                # Within one compiled program, tie the transpose exchange to the
+                # completed forward solution so XLA cannot overlap it with
+                # AmgX's preceding MPI collectives. Concrete calls dispatch each
+                # step in program order, so they need no barrier -- and a
+                # barrier over a multi-process global array could not be
+                # dispatched eagerly anyway.
+                matrix_data, _ = jax.lax.optimization_barrier((matrix_data, x))
+            adjoint_data = mapped_transpose_values(matrix_data)
 
         adjoint = mapped_adjoint(adjoint_data, g_x)
         return adjoint, mapped_matrix_gradient(x, adjoint)
@@ -969,7 +1074,15 @@ def make_sharded_solver(
         matrix_data, x = residuals
         g_x, _ = cotangents
         adjoint, grad_A_data = differentiated_solve_backward(matrix_data, x, g_x)
-        return grad_A_data, adjoint, jnp.zeros_like(adjoint)
+        # The x0 cotangent is zero (the converged solution ignores the initial
+        # guess). Build it shard-locally for a concrete adjoint: zeros_like on
+        # a multi-process global array cannot be dispatched eagerly.
+        if isinstance(adjoint, jax.core.Tracer):
+            grad_x0 = jnp.zeros_like(adjoint)
+        else:
+            with jax.set_mesh(local_mesh):
+                grad_x0 = assemble_global(jnp.zeros_like(local_shard(adjoint)))
+        return grad_A_data, adjoint, grad_x0
 
     differentiated_solve_x0.defvjp(
         differentiated_solve_x0_fwd, differentiated_solve_x0_bwd

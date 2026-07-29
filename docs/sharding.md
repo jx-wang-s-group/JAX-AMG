@@ -46,6 +46,27 @@ Launchers recognized directly by JAX may also work with an argument-free
 `jax.distributed.initialize()`. The explicit `mpi4py` method also covers MPI
 environments whose launcher variables JAX does not recognize automatically.
 
+## Required XLA Flag for Multi-Process Jobs
+
+A sharded solver compiles each rank's local CSR structure and communication
+plans into that process's program as constants, so the processes compile
+programs that are not identical. XLA's cross-process *sharded autotuning*
+assumes identical programs and deadlocks during compilation as soon as such a
+program also contains an automatically partitioned collective. A loss that
+reduces the solution across ranks inside `jax.jit`, such as
+`jnp.sum(x**2)`, produces exactly that collective, so disable the autotuning:
+
+```bash
+XLA_FLAGS=--xla_gpu_shard_autotuning=false \
+  mpirun -n 2 python your_script.py
+```
+
+The flag is read when JAX initializes its backend, so set it in the environment
+or via `os.environ` before the first JAX device call. Without it, a compiled
+loss that reduces across ranks hangs in compilation rather than failing;
+uncompiled calls and `jax.jit(jax.grad(...))` are unaffected, because neither
+emits that collective.
+
 ## Sharded Solve
 
 Build a global RHS from each process's local partition, then create the solver
@@ -141,24 +162,44 @@ with jax.set_mesh(b.sharding.mesh):
 grad_A_local = A.local_matrix(grad_A_data)
 ```
 
-The solver is compiled internally, so a direct `solver(b)` call can use the
-matrix's cached values. Pass `A.data` explicitly under an enclosing JAX
-transformation, including RHS-only differentiation. This keeps the distributed
-matrix values as a dynamic operand instead of embedding a full local value
-buffer in the compiled executable.
+A direct `solver(b)` call can use the matrix's cached values. Pass `A.data`
+explicitly under an enclosing JAX transformation, including RHS-only
+differentiation. This keeps the distributed matrix values as a dynamic operand
+instead of embedding a full local value buffer in the compiled executable.
 
-Run the complete single-node example with:
+Compilation is entirely the caller's decision: the solver adds no `jax.jit` of
+its own. `jax.value_and_grad(loss)` runs the whole pipeline eagerly, while
+`jax.jit(jax.value_and_grad(loss))` compiles it as one program. Both give the
+same results and both match the MPI interface's speed: a compiled caller runs
+the solver's `shard_map` regions inside its one program, while an untransformed
+call executes the rank-local pipeline directly on this process's shard — the
+same code path as `solve(..., comm=...)` — and reassembles the global arrays,
+instead of paying for JAX's much slower per-primitive eager `shard_map`
+execution.
+
+Run the complete single-node examples with:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
 OMPI_MCA_opal_cuda_support=true \
 mpirun -n 2 python demo/sharded_poisson_problem.py
+
+CUDA_VISIBLE_DEVICES=0,1 \
+OMPI_MCA_opal_cuda_support=true \
+mpirun -n 2 python demo/sharded_poisson_operator_optimization.py
 ```
 
-`MPI4JAX_USE_CUDA_MPI` remains relevant to the existing MPI autodiff path but
-is not required for the sharding path. Matrix gradients use a sparse JAX
-all-to-all halo exchange. For a nonsymmetric matrix, the transpose structure
-and a sparse value-exchange plan are cached during solver creation. Only
-off-rank transpose values are exchanged, once per backward pass, rather than
-replicating all matrix values on every GPU. The forward and adjoint solves are
-both performed by AmgX.
+The second example recovers an operator parameter by gradient descent, the
+sharded counterpart of `demo/mpi_poisson_operator_optimization.py`. Because the
+loss is a reduction over global arrays, JAX emits the cross-rank collectives and
+the gradient it returns is already the complete global gradient, so no
+`comm.allreduce` of losses or gradients is needed.
+
+Matrix gradients use a sparse all-to-all halo exchange: `jax.lax.all_to_all`
+inside a compiled program, and the MPI interface's mpi4jax exchange for
+untransformed calls — so `MPI4JAX_USE_CUDA_MPI` applies to eager sharded
+gradients exactly as it does to the MPI autodiff path. For a nonsymmetric
+matrix, the transpose structure and a sparse value-exchange plan are cached
+during solver creation. Only off-rank transpose values are exchanged, once per
+backward pass, rather than replicating all matrix values on every GPU. The
+forward and adjoint solves are both performed by AmgX.

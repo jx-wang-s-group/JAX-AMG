@@ -33,8 +33,16 @@ def _build_mpi_cache(
     block_dim: int = 1,
     lrank: int | None = None,
     device: jax.Device | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
-    """Assemble MPI metadata after structure-dependent collectives are done."""
+    """Assemble MPI metadata after structure-dependent collectives are done.
+
+    ``commit`` controls device placement of the routing arrays. The default pins
+    them to one device, which is what repeated eager MPI solves want. A caller
+    that captures them in a ``jax.shard_map`` spanning the whole mesh must pass
+    ``commit=False``: an array committed to a single device cannot be captured
+    there, while an uncommitted one can.
+    """
     from .mpi_utils import register_comm
 
     rank = comm.Get_rank()
@@ -48,29 +56,27 @@ def _build_mpi_cache(
     if device is None:
         local_devices = jax.local_devices()
         device = local_devices[lrank % len(local_devices)]
+
+    def place(array):
+        return jax.device_put(array, device) if commit else jnp.asarray(array)
+
     halo_plan = halo_plan._replace(
-        col_to_combined=jax.device_put(halo_plan.col_to_combined, device),
-        send_ids_2d=jax.device_put(halo_plan.send_ids_2d, device),
-        recv_ghost_slot_2d=jax.device_put(halo_plan.recv_ghost_slot_2d, device),
+        col_to_combined=place(halo_plan.col_to_combined),
+        send_ids_2d=place(halo_plan.send_ids_2d),
+        recv_ghost_slot_2d=place(halo_plan.recv_ghost_slot_2d),
     )
     if transpose_plan is not None:
         with temp_enable_x64():
             transpose_plan = transpose_plan._replace(
-                indices=jax.device_put(transpose_plan.indices, device),
-                indptr=jax.device_put(transpose_plan.indptr, device),
-                local_source_ids=jax.device_put(
-                    transpose_plan.local_source_ids, device
-                ),
-                local_target_ids=jax.device_put(
-                    transpose_plan.local_target_ids, device
-                ),
-                send_ids_2d=jax.device_put(transpose_plan.send_ids_2d, device),
-                recv_target_ids_2d=jax.device_put(
-                    transpose_plan.recv_target_ids_2d, device
-                ),
+                indices=place(transpose_plan.indices),
+                indptr=place(transpose_plan.indptr),
+                local_source_ids=place(transpose_plan.local_source_ids),
+                local_target_ids=place(transpose_plan.local_target_ids),
+                send_ids_2d=place(transpose_plan.send_ids_2d),
+                recv_target_ids_2d=place(transpose_plan.recv_target_ids_2d),
             )
     if row_indices is not None:
-        row_indices = jax.device_put(row_indices, device)
+        row_indices = place(row_indices)
 
     config_str = amgx_config.prepare_config(
         config, save_stats=save_stats, mpi=True, block_dim=block_dim
