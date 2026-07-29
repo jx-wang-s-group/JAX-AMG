@@ -107,8 +107,11 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
 
     monkeypatch.setattr(sharding_module, "solve", fake_solve)
 
+    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm)
     # Omit mesh to exercise inference from b.sharding.
-    solver = jaxamg.make_sharded_solver(A_local, b, comm=comm)
+    solver = jaxamg.make_sharded_solver(matrix, b, comm=comm)
+    assert solver.matrix is matrix
+    assert solver.A_data is matrix.data
     x, info = solver(b)
     np.testing.assert_array_equal(np.asarray(x), np.asarray(b))
     np.testing.assert_array_equal(np.asarray(solver.local_vector(x)), np.asarray(b))
@@ -137,8 +140,12 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
         )(b, b)
     np.testing.assert_array_equal(np.asarray(grad_b), 2 * np.asarray(b))
     grad_A_local = solver.local_matrix_gradient(grad_A_data)
+    grad_A_from_matrix = matrix.local_matrix(grad_A_data)
     np.testing.assert_array_equal(
         np.asarray(grad_A_local.data), -2 * np.asarray(b) ** 2
+    )
+    np.testing.assert_array_equal(
+        np.asarray(grad_A_from_matrix.data), np.asarray(grad_A_local.data)
     )
     np.testing.assert_array_equal(np.asarray(grad_b_warm), 4 * np.asarray(b))
     np.testing.assert_array_equal(np.asarray(grad_x0), np.zeros_like(np.asarray(b)))

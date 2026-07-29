@@ -151,8 +151,9 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
     )
     b_local = np.arange(row_start + 1, row_start + n_local + 1, dtype=np.float32)
     b = _global_vector(b_local, n_global, mesh)
+    matrix = jaxamg.make_sharded_matrix(A_local, b)
     solver = jaxamg.make_sharded_solver(
-        A_local,
+        matrix,
         b,
         config={
             "solver": "GMRES",
@@ -165,7 +166,8 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
 
     # Change every real matrix value after setup. Padding is also changed but
     # must remain disconnected from both the solve and its gradient.
-    A_data = solver.A_data + jnp.asarray(0.1, dtype=solver.A_data.dtype)
+    assert solver.A_data is matrix.data
+    A_data = matrix.data + jnp.asarray(0.1, dtype=matrix.data.dtype)
 
     def loss(matrix_data, rhs):
         x, _ = solver(rhs, A_data=matrix_data)
@@ -216,7 +218,7 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
     )
     np.testing.assert_allclose(grad_b_global, adjoint_ref, rtol=1e-5, atol=1e-6)
 
-    grad_A_local = solver.local_matrix_gradient(grad_A_data)
+    grad_A_local = matrix.local_matrix(grad_A_data)
     local_rows = np.repeat(
         np.arange(row_start, row_start + n_local), np.diff(np.asarray(indptr))
     )

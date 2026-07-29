@@ -61,8 +61,9 @@ b = jaxamg.make_sharded_vector(
     global_size=n_global,
 )
 
+A = jaxamg.make_sharded_matrix(A_local, b)
 solver = jaxamg.make_sharded_solver(
-    A_local,
+    A,
     b,
     config={"solver": "GMRES", "communicator": "MPI_DIRECT"},
 )
@@ -72,7 +73,12 @@ x, info = solver(b)
 
 The sharding helpers use `MPI.COMM_WORLD` and a one-dimensional mesh over all
 JAX devices by default. Pass `comm=` or `mesh=` explicitly to override them;
-the solver otherwise infers the mesh from `b`.
+the matrix and solver otherwise infer the mesh from `b`.
+
+`A` stores the CSR structure only on its owning rank and exposes its padded,
+globally sharded values as `A.data`; it does not replicate the global matrix.
+The original local-matrix form remains supported by
+`make_sharded_solver(A_local, b)` as a convenience.
 
 For a coupled block system, pass `block_dim=k` to `make_sharded_solver`. The
 matrix and vectors retain their ordinary scalar CSR/vector representation;
@@ -93,9 +99,9 @@ RHS gradients retain the padded shape and sharding of the RHS. The scalar info
 values have shape `(nranks, nrhs)`, and residual history has shape
 `(nranks, nrhs, max_iters + 1)`.
 
-The solver exposes the packed, sharded CSR values as `solver.A_data`. Pass them
-to the solve when differentiating matrix values. Enter the mesh context for an
-outer transformation:
+Pass `A.data` to the solve when differentiating matrix values. The
+backward-compatible `solver.A_data` attribute aliases the same array. Enter the
+mesh context for an outer transformation:
 
 ```python
 import jax.numpy as jnp
@@ -107,11 +113,11 @@ def loss(A_data, rhs):
 compiled_solver = jax.jit(solver)
 compiled_gradient = jax.jit(jax.grad(loss, argnums=(0, 1)))
 
-with jax.set_mesh(mesh):
+with jax.set_mesh(b.sharding.mesh):
     x, info = compiled_solver(b)
-    grad_A_data, grad_b = compiled_gradient(solver.A_data, b)
+    grad_A_data, grad_b = compiled_gradient(A.data, b)
 
-grad_A_local = solver.local_matrix_gradient(grad_A_data)
+grad_A_local = A.local_matrix(grad_A_data)
 ```
 
 The solver is compiled internally and also composes with an enclosing

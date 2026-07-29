@@ -39,10 +39,11 @@ def main() -> None:
         b_local,
         global_size=n_global,
     )
+    A = jaxamg.make_sharded_matrix(A_local, b)
 
     # Create a sharded solver
     solver = jaxamg.make_sharded_solver(
-        A_local,
+        A,
         b,
         config={
             "solver": "CG",
@@ -59,10 +60,10 @@ def main() -> None:
         return jnp.sum(solution**2)
 
     with jax.set_mesh(b.sharding.mesh):
-        grad_A_data, grad_b = jax.grad(loss, argnums=(0, 1))(solver.A_data, b)
+        grad_A_data, grad_b = jax.grad(loss, argnums=(0, 1))(A.data, b)
     grad_A_data.block_until_ready()
     grad_b.block_until_ready()
-    grad_A_local = solver.local_matrix_gradient(grad_A_data)
+    grad_A_local = A.local_matrix(grad_A_data)
 
     # Extract the unpadded portion owned by this process.
     x_local = np.asarray(solver.local_vector(x))

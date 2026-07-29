@@ -11,7 +11,13 @@ from .jaxamg import (
     solve,
 )
 from .preconditioners import make_lineax_preconditioner, make_preconditioner
-from .sharding import make_sharded_solver, make_sharded_vector, solve_sharded
+from .sharding import (
+    ShardedMatrix,
+    make_sharded_matrix,
+    make_sharded_solver,
+    make_sharded_vector,
+    solve_sharded,
+)
 from .sparsity import cache_coloring
 
 __all__ = [
@@ -20,6 +26,8 @@ __all__ = [
     "with_cache",
     "cache_coloring",
     "cache_mpi_metadata",
+    "ShardedMatrix",
+    "make_sharded_matrix",
     "make_sharded_solver",
     "make_sharded_vector",
     "solve_sharded",
