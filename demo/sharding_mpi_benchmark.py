@@ -1,10 +1,11 @@
-"""Benchmark the MPI and JAX-sharding distributed interfaces.
+"""Benchmark MPI and JAX sharding on a realistic distributed PDE solve.
 
-The benchmark uses the same nonsymmetric tridiagonal system, AmgX
-configuration, MPI communicator, and one-GPU-per-rank placement for both
-interfaces. It separates JAX compilation, the first execution after clearing
-the AmgX resource cache, and steady-state execution for a forward solve,
-``dL/db``, and ``dL/dA``, where ``L = 0.5 * ||x||**2``.
+Both interfaces solve the same nonsymmetric 3D seven-point
+convection-diffusion system with an AMG-preconditioned Krylov method. Timings
+include AmgX setup/resetup rather than reusing a previously built hierarchy.
+Compilation, the first execution after clearing the AmgX resource cache, and
+steady-state execution are reported separately for a forward solve, ``dL/db``,
+and ``dL/dA``, where ``L = 0.5 * ||x||**2``.
 
 Single-node usage:
     CUDA_VISIBLE_DEVICES=0,1 \
@@ -36,7 +37,7 @@ import jax.experimental.sparse as jsp
 import jax.numpy as jnp
 
 import jaxamg
-from jaxamg.matrices import tridiagonal_matrix_distributed
+from jaxamg.mpi_utils import get_partition_info
 from jaxamg.sharding import ShardedSolve
 
 
@@ -96,34 +97,67 @@ def _benchmark_callable(
     return Timing(compile_ms, first_ms, steady_ms, first_output)
 
 
-def _nonsymmetric_tridiagonal(n_global: int) -> tuple[jsp.BCSR, int, int]:
-    template, row_start, row_end = tridiagonal_matrix_distributed(
-        n_global,
-        rank,
-        nranks,
-        diagonal_value=4.0,
-        dtype=jnp.float32,
+def _convection_diffusion_3d(grid_size: int) -> tuple[jsp.BCSR, int, int]:
+    """Build this rank's CSR rows without materializing the global matrix."""
+    n_global = grid_size**3
+    row_start, row_end, n_local = get_partition_info(n_global, rank, nranks)
+    global_rows = np.arange(row_start, row_end, dtype=np.int64)
+    plane_size = grid_size**2
+    x_coordinate = global_rows // plane_size
+    remainder = global_rows % plane_size
+    y_coordinate = remainder // grid_size
+    z_coordinate = remainder % grid_size
+
+    has_x_minus = x_coordinate > 0
+    has_x_plus = x_coordinate + 1 < grid_size
+    has_y_minus = y_coordinate > 0
+    has_y_plus = y_coordinate + 1 < grid_size
+    has_z_minus = z_coordinate > 0
+    has_z_plus = z_coordinate + 1 < grid_size
+    row_counts = (
+        1
+        + has_x_minus
+        + has_x_plus
+        + has_y_minus
+        + has_y_plus
+        + has_z_minus
+        + has_z_plus
     )
-    global_rows = np.repeat(
-        np.arange(row_start, row_end), np.diff(np.asarray(template.indptr))
-    )
-    columns = np.asarray(template.indices)
-    values = np.where(
-        columns < global_rows,
-        -0.75,
-        np.where(columns > global_rows, -1.25, 4.0),
-    ).astype(np.float32)
+    indptr = np.empty(n_local + 1, dtype=np.int64)
+    indptr[0] = 0
+    np.cumsum(row_counts, out=indptr[1:])
+    indices = np.empty(indptr[-1], dtype=np.int64)
+    values = np.empty(indptr[-1], dtype=np.float32)
+    cursor = indptr[:-1].copy()
+
+    def insert(mask: np.ndarray, offset: int, coefficient: float) -> None:
+        positions = cursor[mask]
+        indices[positions] = global_rows[mask] + offset
+        values[positions] = coefficient
+        cursor[mask] += 1
+
+    # Increasing column order within each row. The unequal x-direction
+    # coefficients add a modest convection term to the diffusion stencil.
+    insert(has_x_minus, -plane_size, -1.15)
+    insert(has_y_minus, -grid_size, -1.0)
+    insert(has_z_minus, -1, -1.0)
+    insert(np.ones(n_local, dtype=bool), 0, 6.25)
+    insert(has_z_plus, 1, -1.0)
+    insert(has_y_plus, grid_size, -1.0)
+    insert(has_x_plus, plane_size, -0.85)
+
     matrix = jsp.BCSR(
-        (jnp.asarray(values), template.indices, template.indptr),
-        shape=template.shape,
+        (jnp.asarray(values), jnp.asarray(indices), jnp.asarray(indptr)),
+        shape=(n_local, n_global),
     )
     return matrix, row_start, row_end
 
 
 def _initialize_amgx(config: dict[str, Any]) -> None:
     """Remove one-time AmgX initialization from the first measured interface."""
-    warmup_size = 4 * nranks
-    matrix, row_start, row_end = _nonsymmetric_tridiagonal(warmup_size)
+    warmup_grid_size = 4
+    warmup_size = warmup_grid_size**3
+    matrix, row_start, row_end = _convection_diffusion_3d(warmup_grid_size)
     cache = jaxamg.cache_mpi_metadata(
         config,
         comm,
@@ -134,7 +168,7 @@ def _initialize_amgx(config: dict[str, Any]) -> None:
     )
     matrix = jaxamg.with_cache(matrix, mpi=cache, is_symmetric=False)
     rhs = jnp.ones(row_end - row_start, dtype=matrix.data.dtype)
-    jaxamg.solve(matrix, rhs, reuse_setup=True)[0].block_until_ready()
+    jaxamg.solve(matrix, rhs)[0].block_until_ready()
     comm.Barrier()
     jaxamg.clear_solver_cache()
     comm.Barrier()
@@ -149,7 +183,7 @@ def _mpi_functions(
             (matrix_data, A_local.indices, A_local.indptr), shape=A_local.shape
         )
         matrix = jaxamg.with_cache(matrix, mpi=mpi_cache, is_symmetric=False)
-        return jaxamg.solve(matrix, rhs, reuse_setup=True)[0]
+        return jaxamg.solve(matrix, rhs)[0]
 
     def rhs_gradient(matrix_data, rhs):
         x, pullback = jax.vjp(lambda value: solution(matrix_data, value), rhs)
@@ -235,18 +269,16 @@ def _print_results(
 
 
 def main() -> None:
-    n_global = 1000000
-    n_runs = 5
-
-    if n_global % nranks:
-        raise ValueError("n_global must be divisible by the number of MPI ranks")
+    grid_size = 128
+    n_global = grid_size**3
+    n_runs = 3
 
     jax.config.update("jax_logging_level", "ERROR")
     config = {
         "solver": "PBICGSTAB",
-        "preconditioner": {"solver": "JACOBI_L1"},
+        "preconditioner": {"solver": "AMG"},
         "communicator": "MPI_DIRECT",
-        "max_iters": 100,
+        "max_iters": 200,
         "tolerance": 1e-6,
         "monitor_residual": 0,
         "obtain_timings": 0,
@@ -254,7 +286,7 @@ def main() -> None:
     }
     _initialize_amgx(config)
 
-    A_local, row_start, row_end = _nonsymmetric_tridiagonal(n_global)
+    A_local, row_start, row_end = _convection_diffusion_3d(grid_size)
     b_local_np = (
         1.0 + 0.1 * np.sin(np.arange(row_start, row_end, dtype=np.float32) * 0.001)
     ).astype(np.float32)
@@ -273,9 +305,8 @@ def main() -> None:
     )
 
     mesh = jax.make_mesh((nranks,), ("rank",))
-    sharding = jax.NamedSharding(mesh, jax.P("rank"))
-    b_sharded = jax.make_array_from_process_local_data(
-        sharding, b_local_np, global_shape=(n_global,)
+    b_sharded = jaxamg.make_sharded_vector(
+        b_local, comm=comm, mesh=mesh, global_size=n_global
     )
     sharded_matrix = jaxamg.make_sharded_matrix(
         A_local, b_sharded, comm=comm, mesh=mesh
@@ -285,13 +316,15 @@ def main() -> None:
         b_sharded,
         config=config,
         is_symmetric=False,
-        reuse_setup=True,
     )
 
+    global_nnz = comm.allreduce(len(A_local.data), op=MPI.SUM)
     if rank == 0:
         print(
-            f"Nonsymmetric tridiagonal system: n={n_global:,}, "
-            f"ranks/GPUs={nranks}, steady runs={n_runs}\n"
+            f"Nonsymmetric 3D convection-diffusion: grid={grid_size}^3, "
+            f"n={n_global:,}, nnz={global_nnz:,}\n"
+            f"AMG-preconditioned PBICGSTAB, ranks/GPUs={nranks}, "
+            f"steady runs={n_runs}, hierarchy reuse disabled\n"
         )
 
     mpi_timings = _run_interface(
@@ -305,8 +338,8 @@ def main() -> None:
             n_runs,
         )
 
-    sharded_x_local = sharding_timings["forward"].output.addressable_shards[0].data
-    sharded_db_local = sharding_timings["dL/db"].output.addressable_shards[0].data
+    sharded_x_local = sharded_solver.local_vector(sharding_timings["forward"].output)
+    sharded_db_local = sharded_solver.local_vector(sharding_timings["dL/db"].output)
     sharded_dA_local = sharded_matrix.local_matrix(
         sharding_timings["dL/dA"].output
     ).data

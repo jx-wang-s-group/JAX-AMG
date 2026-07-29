@@ -64,6 +64,19 @@ def test_make_sharded_vector_constructs_default_mesh():
     np.testing.assert_array_equal(np.asarray(b), values)
 
 
+def test_make_sharded_vector_rejects_batched_rhs():
+    mesh = jax.make_mesh((1,), ("rank",), devices=[jax.devices()[0]])
+    comm = SimpleNamespace(
+        Get_size=lambda: 1,
+        allgather=lambda value: [value],
+    )
+
+    with pytest.raises(ValueError, match="one-dimensional"):
+        jaxamg.make_sharded_vector(
+            np.ones((4, 2), dtype=np.float32), comm=comm, mesh=mesh
+        )
+
+
 def test_sharded_inputs_preserve_device_arrays(monkeypatch):
     mesh, local_values = _single_device_array(np.arange(4, dtype=np.float32))
     A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
@@ -187,6 +200,12 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     )
     np.testing.assert_array_equal(np.asarray(x_jit), np.asarray(b))
 
+    # Multiple RHS use the same public batching path as the ordinary solver:
+    # vmap a solver that accepts one vector at a time.
+    batched_b = jnp.stack((b, 2 * b))
+    batched_x = jax.vmap(lambda rhs: solver(rhs, A_data=matrix.data)[0])(batched_b)
+    np.testing.assert_array_equal(np.asarray(batched_x), np.asarray(batched_b))
+
     with pytest.raises(ValueError, match="A_data must be passed explicitly"):
         jax.jit(solver).lower(b)
 
@@ -217,98 +236,6 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     np.testing.assert_array_equal(np.asarray(grad_x0), np.zeros_like(np.asarray(b)))
 
     assert len(transpose_calls) == 1
-
-
-def test_sharded_solver_supports_batched_rhs(monkeypatch):
-    values = np.arange(1, 9, dtype=np.float32).reshape(4, 2)
-    mesh = jax.make_mesh((1,), ("rank",), devices=[jax.devices()[0]])
-    comm = SimpleNamespace(
-        Get_size=lambda: 1,
-        Get_rank=lambda: 0,
-        allgather=lambda value: [value],
-    )
-    b = jaxamg.make_sharded_vector(values, comm=comm, mesh=mesh, global_size=4)
-    A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
-    halo_plan = SimpleNamespace(
-        n_ghost=0,
-        max_n_ghost=0,
-        col_to_combined=np.arange(4, dtype=np.int32),
-        send_ids_2d=np.zeros((1, 1), dtype=np.int32),
-        recv_ghost_slot_2d=np.zeros((1, 1), dtype=np.int32),
-    )
-
-    monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
-    monkeypatch.setattr(
-        sharding_module,
-        "build_halo_plan",
-        lambda *args, **kwargs: halo_plan,
-    )
-    monkeypatch.setattr(
-        sharding_module,
-        "_build_mpi_cache",
-        lambda config, comm, nglobal, row_counts, max_nnz, nnz_out, plan, **kwargs: {
-            "lrank": 0,
-            "recvcounts_tuple": row_counts,
-            "max_nnz": max_nnz,
-            "nnz_out": nnz_out,
-            "halo_plan": plan,
-        },
-    )
-    monkeypatch.setattr(sharding_module, "with_cache", lambda A, **kwargs: A)
-    monkeypatch.setattr(sharding_module, "to_bcsr_matrix", lambda A, **kwargs: A)
-    monkeypatch.setattr(
-        sharding_module,
-        "_transpose_distributed_matrix",
-        lambda *args: (
-            _single_rank_transpose_structure(A_local),
-            _single_rank_transpose_plan(A_local),
-        ),
-    )
-
-    def fake_solve(A, rhs, x0=None, **kwargs):
-        x = A.data * rhs
-        if x0 is not None:
-            x = x + x0
-        return x, {
-            "iterations": jnp.asarray(2.0),
-            "residual": jnp.asarray(1e-6, dtype=rhs.dtype),
-            "status": jnp.asarray(0.0),
-            "residual_history": jnp.asarray([1.0, 0.1, 1e-6], dtype=rhs.dtype),
-        }
-
-    monkeypatch.setattr(sharding_module, "solve", fake_solve)
-    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
-    solver = jaxamg.make_sharded_solver(matrix, b)
-
-    with jax.set_mesh(mesh):
-        x, info = jax.jit(lambda matrix_data, rhs: solver(rhs, A_data=matrix_data))(
-            matrix.data, b
-        )
-        grad_A_data, grad_b = jax.jit(
-            jax.grad(
-                lambda matrix_data, rhs: jnp.sum(
-                    solver(rhs, A_data=matrix_data)[0] ** 2
-                ),
-                argnums=(0, 1),
-            )
-        )(matrix.data, b)
-        grad_b_warm, grad_x0 = jax.grad(
-            lambda data, rhs, x0: jnp.sum(solver(rhs, x0, A_data=data)[0] ** 2),
-            argnums=(1, 2),
-        )(matrix.data, b, b)
-
-    np.testing.assert_array_equal(np.asarray(x), values)
-    np.testing.assert_array_equal(np.asarray(solver.local_vector(x)), values)
-    assert info["iterations"].shape == (1, 2)
-    assert info["residual_history"].shape == (1, 2, 3)
-    np.testing.assert_array_equal(np.asarray(grad_b), 2 * values)
-    np.testing.assert_array_equal(np.asarray(grad_b_warm), 4 * values)
-    np.testing.assert_array_equal(np.asarray(grad_x0), np.zeros_like(values))
-
-    grad_A_local = matrix.local_matrix(grad_A_data)
-    np.testing.assert_array_equal(
-        np.asarray(grad_A_local.data), -2 * np.sum(values**2, axis=1)
-    )
 
 
 def test_sharded_matrix_validates_partition(monkeypatch):

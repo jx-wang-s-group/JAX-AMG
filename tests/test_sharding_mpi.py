@@ -268,12 +268,17 @@ def test_sharded_symmetric_warm_start_gradients(sharding_context):
             lambda matrix_data, rhs, guess: solver(rhs, guess, A_data=matrix_data)
         )
         compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+        compiled_vmap = jax.jit(
+            jax.vmap(lambda rhs: solver(rhs, A_data=matrix.data)[0])
+        )
         x, info = compiled_solve(matrix.data, b, x0)
         grad_A_data, grad_b, grad_x0 = compiled_grad(matrix.data, b, x0)
+        x_batched = compiled_vmap(jnp.stack((b, 2 * b)))
     x.block_until_ready()
     grad_A_data.block_until_ready()
     grad_b.block_until_ready()
     grad_x0.block_until_ready()
+    x_batched.block_until_ready()
 
     x_global = _gather_global(x, comm)
     grad_b_global = _gather_global(grad_b, comm)
@@ -286,6 +291,15 @@ def test_sharded_symmetric_warm_start_gradients(sharding_context):
     adjoint_ref = np.linalg.solve(A_global.T, 2.0 * x_ref)
 
     np.testing.assert_allclose(x_global, x_ref, rtol=1e-5, atol=1e-6)
+    x_batched_global = np.concatenate(
+        comm.allgather(np.asarray(x_batched.addressable_shards[0].data)), axis=1
+    )
+    np.testing.assert_allclose(
+        x_batched_global,
+        np.stack((x_ref, 2 * x_ref)),
+        rtol=1e-5,
+        atol=1e-6,
+    )
     np.testing.assert_allclose(grad_b_global, adjoint_ref, rtol=1e-5, atol=1e-6)
     np.testing.assert_array_equal(grad_x0_global, 0)
 
@@ -465,121 +479,3 @@ def test_sharded_block_matrix_gradients(sharding_context, is_symmetric):
     assert solver.global_size == n_global
     assert solver.local_size == n_local
     assert _local_status(info) == 0
-
-
-def test_sharded_batched_rhs_gradients(sharding_context):
-    """Solve multiple RHS columns and accumulate their shared matrix VJP."""
-    comm, rank, nranks, mesh = sharding_context
-    nrhs = 3
-    n_global = 4 * nranks + 1
-    template, row_start, row_end = tridiagonal_matrix_distributed(
-        n_global, rank, nranks, diagonal_value=4.0, dtype=jnp.float32
-    )
-    n_local = row_end - row_start
-    local_rows = np.repeat(
-        np.arange(row_start, row_end), np.diff(np.asarray(template.indptr))
-    )
-    local_columns = np.asarray(template.indices)
-    local_values = np.where(
-        local_columns < local_rows,
-        -0.75,
-        np.where(local_columns > local_rows, -1.25, 4.0),
-    ).astype(np.float32)
-    A_local = jsp.BCSR(
-        (jnp.asarray(local_values), template.indices, template.indptr),
-        shape=template.shape,
-    )
-
-    local_indices = np.arange(row_start, row_end, dtype=np.float32)
-    b_local = np.stack(
-        (
-            local_indices + 1.0,
-            1.0 + 0.1 * local_indices,
-            2.0 - 0.05 * local_indices,
-        ),
-        axis=1,
-    )
-    x0_local = np.full((n_local, nrhs), 0.1, dtype=np.float32)
-    b = jaxamg.make_sharded_vector(b_local, comm=comm, mesh=mesh, global_size=n_global)
-    x0 = jaxamg.make_sharded_vector(
-        x0_local, comm=comm, mesh=mesh, global_size=n_global
-    )
-    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
-    solver = jaxamg.make_sharded_solver(
-        matrix,
-        b,
-        config={
-            "solver": "FGMRES",
-            "preconditioner": {"solver": "JACOBI_L1"},
-            "communicator": "MPI_DIRECT",
-            "max_iters": 100,
-            "tolerance": 1e-8,
-        },
-    )
-    A_data = matrix.data + jnp.asarray(0.05, matrix.data.dtype)
-
-    def loss(matrix_data, rhs, guess):
-        x, _ = solver(rhs, guess, A_data=matrix_data)
-        return jnp.sum(x**2)
-
-    with jax.set_mesh(mesh):
-        compiled_solve = jax.jit(
-            lambda matrix_data, rhs, guess: solver(rhs, guess, A_data=matrix_data)
-        )
-        compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
-        x, info = compiled_solve(A_data, b, x0)
-        grad_A_data, grad_b, grad_x0 = compiled_grad(A_data, b, x0)
-    x.block_until_ready()
-    grad_A_data.block_until_ready()
-    grad_b.block_until_ready()
-    grad_x0.block_until_ready()
-
-    A_reference = 4.05 * np.eye(n_global, dtype=np.float64)
-    A_reference += np.diag(-1.20 * np.ones(n_global - 1), 1)
-    A_reference += np.diag(-0.70 * np.ones(n_global - 1), -1)
-    global_indices = np.arange(n_global, dtype=np.float64)
-    b_reference = np.stack(
-        (
-            global_indices + 1.0,
-            1.0 + 0.1 * global_indices,
-            2.0 - 0.05 * global_indices,
-        ),
-        axis=1,
-    )
-    x_reference = np.linalg.solve(A_reference, b_reference)
-    adjoint_reference = np.linalg.solve(A_reference.T, 2.0 * x_reference)
-    x_global = _gather_unpadded(x, solver, comm)
-    np.testing.assert_allclose(x_global, x_reference, rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(
-        _gather_unpadded(grad_b, solver, comm),
-        adjoint_reference,
-        rtol=1e-5,
-        atol=1e-6,
-    )
-    np.testing.assert_array_equal(
-        _gather_unpadded(grad_x0, solver, comm), np.zeros_like(b_reference)
-    )
-
-    grad_A_local = matrix.local_matrix(grad_A_data)
-    grad_A_reference = -np.sum(
-        adjoint_reference[local_rows]
-        * x_reference[np.asarray(A_local.indices, dtype=np.int64)],
-        axis=1,
-    )
-    np.testing.assert_allclose(
-        np.asarray(grad_A_local.data),
-        grad_A_reference,
-        rtol=1e-5,
-        atol=1e-6,
-    )
-
-    x_physical = np.asarray(x.addressable_shards[0].data)
-    grad_b_physical = np.asarray(grad_b.addressable_shards[0].data)
-    grad_A_physical = np.asarray(grad_A_data.addressable_shards[0].data)
-    np.testing.assert_array_equal(x_physical[n_local:], 0)
-    np.testing.assert_array_equal(grad_b_physical[n_local:], 0)
-    np.testing.assert_array_equal(grad_A_physical[len(A_local.data) :], 0)
-    assert info["iterations"].shape == (nranks, nrhs)
-    assert info["residual_history"].shape[:2] == (nranks, nrhs)
-    local_status = np.asarray(info["status"].addressable_shards[0].data)
-    np.testing.assert_array_equal(local_status, 0)
