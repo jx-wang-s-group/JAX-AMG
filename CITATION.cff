@@ -10,7 +10,7 @@ authors:
     given-names: Jian-Xun
 preferred-citation:
   type: article
-  title: "JAX-AMG: A GPU-Accelerated Differentiable Sparse Linear Solver Library for JAX"
+  title: "JAX-AMG: A GPU-accelerated differentiable sparse linear solver library for JAX"
   authors:
     - family-names: Liu
       given-names: Yi
@@ -18,6 +18,8 @@ preferred-citation:
       given-names: Xiantao
     - family-names: Wang
       given-names: Jian-Xun
+  journal: SoftwareX
   year: 2026
-  doi: "10.48550/arXiv.2606.09001"
-  url: "https://arxiv.org/abs/2606.09001"
+  volume: 35
+  start: 102966
+  doi: "10.1016/j.softx.2026.102966"
