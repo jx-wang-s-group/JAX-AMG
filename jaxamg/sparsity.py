@@ -27,15 +27,34 @@ from jax.typing import ArrayLike
 
 from .sparsity_tracing import trace_sparsity_pattern
 
-
 # --- Probing-based detection: exhaustive one-hot basis-vector probing ---
+# Device-memory budget for one batch of one-hot probes. The batch is sized from
+# a per-probe footprint estimate (``_probe_batch_size``) so probing never forms
+# an n_global x n_global buffer; the OOM-halving loop stays as the safety net.
+_PROBE_BATCH_BYTES = 256 * 2**20
+
+
+def _probe_batch_size(m: int, n: int, out_itemsize: int) -> int:
+    """Initial batch size for one-hot probing from the device-memory budget.
+
+    Per-probe footprint estimate: the float32 one-hot input, the output, and up to
+    two full-input-size intermediates at the output precision -- an operator
+    partitioned from a global one (``global_op(x)[row_start:row_end]``) applies
+    the global operator to the whole vector before slicing its rows. The batch
+    size only sets the work per step: the (rows, cols) result is independent of it.
+    """
+    per_probe = 4 * m + out_itemsize * (2 * m + n)
+    return max(1, min(m, _PROBE_BATCH_BYTES // per_probe))
+
+
 def _probe_columns(
     A_callable: Callable, shape: tuple[int, int], tol: float
 ) -> tuple[np.ndarray, np.ndarray]:
     """Exhaustive probing with one-hot basis vectors (correct for any operator).
 
     Probes columns in batches and extracts the non-zeros per block (the full
-    (m, n) matrix is never assembled), halving the batch on OOM. O(m) probes.
+    (m, n) matrix is never assembled). Batches are sized to a device-memory
+    budget, then halved on OOM. O(m) probes.
     """
     n, m = shape
 
@@ -50,6 +69,13 @@ def _probe_columns(
 
         def batched_A(basis):
             return jax.lax.map(A_callable, basis)
+
+    # Output precision, for sizing the probe batches (worst case if unknown).
+    try:
+        out_sds = jax.eval_shape(A_callable, jax.ShapeDtypeStruct((m,), jnp.float32))
+        out_itemsize = int(np.dtype(out_sds.dtype).itemsize)
+    except Exception:
+        out_itemsize = 8
 
     def _eval_batch(start: int, size: int) -> tuple[np.ndarray, np.ndarray]:
         indices = jnp.arange(start, start + size)
@@ -76,7 +102,7 @@ def _probe_columns(
         s = str(e).lower()
         return "resource exhausted" in s or "out of memory" in s or "oom" in s
 
-    batch_size = m
+    batch_size = _probe_batch_size(m, n, out_itemsize)
     result: tuple[np.ndarray, np.ndarray] | None = None
     while result is None and batch_size >= 1:
         try:
@@ -105,9 +131,11 @@ def probe_sparsity_pattern(
     """Determine the sparsity pattern of a linear operator by one-hot probing.
 
     Probes the operator with batches of one-hot basis vectors and extracts the
-    nonzeros per block (the full (m, n) matrix is never assembled), halving the
-    batch on OOM. Correct for any operator; this is the fallback used when
-    jaxpr tracing is unavailable (opaque or data-dependent operators).
+    nonzeros per block (the full (m, n) matrix is never assembled). Batches are
+    sized to a device-memory budget -- so an operator partitioned from a global
+    one never forms an n_global x n_global buffer -- and halved on OOM. Correct
+    for any operator; this is the fallback used when jaxpr tracing is unavailable
+    (opaque or data-dependent operators).
 
     Must be run outside of JIT compilation. Returns (rows, cols).
     """

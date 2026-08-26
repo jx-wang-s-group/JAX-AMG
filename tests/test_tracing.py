@@ -239,3 +239,18 @@ class TestTracingFallback:
         n = 12
         op = lambda x: jnp.ones(n) * (x @ x)
         assert trace_sparsity_pattern(op, (n, n)) is None
+
+
+class TestHostDevice:
+    def test_host_device_is_this_process_cpu(self):
+        # Host-side constant folds must bind on THIS process's CPU device. Under
+        # jax.distributed, jax.devices("cpu")[0] is process 0's and not addressable
+        # on the other ranks; binding on it silently turned every fold into
+        # _UNKNOWN and bailed the whole trace there (e.g. "conv with non-constant
+        # kernel") to one-hot probing.
+        from jaxamg import sparsity_tracing
+
+        dev = sparsity_tracing._host_device()
+        assert dev.platform == "cpu"
+        assert dev in jax.local_devices(backend="cpu")
+        assert sparsity_tracing._host_device() is dev  # resolved once, cached
