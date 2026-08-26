@@ -10,13 +10,6 @@ Usage:
     CUDA_VISIBLE_DEVICES=0,1 mpirun -n 2 python demo/sharded_poisson_operator_optimization.py
 """
 
-import os
-
-# Required for compiled multi-process losses; see docs/sharding.md.
-os.environ["XLA_FLAGS"] = (
-    os.environ.get("XLA_FLAGS", "") + " --xla_gpu_shard_autotuning=false"
-).strip()
-
 import jax
 import jax.numpy as jnp
 

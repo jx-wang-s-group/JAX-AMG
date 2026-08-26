@@ -59,8 +59,10 @@ def main() -> None:
         solution, _ = solver(rhs, A=A_data)
         return jnp.sum(solution**2)
 
+    grad_fn = jax.jit(jax.grad(loss, argnums=(0, 1)))
+
     with jax.set_mesh(b.sharding.mesh):
-        grad_A_data, grad_b = jax.grad(loss, argnums=(0, 1))(A.data, b)
+        grad_A_data, grad_b = grad_fn(A.data, b)
     grad_A_data.block_until_ready()
     grad_b.block_until_ready()
     grad_A_local = A.local_matrix(grad_A_data)

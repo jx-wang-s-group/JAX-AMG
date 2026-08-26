@@ -38,6 +38,50 @@ from .utils import (
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
 
+# Private API; tells whether XLA_FLAGS can still take effect.
+try:
+    from jax._src.xla_bridge import (
+        backends_are_initialized as _backends_are_initialized,
+    )
+except Exception:  # pragma: no cover - exercised only if the private API moves
+
+    def _backends_are_initialized() -> bool:
+        return False
+
+
+def _disable_shard_autotuning() -> bool:
+    """Disable XLA's cross-process sharded autotuning; return whether it is off.
+
+    That autotuning assumes every process compiles the identical program, but
+    a sharded solve compiles rank-local structure into each process's program
+    and deadlocks under it. Disabling it only affects compile time. XLA reads
+    ``XLA_FLAGS`` when its backend initializes, so an explicit setting is
+    respected and a late import cannot take effect.
+    """
+    flags = os.environ.get("XLA_FLAGS", "")
+    if "xla_gpu_shard_autotuning" in flags:
+        return "xla_gpu_shard_autotuning=false" in flags.lower()
+    if _backends_are_initialized():
+        return False
+    os.environ["XLA_FLAGS"] = f"{flags} --xla_gpu_shard_autotuning=false".strip()
+    return True
+
+
+_SHARD_AUTOTUNING_DISABLED = _disable_shard_autotuning()
+
+
+def _check_shard_autotuning() -> None:
+    if jax.process_count() > 1 and not _SHARD_AUTOTUNING_DISABLED:
+        warnings.warn(
+            "XLA's sharded autotuning is enabled, so compiling a multi-process "
+            "sharded solve will deadlock. Import jaxamg before the first JAX "
+            "device call, set XLA_FLAGS=--xla_gpu_shard_autotuning=false, or "
+            "pass compiler_options={'xla_gpu_shard_autotuning': False} to the "
+            "outer jax.jit.",
+            stacklevel=3,
+        )
+
+
 ShardedInfo = dict[str, jax.Array]
 
 
@@ -634,16 +678,10 @@ def make_sharded_solver(
     ``solver(..., A=A.data)`` to differentiate matrix values. Use
     ``jax.set_mesh(A.mesh)`` around outer transforms such as ``jax.grad``.
 
-    .. warning::
-        The rank-local CSR structure and communication plans are compiled into
-        each process's program as constants, so the processes compile programs
-        that differ. XLA's cross-process sharded autotuning assumes identical
-        programs and deadlocks during compilation when such a program also
-        contains an automatically partitioned collective -- which is what
-        ``jnp.sum(x)`` over a sharded solution inside ``jax.jit`` produces. Run
-        multi-process sharded jobs with ``XLA_FLAGS=--xla_gpu_shard_autotuning=false``
-        (set before JAX initializes its backend) to disable that autotuning;
-        see :doc:`sharding` for details.
+    .. note::
+        Importing jaxamg disables XLA's cross-process sharded autotuning,
+        which deadlocks on the per-process programs a sharded solve compiles
+        to. Import it before the first JAX device call; see :doc:`sharding`.
 
     Args:
         A: Distributed matrix created with :func:`make_sharded_matrix`.
@@ -681,6 +719,7 @@ def make_sharded_solver(
     mesh = A.mesh
     axis_name = A.axis_name
     _validate_runtime(comm, mesh, axis_name)
+    _check_shard_autotuning()
 
     n_local = A.local_size
     nglobal = A.global_size

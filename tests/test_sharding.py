@@ -1,4 +1,6 @@
+import os
 import sys
+import warnings
 from types import ModuleType, SimpleNamespace
 
 import jax
@@ -308,3 +310,35 @@ def test_sharded_solver_requires_sharded_matrix():
 
     with pytest.raises(TypeError, match="make_sharded_matrix"):
         jaxamg.make_sharded_solver(jnp.eye(4), b)  # type: ignore[arg-type]
+
+
+def test_shard_autotuning_flag(monkeypatch):
+    monkeypatch.setattr(sharding_module, "_backends_are_initialized", lambda: False)
+
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_autotune_level=2")
+    assert sharding_module._disable_shard_autotuning()
+    assert os.environ["XLA_FLAGS"] == (
+        "--xla_gpu_autotune_level=2 --xla_gpu_shard_autotuning=false"
+    )
+
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_shard_autotuning=true")
+    assert not sharding_module._disable_shard_autotuning()
+    assert os.environ["XLA_FLAGS"] == "--xla_gpu_shard_autotuning=true"
+
+    monkeypatch.setattr(sharding_module, "_backends_are_initialized", lambda: True)
+    monkeypatch.delenv("XLA_FLAGS")
+    assert not sharding_module._disable_shard_autotuning()
+    assert "XLA_FLAGS" not in os.environ
+
+
+def test_shard_autotuning_warning(monkeypatch):
+    monkeypatch.setattr(jax, "process_count", lambda: 2)
+
+    monkeypatch.setattr(sharding_module, "_SHARD_AUTOTUNING_DISABLED", False)
+    with pytest.warns(UserWarning, match="sharded autotuning"):
+        sharding_module._check_shard_autotuning()
+
+    monkeypatch.setattr(sharding_module, "_SHARD_AUTOTUNING_DISABLED", True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sharding_module._check_shard_autotuning()

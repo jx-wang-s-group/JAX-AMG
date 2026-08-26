@@ -46,26 +46,19 @@ Launchers recognized directly by JAX may also work with an argument-free
 `jax.distributed.initialize()`. The explicit `mpi4py` method also covers MPI
 environments whose launcher variables JAX does not recognize automatically.
 
-## Required XLA Flag for Multi-Process Jobs
+## XLA Sharded Autotuning
 
-A sharded solver compiles each rank's local CSR structure and communication
-plans into that process's program as constants, so the processes compile
-programs that are not identical. XLA's cross-process *sharded autotuning*
-assumes identical programs and deadlocks during compilation as soon as such a
-program also contains an automatically partitioned collective. A loss that
-reduces the solution across ranks inside `jax.jit`, such as
-`jnp.sum(x**2)`, produces exactly that collective, so disable the autotuning:
-
-```bash
-XLA_FLAGS=--xla_gpu_shard_autotuning=false \
-  mpirun -n 2 python your_script.py
-```
-
-The flag is read when JAX initializes its backend, so set it in the environment
-or via `os.environ` before the first JAX device call. Without it, a compiled
-loss that reduces across ranks hangs in compilation rather than failing;
-uncompiled calls and `jax.jit(jax.grad(...))` are unaffected, because neither
-emits that collective.
+XLA's cross-process sharded autotuning assumes every process compiles the
+identical program. A sharded solver compiles each rank's local CSR structure
+and communication plans into that process's program, so compiling a
+multi-process loss under that autotuning deadlocks. Importing jaxamg therefore
+disables it (`--xla_gpu_shard_autotuning=false`; this only affects compile
+time). XLA reads `XLA_FLAGS` when its backend initializes, so import jaxamg
+before the first JAX device call. Otherwise set the flag in the environment
+yourself or pass `compiler_options={"xla_gpu_shard_autotuning": False}` to
+the outer `jax.jit`; `make_sharded_solver` warns when the flag was not applied
+in time. An explicit `xla_gpu_shard_autotuning` setting in `XLA_FLAGS` is left
+untouched.
 
 ## Sharded Solve
 
