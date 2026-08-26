@@ -194,7 +194,7 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     np.testing.assert_array_equal(np.asarray(info["iterations"]), [2])
     assert info["residual_history"].shape == (1, 3)
 
-    x_jit, _ = jax.jit(lambda matrix_data, rhs: solver(rhs, A_data=matrix_data))(
+    x_jit, _ = jax.jit(lambda matrix_data, rhs: solver(rhs, A=matrix_data))(
         matrix.data, b
     )
     np.testing.assert_array_equal(np.asarray(x_jit), np.asarray(b))
@@ -202,17 +202,17 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     # Multiple RHS use the same public batching path as the ordinary solver:
     # vmap a solver that accepts one vector at a time.
     batched_b = jnp.stack((b, 2 * b))
-    batched_x = jax.vmap(lambda rhs: solver(rhs, A_data=matrix.data)[0])(batched_b)
+    batched_x = jax.vmap(lambda rhs: solver(rhs, A=matrix.data)[0])(batched_b)
     np.testing.assert_array_equal(np.asarray(batched_x), np.asarray(batched_b))
 
-    with pytest.raises(ValueError, match="A_data must be passed explicitly"):
+    with pytest.raises(ValueError, match="A must be passed explicitly"):
         jax.jit(solver).lower(b)
 
     # A traced x0 with a concrete RHS must not embed the cached matrix values.
-    with pytest.raises(ValueError, match="A_data must be passed explicitly"):
+    with pytest.raises(ValueError, match="A must be passed explicitly"):
         jax.jit(lambda guess: solver(b, guess)).lower(b)
 
-    x_updated, _ = solver(b, A_data=2 * matrix.data)
+    x_updated, _ = solver(b, A=2 * matrix.data)
     np.testing.assert_array_equal(np.asarray(x_updated), 2 * np.asarray(b))
 
     x_warm, _ = solver(b, b)
@@ -220,14 +220,14 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
 
     with jax.set_mesh(mesh):
         grad_b = jax.grad(
-            lambda data, rhs: jnp.sum(solver(rhs, A_data=data)[0] ** 2),
+            lambda data, rhs: jnp.sum(solver(rhs, A=data)[0] ** 2),
             argnums=1,
         )(matrix.data, b)
-        grad_A_data = jax.grad(lambda data: jnp.sum(solver(b, A_data=data)[0] ** 2))(
+        grad_A_data = jax.grad(lambda data: jnp.sum(solver(b, A=data)[0] ** 2))(
             matrix.data
         )
         grad_b_warm, grad_x0 = jax.grad(
-            lambda data, rhs, x0: jnp.sum(solver(rhs, x0, A_data=data)[0] ** 2),
+            lambda data, rhs, x0: jnp.sum(solver(rhs, x0, A=data)[0] ** 2),
             argnums=(1, 2),
         )(matrix.data, b, b)
     np.testing.assert_array_equal(np.asarray(grad_b), 2 * np.asarray(b))
@@ -239,6 +239,29 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     np.testing.assert_array_equal(np.asarray(grad_x0), np.zeros_like(np.asarray(b)))
 
     assert len(transpose_calls) == 1
+
+    # A matrix with traced values through ``A=``: d/dscale = sum(dL/dA.data
+    # * data), with dL/dA.data = -2 b**2 as asserted above.
+    def scaled_matrix(scale):
+        return jsp.BCSR(
+            (scale * A_local.data, A_local.indices, A_local.indptr),
+            shape=A_local.shape,
+        )
+
+    def scaled_loss(scale):
+        return jnp.sum(solver(b, A=scaled_matrix(scale))[0] ** 2)
+
+    with jax.set_mesh(mesh):
+        grad_scale = jax.grad(scaled_loss)(1.0)
+        grad_scale_jit = jax.jit(jax.grad(scaled_loss))(1.0)
+        x_scaled, _ = solver(b, A=scaled_matrix(3.0))
+    expected = -2 * float(jnp.sum(b**2))
+    assert float(grad_scale) == pytest.approx(expected)
+    assert float(grad_scale_jit) == pytest.approx(expected)
+    np.testing.assert_array_equal(np.asarray(x_scaled), 3 * np.asarray(b))
+
+    with pytest.raises(ValueError, match="sparsity structure"):
+        solver(b, A=jsp.BCSR.fromdense(jnp.ones((4, 4), dtype=jnp.float32)))
 
     # Stats: written after a direct call, rejected under a transform, and a
     # solver created without save_stats warns about incomplete output.
@@ -254,7 +277,7 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
 
     with pytest.raises(ValueError, match="direct solver call"):
         jax.jit(
-            lambda rhs: stats_solver(rhs, A_data=matrix.data, save_stats_file="s.txt")
+            lambda rhs: stats_solver(rhs, A=matrix.data, save_stats_file="s.txt")
         ).lower(b)
 
     with pytest.warns(UserWarning, match="save_stats=True"):

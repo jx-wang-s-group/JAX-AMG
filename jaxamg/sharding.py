@@ -90,6 +90,7 @@ class ShardedMatrix:
         partition_info: tuple[int, int],
         row_counts: tuple[int, ...],
         max_local_size: int,
+        coloring: tuple | None = None,
     ) -> None:
         local_nnz = int(local_bcsr.data.shape[0])
         # Keep only the rank-local CSR structure. The matrix values live solely
@@ -116,6 +117,9 @@ class ShardedMatrix:
         self.max_local_nnz = int(data.addressable_shards[0].data.shape[0])
         self.shape = (self.global_size, self.global_size)
         self.local_shape = tuple(local_bcsr.shape)
+        # Coloring of the source operator, if any, for materializing
+        # operators with this sparsity.
+        self._coloring = coloring
 
     def local_matrix(self, data: jax.Array | None = None) -> jsp.BCSR:
         """Return this rank's unpadded BCSR matrix for ``data`` or cached values.
@@ -127,7 +131,10 @@ class ShardedMatrix:
         """
         values = self.data if data is None else data
         _validate_operand(values, self.data, self.mesh, self.axis_name, "matrix data")
-        local_values = values.addressable_shards[0].data[: self.local_nnz]
+        # The caller may be inside jax.set_mesh over the whole mesh, which
+        # rejects single-device slicing.
+        with jax.set_mesh(_local_mesh(self.mesh, self.axis_name)):
+            local_values = values.addressable_shards[0].data[: self.local_nnz]
         return jsp.BCSR(
             (local_values, self._structure.indices, self._structure.indptr),
             shape=self._structure.shape,
@@ -154,18 +161,21 @@ class ShardedSolve:
         b: jax.Array,
         x0: jax.Array | None = None,
         *,
-        A_data: jax.Array | None = None,
+        A: MatrixOrOperator | jax.Array | None = None,
         save_stats_file: str | os.PathLike | None = None,
     ) -> tuple[jax.Array, ShardedInfo]:
-        """Solve with cached values or an explicit differentiable ``A_data``.
+        """Solve with the cached values or an explicit ``A``.
 
-        ``A_data`` may be omitted for a direct call but is required inside a
-        JAX transformation so matrix values remain a dynamic operand.
-        ``save_stats_file`` writes formatted AmgX statistics after a direct
-        call (rank 0 writes the file); the solver must have been created with
-        ``save_stats=True`` for the file to contain solver statistics.
+        ``A`` is this rank's ``(n_local, n_global)`` operator or matrix with the
+        sparsity fixed at solver creation, as ``solve(A, b)`` takes it, or the
+        packed global values in the layout of ``ShardedMatrix.data``. Operator
+        parameters must be identical on every rank and receive the gradient of
+        the global loss; packed values receive their per-entry gradient. ``A``
+        is required inside a JAX transformation. ``save_stats_file`` writes
+        AmgX statistics after a direct call (rank 0 writes the file; requires
+        ``save_stats=True`` at creation).
         """
-        return self._solve_fn(b, x0, A_data=A_data, save_stats_file=save_stats_file)
+        return self._solve_fn(b, x0, A=A, save_stats_file=save_stats_file)
 
     def local_vector(self, value: jax.Array) -> jax.Array:
         """Return this rank's unpadded rows of a solver vector.
@@ -261,6 +271,11 @@ def make_sharded_vector(
         padded_values,
         global_shape=(comm_size * max_local_size,),
     )
+
+
+def _local_mesh(mesh: Mesh, axis_name: str) -> Mesh:
+    """This process's mesh device as a one-device mesh."""
+    return jax.make_mesh((1,), (axis_name,), devices=[mesh.local_devices[0]])
 
 
 def _require_shard_map() -> None:
@@ -477,6 +492,7 @@ def _pack_sharded_matrix(
     row_counts: tuple[int, ...],
     max_local_size: int,
     max_nnz: int | None = None,
+    coloring: tuple | None = None,
 ) -> ShardedMatrix:
     """Pack normalized local values into a global sharded array."""
     local_nnz = int(A_bcsr.data.shape[0])
@@ -502,6 +518,7 @@ def _pack_sharded_matrix(
         partition_info,
         row_counts,
         max_local_size,
+        coloring,
     )
 
 
@@ -558,6 +575,9 @@ def make_sharded_matrix(
         partition_info,
         row_counts,
         max_local_size,
+        coloring=(
+            getattr(A_local, "_coloring_info", None) if callable(A_local) else None
+        ),
     )
 
 
@@ -611,7 +631,7 @@ def make_sharded_solver(
     ``jax.distributed.initialize()`` must be called before this function in a
     multi-process job. The matrix owns the communicator, mesh, local CSR
     structure, and globally sharded packed values. Pass ``A.data`` through
-    ``solver(..., A_data=A_data)`` to differentiate matrix values. Use
+    ``solver(..., A=A.data)`` to differentiate matrix values. Use
     ``jax.set_mesh(A.mesh)`` around outer transforms such as ``jax.grad``.
 
     .. warning::
@@ -644,12 +664,13 @@ def make_sharded_solver(
             file.
 
     Returns:
-        A callable ``solver(b, x0=None, *, A_data=None, save_stats_file=None)``. Use
-        ``A.local_matrix(gradient)`` to convert packed matrix gradients to this
-        rank's unpadded BCSR structure. ``solver.local_vector(value)`` removes
-        vector padding. ``A_data`` may be omitted for a direct call but must be
-        explicit under ``jax.jit``, ``jax.grad``, or another JAX transform. For
-        each solve, info values have one entry per rank.
+        A callable ``solver(b, x0=None, *, A=None, save_stats_file=None)``.
+        ``A`` is this rank's operator or matrix with the sparsity fixed here
+        (its closed-over parameters must be identical on every rank) or the
+        packed global values ``A.data``; it may be omitted for a direct call
+        but is required under a JAX transform. ``A.local_matrix(gradient)``
+        unpacks a packed matrix gradient and ``solver.local_vector(value)``
+        removes vector padding. Info values have one entry per rank.
     """
     _require_shard_map()
     if not isinstance(A, ShardedMatrix):
@@ -934,7 +955,7 @@ def make_sharded_solver(
     # under it so that its single-device operations dispatch cleanly even when
     # the caller sits inside jax.set_mesh over the whole multi-process mesh
     # (as an eager outer transform requires for its own global-array ops).
-    local_mesh = jax.make_mesh((1,), (axis_name,), devices=[local_device])
+    local_mesh = _local_mesh(mesh, axis_name)
 
     def local_shard(value: jax.Array) -> jax.Array:
         return value.addressable_shards[0].data
@@ -1011,6 +1032,191 @@ def make_sharded_solver(
             out_specs=A_data_spec,
         ),
     )
+
+    coloring = A._coloring
+
+    def local_values_of(A_local: MatrixOrOperator) -> jax.Array:
+        """This rank's padded values of ``A_local`` in the packed layout."""
+        if callable(A_local):
+            info = getattr(A_local, "_coloring_info", None) or coloring
+            if info is None:
+                raise ValueError(
+                    "A is a matrix-free operator without coloring information; "
+                    "build the sharded matrix from the operator, or attach "
+                    "coloring with jaxamg.with_cache(op, coloring="
+                    "jaxamg.cache_coloring(op, shape=(n_local, n_global)))"
+                )
+            rows, cols, column_colors, n_colors, shape = info
+            if tuple(shape) != (n_local, nglobal):
+                raise ValueError(
+                    f"A must have local shape {(n_local, nglobal)}; its "
+                    f"coloring describes shape {tuple(shape)}"
+                )
+            from .sparsity import materialize_sparse_matrix
+
+            values = materialize_sparse_matrix(
+                A_local, shape, rows, cols, column_colors, n_colors
+            ).data
+        else:
+            values = to_bcsr_matrix(
+                A_local,
+                b=jnp.zeros(n_local, dtype=A_data.dtype),
+                use_int64_indices=True,
+            ).data
+        if values.shape[0] != local_nnz:
+            raise ValueError(
+                "A must have the sparsity structure fixed when the solver was "
+                f"created; got {values.shape[0]} local nonzeros, expected "
+                f"{local_nnz}"
+            )
+        return jnp.pad(values.astype(A_data.dtype), (0, max_nnz - local_nnz))
+
+    def lax_reduce(value: jax.Array) -> jax.Array:
+        return jax.lax.psum(value, axis_name)
+
+    if nranks == 1:
+
+        def mpi_reduce(value: jax.Array) -> jax.Array:
+            return value
+
+    else:
+
+        def mpi_reduce(value: jax.Array) -> jax.Array:
+            import mpi4jax
+            from mpi4py import MPI
+
+            return mpi4jax.allreduce(value, op=MPI.SUM, comm=comm)
+
+    def require_replicated(value: jax.Array) -> None:
+        sharding = getattr(getattr(value, "aval", None), "sharding", None)
+        spec = getattr(sharding, "spec", None)
+        if spec is not None and any(entry is not None for entry in spec):
+            raise ValueError(
+                "a differentiable value that A closes over is sharded across "
+                "ranks; such values must be identical on every rank. Pass "
+                "rank-local matrix values as the packed array A.data instead."
+            )
+
+    def check_replicated(value: Any) -> None:
+        if (
+            isinstance(value, jax.Array)
+            and not isinstance(value, jax.core.Tracer)
+            and not value.sharding.is_fully_replicated
+        ):
+            raise ValueError(
+                "a value that A closes over is sharded across ranks; such "
+                "values must be identical on every rank. Pass rank-local "
+                "matrix values as the packed array A.data instead."
+            )
+
+    def local_copy(value: Any) -> Any:
+        """This process's copy of a value: for an array spanning the mesh,
+        its addressable shard (the value is replicated)."""
+        if isinstance(value, jax.Array) and not isinstance(value, jax.core.Tracer):
+            return value.addressable_shards[0].data
+        return value
+
+    def replicated_over_mesh(local_value: jax.Array) -> jax.Array:
+        """This rank's value typed as replicated over the mesh; ranks may
+        differ, and only this rank's copy is read back."""
+        return jax.make_array_from_single_device_arrays(
+            local_value.shape,
+            NamedSharding(mesh, P()),
+            [jax.device_put(local_value, local_device)],
+        )
+
+    def typed_like(cotangent: jax.Array, primal: jax.Array) -> jax.Array:
+        if isinstance(getattr(primal, "sharding", None), NamedSharding):
+            return replicated_over_mesh(cotangent)
+        return cotangent
+
+    def in_mesh_context() -> bool:
+        return not jax.sharding.get_abstract_mesh().empty
+
+    # The materialization is ordinary JAX code evaluated outside shard_map
+    # (JAX assumes a shard_map body is identical on every device; per-process
+    # constants violate that). Traced, each process computes its own values
+    # typed replicated (P()); eagerly it runs in the caller's context, which
+    # its arrays' types are tied to. Two custom VJPs bracket it: local_to_global
+    # avoids the psum JAX would insert when transposing replicated to sharded,
+    # and reduce_cotangent sums parameter cotangents across ranks.
+    to_shards = jax.shard_map(
+        lambda values: values,
+        mesh=mesh,
+        in_specs=(P(),),
+        out_specs=A_data_spec,
+        check_vma=False,
+    )
+    from_shards = jax.shard_map(
+        lambda values: values,
+        mesh=mesh,
+        in_specs=(A_data_spec,),
+        out_specs=P(),
+        check_vma=False,
+    )
+    sum_across_ranks = jax.shard_map(
+        lax_reduce, mesh=mesh, in_specs=(P(),), out_specs=P(), check_vma=False
+    )
+
+    @jax.custom_vjp
+    def local_to_global(values: jax.Array) -> jax.Array:
+        if isinstance(values, jax.core.Tracer):
+            return to_shards(values)
+        return assemble_global(local_copy(values))
+
+    def local_to_global_fwd(values: jax.Array):
+        return local_to_global(values), values
+
+    def local_to_global_bwd(values: jax.Array, ct: jax.Array):
+        if isinstance(ct, jax.core.Tracer):
+            return (from_shards(ct),)
+        return (typed_like(local_shard(ct), values),)
+
+    local_to_global.defvjp(local_to_global_fwd, local_to_global_bwd)
+
+    @jax.custom_vjp
+    def reduce_cotangent(value: jax.Array) -> jax.Array:
+        return value
+
+    def reduce_cotangent_fwd(value: jax.Array):
+        return value, value
+
+    def reduce_cotangent_bwd(value: jax.Array, ct: jax.Array):
+        if isinstance(ct, jax.core.Tracer):
+            return (sum_across_ranks(ct),)
+        with jax.set_mesh(local_mesh):
+            reduced = mpi_reduce(local_copy(ct))
+        return (typed_like(reduced, value),)
+
+    reduce_cotangent.defvjp(reduce_cotangent_fwd, reduce_cotangent_bwd)
+
+    def pack_operator(A_local: MatrixOrOperator, traced: bool) -> jax.Array:
+        """Global packed values of a local operator or matrix, differentiable
+        with respect to the traced values it closes over."""
+        closed = jax.make_jaxpr(lambda: local_values_of(A_local))()
+        # Traced closed-over values become explicit inputs; the rest stay
+        # jaxpr constants.
+        hoisted = tuple(
+            const
+            for const in closed.consts
+            if isinstance(const, jax.core.Tracer)
+            and jnp.issubdtype(const.dtype, jnp.inexact)
+        )
+        if traced:
+            for value in hoisted:
+                require_replicated(value)
+        slots = {id(const): index for index, const in enumerate(hoisted)}
+        values = tuple(reduce_cotangent(value) for value in hoisted)
+        consts = []
+        for const in closed.consts:
+            if id(const) in slots:
+                consts.append(values[slots[id(const)]])
+                continue
+            check_replicated(const)
+            # A jit cannot close over an array spanning the mesh; eager
+            # evaluation needs it as is.
+            consts.append(local_copy(const) if traced else const)
+        return local_to_global(jax.core.eval_jaxpr(closed.jaxpr, consts)[0])
 
     def differentiated_solve_backward(
         matrix_data: jax.Array, x: jax.Array, g_x: jax.Array
@@ -1092,19 +1298,24 @@ def make_sharded_solver(
         rhs: jax.Array,
         x0: jax.Array | None = None,
         *,
-        A_data_override: jax.Array | None = None,
+        A_override: MatrixOrOperator | jax.Array | None = None,
         save_stats_file: str | os.PathLike | None = None,
     ) -> tuple[jax.Array, ShardedInfo]:
         _validate_operand(rhs, b, mesh, axis_name, "b")
-        if A_data_override is None:
-            if isinstance(rhs, jax.core.Tracer) or isinstance(x0, jax.core.Tracer):
+        traced = isinstance(rhs, jax.core.Tracer) or isinstance(x0, jax.core.Tracer)
+        if A_override is None:
+            if traced:
                 raise ValueError(
-                    "A_data must be passed explicitly when a sharded solver is "
-                    "used inside jax.jit, jax.grad, or another JAX transform"
+                    "A must be passed explicitly (this rank's operator or "
+                    "matrix, or the packed values A.data) when a sharded solver "
+                    "is used inside jax.jit, jax.grad, or another JAX transform"
                 )
             matrix_data = A_data
+        elif isinstance(A_override, jax.Array) and A_override.ndim == 1:
+            # The packed global values themselves.
+            matrix_data = A_override
         else:
-            matrix_data = A_data_override
+            matrix_data = pack_operator(A_override, traced)
         _validate_operand(matrix_data, A_data, mesh, axis_name, "A_data")
         if save_stats_file is not None:
             if any(
@@ -1137,18 +1348,17 @@ def make_sharded_solver(
 
     def unpad_local_vector(value: jax.Array) -> jax.Array:
         _validate_operand(value, b, mesh, axis_name, "solver vector")
-        return value.addressable_shards[0].data[:n_local]
+        with jax.set_mesh(local_mesh):
+            return value.addressable_shards[0].data[:n_local]
 
     def solve_fn(
         rhs: jax.Array,
         x0: jax.Array | None = None,
         *,
-        A_data: jax.Array | None = None,
+        A: MatrixOrOperator | jax.Array | None = None,
         save_stats_file: str | os.PathLike | None = None,
     ) -> tuple[jax.Array, ShardedInfo]:
-        return sharded_solver(
-            rhs, x0, A_data_override=A_data, save_stats_file=save_stats_file
-        )
+        return sharded_solver(rhs, x0, A_override=A, save_stats_file=save_stats_file)
 
     return ShardedSolve(
         solve_fn,

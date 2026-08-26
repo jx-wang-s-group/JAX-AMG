@@ -56,7 +56,7 @@ def main() -> None:
     x.block_until_ready()
 
     def loss(A_data, rhs):
-        solution, _ = solver(rhs, A_data=A_data)
+        solution, _ = solver(rhs, A=A_data)
         return jnp.sum(solution**2)
 
     with jax.set_mesh(b.sharding.mesh):

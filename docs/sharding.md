@@ -134,25 +134,25 @@ import jax.numpy as jnp
 
 batched_b = jnp.stack((b1, b2))
 batched_x, batched_info = jax.vmap(
-    lambda rhs: solver(rhs, A_data=A.data)
+    lambda rhs: solver(rhs, A=A.data)
 )(batched_b)
 ```
 
 The underlying AmgX solves use JAX-AMG's sequential FFI batching path.
 
-Pass `A.data` to the solve when differentiating matrix values. Enter the mesh
-context for an outer transformation:
+`A=` accepts either this rank's operator or matrix (next section) or the
+packed global values `A.data`. Pass `A.data` to differentiate matrix entries;
+the gradient has the same layout. Enter the mesh context for an outer
+transformation:
 
 ```python
 import jax.numpy as jnp
 
 def loss(A_data, rhs):
-    x, _ = solver(rhs, A_data=A_data)
+    x, _ = solver(rhs, A=A_data)
     return jnp.sum(x**2)
 
-compiled_solver = jax.jit(
-    lambda A_data, rhs: solver(rhs, A_data=A_data)
-)
+compiled_solver = jax.jit(lambda A_data, rhs: solver(rhs, A=A_data))
 compiled_gradient = jax.jit(jax.grad(loss, argnums=(0, 1)))
 
 with jax.set_mesh(b.sharding.mesh):
@@ -162,10 +162,46 @@ with jax.set_mesh(b.sharding.mesh):
 grad_A_local = A.local_matrix(grad_A_data)
 ```
 
-A direct `solver(b)` call can use the matrix's cached values. Pass `A.data`
-explicitly under an enclosing JAX transformation, including RHS-only
-differentiation. This keeps the distributed matrix values as a dynamic operand
-instead of embedding a full local value buffer in the compiled executable.
+A direct `solver(b)` call uses the cached values. Under a JAX transformation
+`A` is required, even for RHS-only differentiation, so the values stay a
+dynamic operand rather than a constant baked into the executable.
+
+## Differentiating Operator Parameters
+
+When the values depend on parameters, pass this rank's operator or matrix as
+`A=`, exactly as `solve(A, b)` takes it in the MPI interface. The solver
+materializes it with the sparsity fixed at construction and differentiates
+through it:
+
+```python
+from jaxamg.matrices import poisson_operator
+from jaxamg.mpi_utils import partition_operator
+
+def local_operator(skew):
+    operator, _, _ = partition_operator(
+        poisson_operator(skew), n_global, rank, nranks
+    )
+    return operator
+
+coloring = jaxamg.cache_coloring(local_operator(0.0), shape=(n_local, n_global))
+A = jaxamg.make_sharded_matrix(
+    jaxamg.with_cache(local_operator(0.0), coloring=coloring), b
+)
+solver = jaxamg.make_sharded_solver(A, b)
+
+def loss(skew, rhs, x_target):
+    x, _ = solver(rhs, A=local_operator(skew))
+    return jnp.sum((x - x_target) ** 2) / n_global
+
+with jax.set_mesh(A.mesh):
+    value, grad_skew = jax.value_and_grad(loss)(skew, b, x_target)
+```
+
+Per rank this is the MPI interface's own materialization, so memory and
+compute per solve match `solve(..., comm=...)`. Parameters the operator closes
+over must be identical on every rank; their gradients are summed across ranks.
+A closed-over value sharded across ranks is rejected under `jax.jit` — pass
+rank-local matrix values as `A.data` instead.
 
 Compilation is entirely the caller's decision: the solver adds no `jax.jit` of
 its own. `jax.value_and_grad(loss)` runs the whole pipeline eagerly, while
@@ -189,11 +225,11 @@ OMPI_MCA_opal_cuda_support=true \
 mpirun -n 2 python demo/sharded_poisson_operator_optimization.py
 ```
 
-The second example recovers an operator parameter by gradient descent, the
-sharded counterpart of `demo/mpi_poisson_operator_optimization.py`. Because the
-loss is a reduction over global arrays, JAX emits the cross-rank collectives and
-the gradient it returns is already the complete global gradient, so no
-`comm.allreduce` of losses or gradients is needed.
+The second example is the sharded counterpart of
+`demo/mpi_poisson_operator_optimization.py`: it recovers an operator parameter
+by gradient descent through `solver(rhs, A=...)`. The loss is a reduction over
+global arrays, so its gradient is already global and no `comm.allreduce` is
+needed.
 
 Matrix gradients use a sparse all-to-all halo exchange: `jax.lax.all_to_all`
 inside a compiled program, and the MPI interface's mpi4jax exchange for

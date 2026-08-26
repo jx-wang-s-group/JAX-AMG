@@ -202,7 +202,7 @@ def _mpi_functions(
 
 def _sharding_functions(solver: ShardedSolve) -> dict[str, Any]:
     def solution(matrix_data, rhs):
-        return solver(rhs, A_data=matrix_data)[0]
+        return solver(rhs, A=matrix_data)[0]
 
     def rhs_gradient(matrix_data, rhs):
         x, pullback = jax.vjp(lambda value: solution(matrix_data, value), rhs)

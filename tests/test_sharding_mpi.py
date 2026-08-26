@@ -27,8 +27,12 @@ if _SHARDING_TEST:
         jax.distributed.initialize(cluster_detection_method="mpi4py")
 
 import jaxamg  # noqa: E402
-from jaxamg.matrices import tridiagonal_matrix_distributed  # noqa: E402
-from jaxamg.mpi_utils import get_partition_info  # noqa: E402
+from jaxamg.matrices import (  # noqa: E402
+    poisson_operator,
+    rhs_ones,
+    tridiagonal_matrix_distributed,
+)
+from jaxamg.mpi_utils import get_partition_info, partition_operator  # noqa: E402
 from jaxamg.sharding import ShardedSolve  # noqa: E402
 
 pytestmark = [
@@ -174,13 +178,11 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
     A_data = matrix.data + jnp.asarray(0.1, dtype=matrix.data.dtype)
 
     def loss(matrix_data, rhs):
-        x, _ = solver(rhs, A_data=matrix_data)
+        x, _ = solver(rhs, A=matrix_data)
         return jnp.sum(x**2)
 
     with jax.set_mesh(mesh):
-        compiled_solve = jax.jit(
-            lambda matrix_data, rhs: solver(rhs, A_data=matrix_data)
-        )
+        compiled_solve = jax.jit(lambda matrix_data, rhs: solver(rhs, A=matrix_data))
         compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1)))
         compiled_cached_grad = jax.jit(jax.grad(loss, argnums=1))
         x, info = compiled_solve(A_data, b)
@@ -260,17 +262,17 @@ def test_sharded_symmetric_warm_start_gradients(sharding_context):
     )
 
     def loss(matrix_data, rhs, guess):
-        x, _ = solver(rhs, guess, A_data=matrix_data)
+        x, _ = solver(rhs, guess, A=matrix_data)
         return jnp.sum(x**2)
 
     with jax.set_mesh(mesh):
         compiled_solve = jax.jit(
-            lambda matrix_data, rhs, guess: solver(rhs, guess, A_data=matrix_data)
+            lambda matrix_data, rhs, guess: solver(rhs, guess, A=matrix_data)
         )
         compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
         compiled_vmap = jax.jit(
             lambda matrix_data, rhs_batch: jax.vmap(
-                lambda rhs: solver(rhs, A_data=matrix_data)[0]
+                lambda rhs: solver(rhs, A=matrix_data)[0]
             )(rhs_batch)
         )
         x, info = compiled_solve(matrix.data, b, x0)
@@ -350,12 +352,12 @@ def test_sharded_uneven_row_partitions(sharding_context):
     A_data = matrix.data + jnp.asarray(0.05, matrix.data.dtype)
 
     def loss(matrix_data, rhs, guess):
-        x, _ = solver(rhs, guess, A_data=matrix_data)
+        x, _ = solver(rhs, guess, A=matrix_data)
         return jnp.sum(x**2)
 
     with jax.set_mesh(mesh):
         compiled_solve = jax.jit(
-            lambda matrix_data, rhs, guess: solver(rhs, guess, A_data=matrix_data)
+            lambda matrix_data, rhs, guess: solver(rhs, guess, A=matrix_data)
         )
         compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
         x, info = compiled_solve(A_data, b, x0)
@@ -462,13 +464,11 @@ def test_sharded_block_matrix_gradients(sharding_context, is_symmetric):
     )
 
     def loss(matrix_data, rhs):
-        x, _ = solver(rhs, A_data=matrix_data)
+        x, _ = solver(rhs, A=matrix_data)
         return jnp.sum(x**2)
 
     with jax.set_mesh(mesh):
-        compiled_solve = jax.jit(
-            lambda matrix_data, rhs: solver(rhs, A_data=matrix_data)
-        )
+        compiled_solve = jax.jit(lambda matrix_data, rhs: solver(rhs, A=matrix_data))
         compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1)))
         x, info = compiled_solve(matrix.data, b)
         grad_A_data, grad_b = compiled_grad(matrix.data, b)
@@ -515,3 +515,88 @@ def test_sharded_block_matrix_gradients(sharding_context, is_symmetric):
     assert solver.global_size == n_global
     assert solver.local_size == n_local
     assert _local_status(info) == 0
+
+
+def test_sharded_operator_parameter_gradients(sharding_context):
+    """``solver(rhs, A=operator)``: eager and compiled gradients of a parameter
+    the operator closes over match the MPI interface's allreduced gradient."""
+    comm, rank, nranks, mesh = sharding_context
+    grid = 8
+    n_global = grid * grid
+    row_start, row_end, n_local = get_partition_info(n_global, rank, nranks)
+    config = {
+        "solver": "PBICGSTAB",
+        "preconditioner": {"solver": "JACOBI_L1"},
+        "communicator": "MPI_DIRECT",
+        "max_iters": 200,
+        "tolerance": 1e-12,
+    }
+
+    def local_operator(skew):
+        operator, _, _ = partition_operator(
+            poisson_operator(skew), n_global, rank, nranks
+        )
+        return operator
+
+    b_local = rhs_ones(n_local)
+    b = jaxamg.make_sharded_vector(b_local, comm=comm, mesh=mesh, global_size=n_global)
+    coloring = jaxamg.cache_coloring(local_operator(0.0), shape=(n_local, n_global))
+    matrix = jaxamg.make_sharded_matrix(
+        jaxamg.with_cache(local_operator(0.0), coloring=coloring),
+        b,
+        comm=comm,
+        mesh=mesh,
+    )
+    solver = jaxamg.make_sharded_solver(matrix, b, config=config)
+
+    true_skew = 3.0
+    with jax.set_mesh(mesh):
+        x_target, info = solver(b, A=local_operator(true_skew))
+    assert _local_status(info) == 0
+
+    def loss(skew, rhs, target):
+        x, _ = solver(rhs, A=local_operator(skew))
+        return jnp.sum((x - target) ** 2) / n_global
+
+    # Reference: the MPI interface's rank-local loss, reduced by hand as in
+    # the MPI demo.
+    mpi_cache = jaxamg.cache_mpi_metadata(
+        config,
+        comm,
+        n_global,
+        (row_start, row_end),
+        jaxamg.with_cache(local_operator(0.0), coloring=coloring),
+    )
+    target_local = np.asarray(solver.local_vector(x_target))
+
+    def loss_local(skew):
+        operator = jaxamg.with_cache(
+            local_operator(skew), coloring=coloring, mpi=mpi_cache
+        )
+        x, _ = jaxamg.solve(operator, b_local)
+        return jnp.sum((x - target_local) ** 2) / n_global
+
+    skew = 1.0
+    reference_loss = comm.allreduce(float(loss_local(skew)), op=MPI.SUM)
+    reference_grad = comm.allreduce(float(jax.grad(loss_local)(skew)), op=MPI.SUM)
+    assert reference_grad != 0.0
+
+    with jax.set_mesh(mesh):
+        eager_loss, eager_grad = jax.value_and_grad(loss)(skew, b, x_target)
+        compiled_loss, compiled_grad = jax.jit(jax.value_and_grad(loss))(
+            skew, b, x_target
+        )
+    for value, grad in ((eager_loss, eager_grad), (compiled_loss, compiled_grad)):
+        assert float(value) == pytest.approx(reference_loss, rel=1e-4)
+        assert float(grad) == pytest.approx(reference_grad, rel=1e-4)
+
+    # A value that differs across ranks cannot be closed over (its cotangent
+    # would be summed). Detected under jit; a use that leaves the operator's
+    # output sharded fails earlier in JAX's sharding checks.
+    def sharded_closure(coefficients, rhs):
+        base = local_operator(1.0)
+        return solver(rhs, A=lambda v: base(v) * jnp.mean(coefficients))[0]
+
+    with jax.set_mesh(mesh):
+        with pytest.raises(ValueError, match="identical on every rank"):
+            jax.jit(sharded_closure).lower(b, b)
