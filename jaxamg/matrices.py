@@ -724,6 +724,85 @@ def convection_diffusion_matrix_2d(
     return jsp.BCSR((vals, cols, indptr), shape=(n2, n2))
 
 
+def poisson_matrix_stretched(
+    nx: int,
+    ny: int,
+    stretch: float = 1.05,
+    *,
+    normalize: bool = True,
+    periodic_x: bool = True,
+    dtype: DTypeLike | None = None,
+) -> tuple[jsp.BCSR, jax.Array]:
+    """Finite-volume Laplacian on a geometrically stretched 2D grid (singular).
+
+    Cell sizes grow by ``stretch`` per cell. Periodic in x (optional), Neumann
+    in y, so ``A·1 = 0``. With ``normalize=True`` rows are divided by the cell
+    volume (``A = D⁻¹L``), which for ``stretch != 1`` is nonsymmetric with
+    ``null(A) = span(1)`` but ``null(Aᵀ) = span(V)``; ``normalize=False``
+    returns the symmetric flux form ``L``. Sign convention ``-∇²`` (positive
+    diagonal). Cell ``(i, j)`` is row ``i * ny + j``.
+
+    Args:
+        nx: Number of cells in x.
+        ny: Number of cells in y.
+        stretch: Growth factor of the cell size per cell (1.0: uniform grid).
+        normalize: Divide each row by its cell volume (see above).
+        periodic_x: Periodic in x; otherwise Neumann in x as well.
+        dtype: Data type for matrix values and volumes (default float32).
+
+    Returns:
+        A: ``(nx*ny) × (nx*ny)`` BCSR matrix.
+        V: Cell volumes ``(nx*ny,)``, the left null vector of the normalized operator.
+    """
+    if nx < 2 or ny < 2:
+        raise ValueError("nx and ny must be at least 2")
+    if stretch <= 0:
+        raise ValueError("stretch must be positive")
+    dtype = jnp.float32 if dtype is None else dtype
+    np_dtype = np.float64 if dtype == jnp.float64 else np.float32
+
+    dx = float(stretch) ** np.arange(nx, dtype=np.float64)
+    dy = float(stretch) ** np.arange(ny, dtype=np.float64)
+    volumes = np.outer(dx, dy).ravel()
+    n = nx * ny
+
+    rows: list[np.ndarray] = []
+    cols: list[np.ndarray] = []
+    vals: list[np.ndarray] = []
+
+    def couple(p: np.ndarray, q: np.ndarray, c: np.ndarray) -> None:
+        # Flux form: L_pq = L_qp = -c, L_pp += c, L_qq += c.
+        rows.extend([p, q, p, q])
+        cols.extend([q, p, p, q])
+        vals.extend([-c, -c, c, c])
+
+    i_grid, j_grid = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+
+    # x faces between (i, j) and (i+1, j)
+    i = i_grid[:-1].ravel()
+    j = j_grid[:-1].ravel()
+    couple(i * ny + j, (i + 1) * ny + j, dy[j] / (0.5 * (dx[i] + dx[i + 1])))
+    if periodic_x:
+        j = np.arange(ny)
+        couple((nx - 1) * ny + j, j, dy[j] / (0.5 * (dx[-1] + dx[0])))
+
+    # y faces between (i, j) and (i, j+1)
+    i = i_grid[:, :-1].ravel()
+    j = j_grid[:, :-1].ravel()
+    couple(i * ny + j, i * ny + j + 1, dx[i] / (0.5 * (dy[j] + dy[j + 1])))
+
+    L = sp.csr_matrix(
+        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(n, n),
+    )
+    L.sum_duplicates()
+    A = (sp.diags(1.0 / volumes) @ L).tocsr() if normalize else L
+    A.sort_indices()
+
+    A_bcsr = jsp.BCSR.from_scipy_sparse(A.astype(np_dtype))
+    return A_bcsr, jnp.asarray(volumes.astype(np_dtype))
+
+
 def rhs_ones(n: int, dtype: DTypeLike | None = None) -> jax.Array:
     """Create a constant RHS vector of ones.
 
