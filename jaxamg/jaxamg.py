@@ -22,6 +22,21 @@ from .mpi_utils import (
     register_comm,
     resolve_comm,
 )
+from .nullspace import (
+    _DENSE_LU_MSG,
+    _MISSING_NULLSPACE_MSG,
+    _MISSING_TRANSPOSE_MSG,
+    NullSpaceSpec,
+    NullSpaceWarning,
+    as_nullspace_basis,
+    make_mpi_reduce_sum,
+    project_out,
+    relative_norm,
+    row_index,
+    validate_basis,
+    verify_nullspace,
+    warn_if_singular,
+)
 from .utils import *
 
 if TYPE_CHECKING:
@@ -510,6 +525,8 @@ def solve(
     partition_info: tuple[int, int] | None = None,
     save_stats_file: str | os.PathLike | None = None,
     reuse_setup: bool = False,
+    nullspace: NullSpaceSpec = None,
+    transpose_nullspace: NullSpaceSpec = None,
     **kwargs: Any,
 ) -> tuple[jax.Array, dict]:
     """Solve `Ax=b` using the AmgX backend. See [Examples](examples.md) for usage.
@@ -525,11 +542,16 @@ def solve(
         partition_info: `(row_start, row_end)` owned by this rank in MPI mode.  Required when `comm` is provided and MPI metadata is not pre-attached to `A`.
         save_stats_file: Optional file path to save detailed AmgX solver statistics.  If None, no file is created.
         reuse_setup: For repeated solves with the same sparsity pattern, skip warm `AMGX_solver_resetup` and keep the cached hierarchy. This is cheaper per solve but may require more iterations if matrix coefficients change significantly.
+        nullspace: Basis of `null(A)` for singular systems: `"constant"`, a length-`n` vector, or an `(n, k)` array (local rows in MPI mode). The solution is pinned orthogonal to it, and the transpose of that pin projects the adjoint right-hand side onto `range(Aᵀ)`, which makes the backward solve converge. Gradients w.r.t. `A` assume perturbations that preserve the declared null spaces (`dA·N = 0`, `Mᵀ·dA = 0`), as coefficient changes of a conservative discretization do. Defaults to the basis attached with `with_cache`.
+        transpose_nullspace: Basis of `null(Aᵀ)` (same formats). `b` is projected onto `range(A)` (removed fraction in `info["rhs_inconsistency"]`) and, by transposition, the adjoint solution is pinned: the forward returns `A⁺b`, `jax.grad` returns `(Aᵀ)⁺g`. Equals `nullspace` for symmetric `A` (filled in when `A` is marked symmetric); for nonsymmetric `A` it differs, e.g. `A = D⁻¹L` has `nullspace="constant"` but `transpose_nullspace=V` (cell volumes). Defaults to the basis attached with `with_cache`.
         **kwargs: Additional AmgX config parameters. These override values in `config` when both are provided.
 
     Returns:
         x: Solution vector (float32 or float64). In MPI mode, returns local portion.
-        info: Dictionary containing `iterations`, `residual`, `status`, and `residual_history` (residual norm per outer iteration, entry 0 being the initial residual; inside `jit` it has fixed length `max_iters + 1` with NaN padding past entry `iterations`).
+        info: Dictionary containing `iterations`, `residual`, `status`, and `residual_history` (residual norm per outer iteration, entry 0 being the initial residual; inside `jit` it has fixed length `max_iters + 1` with NaN padding past entry `iterations`). With `transpose_nullspace`, also `rhs_inconsistency` (`‖b − b'‖/‖b‖`).
+
+    Warns:
+        NullSpaceWarning: `A·1 = 0` without a declared `nullspace`; `nullspace` without `transpose_nullspace` (or vice versa) for a matrix not marked symmetric; a basis failing `A·N ≈ 0` / `Aᵀ·M ≈ 0` (the latter not checked in MPI mode); or a `DENSE_LU_SOLVER` coarse solve. Checks run only on concrete matrix values.
     """
 
     b = jnp.asarray(b)
@@ -555,6 +577,13 @@ def solve(
 
     # MPI cache may be pre-attached to A via `with_cache`
     mpi_cache = getattr(A, "_mpi_cache", None)
+
+    # Null-space bases: explicit arguments override ones attached via with_cache.
+    if nullspace is None:
+        nullspace = getattr(A, "_nullspace", None)
+    if transpose_nullspace is None:
+        transpose_nullspace = getattr(A, "_transpose_nullspace", None)
+    singular = nullspace is not None or transpose_nullspace is not None
 
     # Prepare configuration string/file (skip if using mpi_cache which already has config_str)
     if mpi_cache is not None:
@@ -588,8 +617,11 @@ def solve(
             save_stats=(save_stats_file is not None),
             mpi=(comm is not None),
             block_dim=block_dim,
+            singular=singular,
             **kwargs,
         )
+    if singular and amgx_config.uses_dense_lu_coarse_solver(config_str):
+        warnings.warn(_DENSE_LU_MSG, NullSpaceWarning, stacklevel=2)
 
     # Residual-history slots appended to the stats output (one per outer
     # iteration, plus the initial residual).
@@ -661,14 +693,6 @@ def solve(
                 block_dim=block_dim,
             )
 
-            x, info = solver(
-                A_csr,
-                b,
-                x0_arg,
-                jnp.asarray(halo_plan.col_to_combined),
-                jnp.asarray(halo_plan.send_ids_2d),
-                jnp.asarray(halo_plan.recv_ghost_slot_2d),
-            )
         elif comm is not None:
             # Compute metadata dynamically
             import importlib.util
@@ -747,14 +771,51 @@ def solve(
                 use_x0=use_x0,
                 block_dim=block_dim,
             )
-            x, info = solver(
-                A_csr,
-                b,
-                x0_arg,
-                jnp.asarray(halo_plan.col_to_combined),
-                jnp.asarray(halo_plan.send_ids_2d),
-                jnp.asarray(halo_plan.recv_ghost_slot_2d),
-            )
+
+        halo_args = (
+            jnp.asarray(halo_plan.col_to_combined),
+            jnp.asarray(halo_plan.send_ids_2d),
+            jnp.asarray(halo_plan.recv_ghost_slot_2d),
+        )
+        if mpi_cache is not None:
+            # AmgX runs on the cached communicator; so must everything else.
+            comm_obj = resolve_comm(mpi_cache["comm_ptr"])
+            if comm is not None and register_comm(comm) != mpi_cache["comm_ptr"]:
+                warnings.warn(
+                    "comm differs from the communicator cached on A; using the "
+                    "cached one.",
+                    stacklevel=2,
+                )
+        else:
+            assert comm is not None
+            comm_obj = comm
+        # Global reductions for the null-space projections.
+        reduce_sum = make_mpi_reduce_sum(comm_obj)
+
+        def run(b_: jax.Array, x0_: jax.Array) -> tuple[jax.Array, jax.Array]:
+            return solver(A_csr, b_, x0_, *halo_args)
+
+        n_ghost = halo_plan.n_ghost
+
+        def matvec(basis: jax.Array) -> jax.Array:
+            # Local rows of A @ basis via halo exchange (eager check only).
+            rows = row_index(A_csr)
+            columns = []
+            for j in range(basis.shape[1]):
+                combined = _mpi4jax_halo_gather(
+                    basis[:, j], halo_args[1], halo_args[2], n_ghost, comm_obj
+                )
+                columns.append(
+                    jax.ops.segment_sum(
+                        A_csr.data * combined[halo_args[0]],
+                        rows,
+                        num_segments=A_csr.shape[0],
+                    )
+                )
+            return jnp.stack(columns, axis=1)
+
+        # Aᵀ·M is not checked in MPI mode (needs a reverse halo exchange).
+        matvec_T = None
 
     else:
         # Single-GPU mode: use int32 indices
@@ -769,19 +830,75 @@ def solve(
             use_x0=use_x0,
             block_dim=block_dim,
         )
+        comm_obj = None
+        reduce_sum = None
 
-        x, info = solver(A_csr, b, x0_arg)
+        def run(b_: jax.Array, x0_: jax.Array) -> tuple[jax.Array, jax.Array]:
+            return solver(A_csr, b_, x0_)
+
+        def matvec(basis: jax.Array) -> jax.Array:
+            return A_csr @ basis
+
+        def matvec_T(basis: jax.Array) -> jax.Array:
+            return A_csr.to_bcoo().T @ basis
+
+    # Null-space projections as JAX ops around the primitive; their
+    # transposes are the adjoint projections (see nullspace.py).
+    n_local = A_csr.shape[0]
+    N = as_nullspace_basis(nullspace, n_local, target_dtype, "nullspace")
+    M = as_nullspace_basis(
+        transpose_nullspace, n_local, target_dtype, "transpose_nullspace"
+    )
+    if N is not None:
+        validate_basis(N, "nullspace", comm_obj)
+    if M is not None:
+        validate_basis(M, "transpose_nullspace", comm_obj)
+    if M is None and N is not None:
+        if is_symmetric:
+            M = N
+        else:
+            warnings.warn(_MISSING_TRANSPOSE_MSG, NullSpaceWarning, stacklevel=2)
+    elif N is None and M is not None:
+        if is_symmetric:
+            N = M
+        else:
+            warnings.warn(_MISSING_NULLSPACE_MSG, NullSpaceWarning, stacklevel=2)
+    if N is None and M is None:
+        warn_if_singular(A_csr, comm=comm_obj, stacklevel=3)
+    else:
+        if N is not None:
+            verify_nullspace(A_csr, N, matvec, "nullspace", comm=comm_obj, stacklevel=3)
+        if M is not None and matvec_T is not None:
+            verify_nullspace(
+                A_csr, M, matvec_T, "transpose_nullspace", comm=comm_obj, stacklevel=3
+            )
+
+    rhs_inconsistency = None
+    if M is not None:
+        b_proj = project_out(b, M, reduce_sum)
+        rhs_inconsistency = relative_norm(b - b_proj, b, reduce_sum)
+        b = b_proj
+        if not use_x0:
+            x0_arg = b
+
+    x, info = run(b, x0_arg)
+
+    if N is not None:
+        x = project_out(x, N, reduce_sum)
 
     if isinstance(info, jax.core.Tracer):
         # Inside JIT (or another trace): info elements are tracers; return as-is.
         # The history keeps its fixed trace-time length (outer max_iters + 1),
         # NaN-padded past entry `iterations`.
-        return x, {
+        traced_info = {
             "iterations": info[0],
             "residual": info[1],
             "status": info[2],
             "residual_history": info[3:],
         }
+        if rhs_inconsistency is not None:
+            traced_info["rhs_inconsistency"] = rhs_inconsistency
+        return x, traced_info
 
     info_dict = {
         "iterations": int(info[0]),
@@ -791,6 +908,8 @@ def solve(
         # initial residual); trim the NaN padding outside a trace.
         "residual_history": info[3 : 4 + int(info[0])],
     }
+    if rhs_inconsistency is not None:
+        info_dict["rhs_inconsistency"] = float(rhs_inconsistency)
     if save_stats_file is not None:
         try:
             stats_str = _ensure_backend().get_stats_string()

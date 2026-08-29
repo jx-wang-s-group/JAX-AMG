@@ -133,3 +133,17 @@ config = {
 ```
 
 Non-GPU-aware MPI still works, but communication may stage through host memory and be slower.
+
+## Singular systems
+
+`nullspace` and `transpose_nullspace` (see [Singular systems](examples.md#singular-systems))
+take each rank's local rows; the projections reduce across ranks internally.
+With cached metadata, prepare it with `singular=True` and attach the bases to `A`:
+
+```python
+mpi_cache = jaxamg.cache_mpi_metadata(config, comm, n, (row_start, row_end), A_local, singular=True)
+A_local = jaxamg.with_cache(A_local, mpi=mpi_cache, nullspace="constant", transpose_nullspace=V_local)
+x_local, info = jaxamg.solve(A_local, b_local)
+```
+
+The `Aᵀ·M ≈ 0` check of `transpose_nullspace` is skipped in MPI mode.

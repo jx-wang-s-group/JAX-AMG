@@ -950,3 +950,78 @@ def test_mpi_block_gradients(mpi_context):
     np.testing.assert_allclose(
         np.asarray(g_b), g_b_ref, atol=1e-3 * np.max(np.abs(g_b_ref))
     )
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_nullspace(mpi_context):
+    """Singular nonsymmetric matrix (volume-normalized finite-volume Poisson on
+    a stretched grid) in MPI mode: `nullspace`/`transpose_nullspace` with
+    global reductions, eager and jitted (cached metadata + bases attached to A).
+    """
+    comm, rank, nranks = mpi_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        from jaxamg.matrices import poisson_matrix_stretched
+        from jaxamg.utils import to_scipy
+
+        A_global, V_global = poisson_matrix_stretched(24, 16, 1.08, dtype=jnp.float64)
+        n = A_global.shape[0]
+        V_np = np.asarray(V_global)
+        rng = np.random.default_rng(0)
+        b_global = rng.standard_normal(n)
+        b_global -= (V_np @ b_global) / V_np.sum()  # Σ V_i b_i = 0
+        w_global = rng.standard_normal(n) + 0.5  # Σ w ≠ 0
+
+        A_local, row_start, row_end = partition_csr_matrix(A_global, rank, nranks)
+        rows = slice(row_start, row_end)
+        V_local = jnp.asarray(V_np[rows])
+        b_local = jnp.asarray(b_global[rows])
+        w_local = jnp.asarray(w_global[rows])
+        cfg = {"tolerance": 1e-10, "max_iters": 300}
+
+        def solve_local(b_):
+            return jaxamg.solve(
+                A_local,
+                b_,
+                comm=comm,
+                nglobal=n,
+                partition_info=(row_start, row_end),
+                nullspace="constant",
+                transpose_nullspace=V_local,
+                **cfg,
+            )
+
+        x_local, info = solve_local(b_local)
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+        assert info["rhs_inconsistency"] < 1e-12
+        # Local loss w_local·x_local: summed over ranks it is the global w·x,
+        # so each rank's gradient is its slice of the global one.
+        g_local = jax.grad(lambda b_: jnp.dot(w_local, solve_local(b_)[0]))(b_local)
+
+        # Jitted path: cached MPI metadata and null-space bases attached to A.
+        mpi_cache = jaxamg.cache_mpi_metadata(
+            cfg, comm, n, (row_start, row_end), A_local, singular=True
+        )
+        A_cached = jaxamg.with_cache(
+            A_local, mpi=mpi_cache, nullspace="constant", transpose_nullspace=V_local
+        )
+        g_jit = jax.jit(
+            jax.grad(lambda b_: jnp.dot(w_local, jaxamg.solve(A_cached, b_)[0]))
+        )(b_local)
+
+        x = gather_vector(x_local, comm)
+        g = gather_vector(g_local, comm)
+        g2 = gather_vector(g_jit, comm)
+        if rank == 0:
+            A_dense = to_scipy(A_global).toarray().astype(np.float64)
+            x = np.asarray(x)
+            assert abs(x.mean()) < 1e-10 * np.linalg.norm(x)
+            assert np.linalg.norm(A_dense @ x - b_global) < 1e-7 * np.linalg.norm(
+                b_global
+            )
+            g_ref = np.linalg.pinv(A_dense).T @ w_global
+            atol = 1e-8 * np.linalg.norm(g_ref)
+            np.testing.assert_allclose(np.asarray(g), g_ref, rtol=1e-6, atol=atol)
+            np.testing.assert_allclose(np.asarray(g2), g_ref, rtol=1e-6, atol=atol)
+    finally:
+        jax.config.update("jax_enable_x64", False)

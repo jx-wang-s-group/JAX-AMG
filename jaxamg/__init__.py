@@ -10,6 +10,7 @@ from .jaxamg import (
     get_solver_cache_info,
     solve,
 )
+from .nullspace import NullSpaceWarning
 from .preconditioners import make_lineax_preconditioner, make_preconditioner
 from .sparsity import cache_coloring
 
@@ -20,6 +21,7 @@ __all__ = [
     "cache_coloring",
     "cache_mpi_metadata",
     "AMGXStatus",
+    "NullSpaceWarning",
     "make_preconditioner",
     "make_lineax_preconditioner",
     "clear_solver_cache",
