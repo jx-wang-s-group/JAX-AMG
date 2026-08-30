@@ -1101,6 +1101,11 @@ def make_sharded_solver(
 
     def check_structure(matrix: jsp.BCSR) -> None:
         """Reject a matrix whose CSR structure differs from the fixed one."""
+        if tuple(matrix.shape) != tuple(A_structure.shape):
+            raise ValueError(
+                f"A must have local shape {tuple(A_structure.shape)}; got "
+                f"{tuple(matrix.shape)}"
+            )
         for given, fixed in (
             (matrix.indices, A_structure.indices),
             (matrix.indptr, A_structure.indptr),
