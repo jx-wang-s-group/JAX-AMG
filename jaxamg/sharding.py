@@ -248,8 +248,8 @@ def make_sharded_vector(
 
     Args:
         local_values: This rank's unpadded values with shape ``(n_local,)``.
-        comm: MPI communicator whose rank order matches ``mesh``. Defaults to
-            ``MPI.COMM_WORLD``.
+        comm: MPI communicator spanning every JAX process, with rank order
+            matching ``mesh``. Defaults to ``MPI.COMM_WORLD``.
         mesh: One-dimensional JAX device mesh with one device per MPI rank.
             Defaults to a mesh over the first ``comm.size`` JAX devices (all
             devices in a typical multi-process job).
@@ -601,8 +601,8 @@ def make_sharded_matrix(
             and sparsity pattern are known; it is materialized once here.
         b: Global row-sharded RHS used to validate the matrix partition, mesh,
             and numerical dtype.
-        comm: MPI communicator whose rank order matches the JAX process order.
-            Defaults to ``MPI.COMM_WORLD``.
+        comm: MPI communicator spanning every JAX process, with rank order
+            matching the JAX process order. Defaults to ``MPI.COMM_WORLD``.
         mesh: One-dimensional JAX device mesh. If omitted, use the mesh from
             ``b.sharding``.
         axis_name: Name of the mesh axis that partitions rows and packed values.
@@ -680,9 +680,10 @@ def make_sharded_solver(
 
     This interface complements, rather than replaces, ``solve(..., comm=...)``.
     JAX manages the global input and output arrays through ``shard_map`` while
-    the AmgX solve itself uses the supplied MPI communicator. Version one uses
-    a one-dimensional mesh and requires one MPI process with one mesh-local GPU
-    per rank.
+    the AmgX solve itself uses the supplied MPI communicator. The interface is
+    experimental; it uses a one-dimensional mesh and requires one MPI process
+    with one mesh-local GPU per rank and a communicator spanning every JAX
+    process.
 
     ``jax.distributed.initialize()`` must be called before this function in a
     multi-process job. The matrix owns the communicator, mesh, local CSR

@@ -9,6 +9,11 @@ The interface targets `shard_map` and `NamedSharding` rather than adding a
 separate `pmap` wrapper. This keeps inputs and outputs as JAX global arrays and
 fits JAX's current explicit-sharding model.
 
+The interface is experimental. Every process issues the same collectives, but
+its compiled program carries rank-specific constants (the local CSR structure
+and communication plans), which JAX's SPMD model does not formally promise to
+support. Expect the API to evolve.
+
 ## Current Scope
 
 The initial interface supports:
@@ -22,8 +27,10 @@ The initial interface supports:
 - JIT compilation and reverse-mode differentiation with respect to matrix
   values and the RHS.
 
-The local CSR structure is fixed when the solver is created. Multiple local GPUs
-per MPI process are not supported yet.
+The local CSR structure is fixed when the solver is created. It requires JAX
+0.8 or newer, a communicator spanning every JAX process
+(no subcommunicators), and at least one row per rank. Multiple local GPUs per
+MPI process are not supported yet.
 
 ## Process and Device Setup
 
