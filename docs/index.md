@@ -7,7 +7,7 @@
 - **GPU-Accelerated Solvers**: Leverages NVIDIA AmgX for a broad range of GPU-accelerated sparse linear solvers, including algebraic multigrid (AMG), Krylov methods, and various variants, with flexible configuration options for solvers, smoothers, and preconditioners.
 - **Automatic Differentiation**: Supports adjoint-based gradient computation and integrates seamlessly with JAX for end-to-end differentiable workflows.
 - **JIT Compilation**: Built as a native JAX primitive, fully compatible with Just-in-Time compilation (`jax.jit`) for efficient, low-overhead execution.
-- **MPI Support**: Enables distributed linear solves across multiple GPUs, with GPU-aware MPI support.
+- **Distributed Solving**: Supports multi-GPU MPI, GPU-aware communication, and JAX sharding.
 - **Matrix-Free Operators**: Beyond explicit matrices, `A` can be a callable operator. The library recovers the exact sparsity pattern in a single pass by tracing the operator's computation graph, then assembles the matrix the solver needs.
 
 ## Dependencies
@@ -68,4 +68,3 @@ If you use JAX-AMG in your work, please consider using the following citation:
   doi={10.1016/j.softx.2026.102966},
 }
 ```
-

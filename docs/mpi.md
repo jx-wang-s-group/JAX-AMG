@@ -2,6 +2,10 @@
 
 This page explains how to run JAX-AMG in distributed mode with MPI across multiple GPUs and nodes.
 
+If your application already uses JAX sharding, see the additive
+[JAX Sharding](sharding.md) interface. It retains MPI inside AmgX rather than
+replacing the workflow documented here.
+
 ## Prerequisites
 
 Before running MPI jobs, make sure you have:

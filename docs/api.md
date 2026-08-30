@@ -18,6 +18,38 @@ This page documents the public API of JAX-AMG.
         show_source: false
         heading_level: 3
 
+## JAX Sharding
+
+::: jaxamg.ShardedMatrix
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
+::: jaxamg.ShardedSolve
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
+::: jaxamg.make_sharded_matrix
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
+::: jaxamg.make_sharded_vector
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
+::: jaxamg.make_sharded_solver
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
 ## Warnings
 
 ::: jaxamg.NullSpaceWarning

@@ -8,3 +8,4 @@ include pyproject.toml
 include setup.py
 recursive-include jaxamg *.h *.cc *.pyi
 include jaxamg/py.typed
+recursive-include tests *.py

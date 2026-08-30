@@ -231,11 +231,9 @@ def test_mpi_allgatherv(mpi_context):
 def test_mpi_transpose(mpi_context):
     """Test distributed transpose on a non-symmetric matri."""
     comm, rank, nranks = mpi_context
-    from mpi4py import MPI
-
     from jaxamg.mpi_utils import (
-        _mpi4jax_alltoallv_transpose,
-        local_transpose_nnz,
+        _mpi4jax_transpose_values,
+        build_transpose_plan,
     )
 
     grid_size = 4
@@ -269,30 +267,42 @@ def test_mpi_transpose(mpi_context):
     row_counts_global = comm.allgather(n_local)
     recvcounts_tuple = tuple(row_counts_global)
 
-    # Calculate max_nnz across ranks (send buffers) and this rank's local
-    # nnz(A^T) (output). For this structurally symmetric graph the latter equals
-    # the local nnz of A, so both transpose directions use the same value.
-    max_nnz = comm.allreduce(nnz_local, op=MPI.MAX)
-    nnz_out = local_transpose_nnz(A_local.indices, recvcounts_tuple, comm)
-
-    # 3. Compute A^T
-    data_T, indices_T, indptr_T = _mpi4jax_alltoallv_transpose(
-        new_data,
+    plan = build_transpose_plan(
         A_local.indices,
         A_local.indptr,
         recvcounts_tuple,
+        (row_start, row_end),
         comm,
-        max_nnz,
-        nnz_out,
     )
+
+    # 3. Compute A^T
+    data_T = _mpi4jax_transpose_values(
+        new_data,
+        jnp.asarray(plan.local_source_ids),
+        jnp.asarray(plan.local_target_ids),
+        jnp.asarray(plan.send_ids_2d),
+        jnp.asarray(plan.recv_target_ids_2d),
+        plan.nnz,
+        comm,
+    )
+    indices_T = plan.indices
+    indptr_T = plan.indptr
 
     # Verify A^T is different from A (sanity check)
     assert not np.allclose(data_T, new_data)
 
     # 4. Compute (A^T)^T -> should be A
-    data_TT, indices_TT, indptr_TT = _mpi4jax_alltoallv_transpose(
-        data_T, indices_T, indptr_T, recvcounts_tuple, comm, max_nnz, nnz_out
+    data_TT = _mpi4jax_transpose_values(
+        data_T,
+        jnp.asarray(plan.local_target_ids),
+        jnp.asarray(plan.local_source_ids),
+        jnp.asarray(plan.recv_target_ids_2d),
+        jnp.asarray(plan.send_ids_2d),
+        len(A_local.data),
+        comm,
     )
+    indices_TT = A_local.indices
+    indptr_TT = A_local.indptr
 
     # 5. Verify (A^T)^T == A
     np.testing.assert_array_equal(indptr_TT, A_local.indptr)
@@ -301,19 +311,21 @@ def test_mpi_transpose(mpi_context):
 
     # 6. Verify JIT compatibility
     @jax.jit
-    def transpose_jit_fn(data, indices, indptr):
-        return _mpi4jax_alltoallv_transpose(
-            data, indices, indptr, recvcounts_tuple, comm, max_nnz, nnz_out
+    def transpose_jit_fn(data):
+        return _mpi4jax_transpose_values(
+            data,
+            jnp.asarray(plan.local_source_ids),
+            jnp.asarray(plan.local_target_ids),
+            jnp.asarray(plan.send_ids_2d),
+            jnp.asarray(plan.recv_target_ids_2d),
+            plan.nnz,
+            comm,
         )
 
     # Run JIT-compiled transpose
-    data_T_jit, indices_T_jit, indptr_T_jit = transpose_jit_fn(
-        new_data, A_local.indices, A_local.indptr
-    )
+    data_T_jit = transpose_jit_fn(new_data)
 
     # Verify JIT output matches non-JIT output
-    np.testing.assert_array_equal(indptr_T_jit, indptr_T)
-    np.testing.assert_array_equal(indices_T_jit, indices_T)
     np.testing.assert_allclose(data_T_jit, data_T)
 
 
@@ -332,7 +344,7 @@ def test_mpi_transpose_nonsymmetric_nnz(mpi_context):
     import scipy.sparse as sp
     from mpi4py import MPI
 
-    from jaxamg.mpi_utils import _mpi4jax_alltoallv_transpose, local_transpose_nnz
+    from jaxamg.mpi_utils import _mpi4jax_transpose_values, build_transpose_plan
 
     n = 4 * nranks
     rows, cols, vals = [], [], []
@@ -350,21 +362,25 @@ def test_mpi_transpose_nonsymmetric_nnz(mpi_context):
     A_local, row_start, row_end = partition_csr_matrix(A, rank, nranks)
     n_local = row_end - row_start
     recvcounts_tuple = tuple(comm.allgather(n_local))
-    max_nnz = comm.allreduce(int(A_local.data.shape[0]), op=MPI.MAX)
-    nnz_out = local_transpose_nnz(A_local.indices, recvcounts_tuple, comm)
-
-    data_T, indices_T, indptr_T = _mpi4jax_alltoallv_transpose(
-        A_local.data,
+    plan = build_transpose_plan(
         A_local.indices,
         A_local.indptr,
         recvcounts_tuple,
+        (row_start, row_end),
         comm,
-        max_nnz,
-        nnz_out,
+    )
+    data_T = _mpi4jax_transpose_values(
+        A_local.data,
+        jnp.asarray(plan.local_source_ids),
+        jnp.asarray(plan.local_target_ids),
+        jnp.asarray(plan.send_ids_2d),
+        jnp.asarray(plan.recv_target_ids_2d),
+        plan.nnz,
+        comm,
     )
     data_T = np.asarray(data_T)
-    indices_T = np.asarray(indices_T)
-    indptr_T = np.asarray(indptr_T)
+    indices_T = plan.indices
+    indptr_T = plan.indptr
 
     # Ground truth: this rank's rows of the true global transpose.
     at_true = A.T.tocsr()[row_start:row_end].toarray()
@@ -378,7 +394,7 @@ def test_mpi_transpose_nonsymmetric_nnz(mpi_context):
 
     # The scenario must actually exercise unequal local counts on some rank
     # (otherwise it would not distinguish the fix from the old nnz(A) sizing).
-    grew = comm.allreduce(int(nnz_out != int(A_local.data.shape[0])), op=MPI.SUM)
+    grew = comm.allreduce(int(plan.nnz != int(A_local.data.shape[0])), op=MPI.SUM)
     assert grew > 0, "test matrix should give unequal local nnz across transpose"
 
 

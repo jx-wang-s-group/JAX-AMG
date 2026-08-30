@@ -9,8 +9,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jaxamg.matrices import poisson3d_operator
+from jaxamg import sparsity
+from jaxamg.matrices import poisson3d_operator, poisson_operator
 from jaxamg.sparsity import (
+    _PROBE_BATCH_BYTES,
+    _probe_batch_size,
     _verify_recovery,
     cache_coloring,
     get_column_coloring,
@@ -384,3 +387,48 @@ class TestMaterializeAutodiff:
 
         g = jax.grad(loss)(2.0)
         assert np.isfinite(float(g)) and float(g) != 0.0
+
+
+class TestProbeBatching:
+    """One-hot probing runs in device-memory-budgeted batches, so an operator
+    partitioned from a global one (global apply, then row slice) never forms an
+    n_global x n_global buffer -- and the batch size never changes the result."""
+
+    def test_batch_size_from_budget(self):
+        assert _probe_batch_size(16, 16, 4) == 16  # small problem: one batch
+        assert _probe_batch_size(10**9, 10**9, 8) == 1  # never below one probe
+        # One rank's half of a 512x512 Poisson grid under x64: the batch stays
+        # within the budget instead of an n_global-wide (n_global^2) basis.
+        m, n = 262144, 131072
+        b = _probe_batch_size(m, n, 8)
+        assert 1 <= b < m
+        assert b * (4 * m + 8 * (2 * m + n)) <= _PROBE_BATCH_BYTES
+
+    def test_pattern_independent_of_batch_size(self, monkeypatch):
+        # A row block of a global operator, probed in one batch and in several
+        # uneven batches: identical (rows, cols) arrays -- the column-major
+        # (col, row) order of the dense pattern -- so the budget only sets the
+        # work per step.
+        grid = 6
+        n_global = grid * grid
+        row_start, row_end = 11, 29
+        n_local = row_end - row_start
+        global_op = poisson_operator(skew=1.0)
+        local_op = lambda x: global_op(x)[row_start:row_end]
+        shape = (n_local, n_global)
+
+        monkeypatch.setattr(sparsity, "_PROBE_BATCH_BYTES", 2**40)
+        assert _probe_batch_size(n_global, n_local, 4) == n_global
+        rows_1, cols_1 = probe_sparsity_pattern(local_op, shape)
+
+        per_probe = 4 * n_global + 4 * (2 * n_global + n_local)  # float32 output
+        monkeypatch.setattr(sparsity, "_PROBE_BATCH_BYTES", 5 * per_probe)
+        assert _probe_batch_size(n_global, n_local, 4) == 5  # 36 cols -> 8 batches
+        rows_5, cols_5 = probe_sparsity_pattern(local_op, shape)
+
+        np.testing.assert_array_equal(rows_5, rows_1)
+        np.testing.assert_array_equal(cols_5, cols_1)
+        J = np.asarray(jax.jacfwd(local_op)(jnp.ones(n_global)))
+        c_ref, r_ref = np.nonzero(J.T)
+        np.testing.assert_array_equal(rows_1, r_ref)
+        np.testing.assert_array_equal(cols_1, c_ref)

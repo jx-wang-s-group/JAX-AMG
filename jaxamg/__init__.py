@@ -12,6 +12,13 @@ from .jaxamg import (
 )
 from .nullspace import NullSpaceWarning
 from .preconditioners import make_lineax_preconditioner, make_preconditioner
+from .sharding import (
+    ShardedMatrix,
+    ShardedSolve,
+    make_sharded_matrix,
+    make_sharded_solver,
+    make_sharded_vector,
+)
 from .sparsity import cache_coloring
 
 __all__ = [
@@ -20,6 +27,11 @@ __all__ = [
     "with_cache",
     "cache_coloring",
     "cache_mpi_metadata",
+    "ShardedMatrix",
+    "ShardedSolve",
+    "make_sharded_matrix",
+    "make_sharded_solver",
+    "make_sharded_vector",
     "AMGXStatus",
     "NullSpaceWarning",
     "make_preconditioner",

@@ -1,0 +1,696 @@
+"""Multi-GPU integration tests for the additive JAX sharding interface.
+
+Run this module separately from the ordinary MPI suite because JAX distributed
+must see every participating GPU in every process::
+
+    CUDA_VISIBLE_DEVICES=0,1 \
+      mpirun -n 2 python -m pytest --only-mpi tests/test_sharding_mpi.py
+"""
+
+from __future__ import annotations
+
+import sys
+
+import jax
+import jax.experimental.sparse as jsp
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+_SHARDING_TEST = any("test_sharding_mpi.py" in arg for arg in sys.argv[1:])
+if _SHARDING_TEST:
+    from mpi4py import MPI
+
+    _SHARDING_TEST = MPI.COMM_WORLD.Get_size() > 1
+    if _SHARDING_TEST:
+        # This must precede calls that can initialize the XLA backend.
+        jax.distributed.initialize(cluster_detection_method="mpi4py")
+
+import jaxamg  # noqa: E402
+from jaxamg.matrices import (  # noqa: E402
+    poisson_operator,
+    rhs_ones,
+    tridiagonal_matrix_distributed,
+)
+from jaxamg.mpi_utils import get_partition_info, partition_operator  # noqa: E402
+from jaxamg.sharding import ShardedSolve, has_supported_jax  # noqa: E402
+
+pytestmark = [
+    pytest.mark.mpi(min_size=2),
+    pytest.mark.sharding,
+    pytest.mark.skipif(
+        not has_supported_jax(),
+        reason="the sharding interface requires JAX 0.9 or newer",
+    ),
+    pytest.mark.skipif(
+        not _SHARDING_TEST,
+        reason="run this module separately under mpirun with at least two ranks",
+    ),
+]
+
+
+@pytest.fixture(scope="module")
+def sharding_context():
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    nranks = comm.Get_size()
+    mesh = jax.make_mesh((nranks,), ("rank",))
+
+    yield comm, rank, nranks, mesh
+
+    comm.Barrier()
+    jaxamg.finalize()
+    comm.Barrier()
+    jax.config.update("jax_logging_level", "ERROR")
+    jax.distributed.shutdown()
+
+
+def _global_vector(
+    local_values: np.ndarray, global_size: int, mesh: jax.sharding.Mesh
+) -> jax.Array:
+    sharding = jax.NamedSharding(mesh, jax.P("rank"))
+    return jax.make_array_from_process_local_data(
+        sharding, local_values, global_shape=(global_size,)
+    )
+
+
+def _gather_global(array: jax.Array, comm: MPI.Comm) -> np.ndarray:
+    local = np.asarray(array.addressable_shards[0].data)
+    return np.concatenate(comm.allgather(local))
+
+
+def _gather_unpadded(
+    array: jax.Array, solver: ShardedSolve, comm: MPI.Comm
+) -> np.ndarray:
+    local = np.asarray(solver.local_vector(array))
+    return np.concatenate(comm.allgather(local))
+
+
+def _local_status(info: dict[str, jax.Array]) -> int:
+    status = np.asarray(info["status"].addressable_shards[0].data)
+    return int(status.item())
+
+
+def _distributed_block_system(
+    n_blocks: int,
+    rank: int,
+    nranks: int,
+    *,
+    symmetric: bool,
+) -> tuple[jsp.BCSR, np.ndarray, int, int]:
+    """Build a block-aligned local partition and its small dense reference."""
+    import scipy.sparse
+
+    block_dim = 2
+    lower = -np.ones(n_blocks - 1, dtype=np.float32)
+    upper = lower if symmetric else -1.25 * np.ones_like(lower)
+    node_matrix = scipy.sparse.diags(
+        (lower, 4.0 * np.ones(n_blocks, dtype=np.float32), upper),
+        offsets=(-1, 0, 1),
+        format="csr",
+    )
+    coupling = np.array(
+        [[2.0, 0.25], [0.25 if symmetric else 0.5, 1.5]], dtype=np.float32
+    )
+    A_global = scipy.sparse.kron(node_matrix, coupling, format="csr")
+
+    block_start, block_end, _ = get_partition_info(n_blocks, rank, nranks)
+    row_start = block_start * block_dim
+    row_end = block_end * block_dim
+    A_partition = A_global[row_start:row_end]
+    A_local = jsp.BCSR(
+        (
+            jnp.asarray(A_partition.data, dtype=jnp.float32),
+            jnp.asarray(A_partition.indices, dtype=jnp.int32),
+            jnp.asarray(A_partition.indptr, dtype=jnp.int32),
+        ),
+        shape=A_partition.shape,
+    )
+    return A_local, A_global.toarray(), row_start, row_end
+
+
+def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
+    """Exercise dynamic values and unequal local nnz across A and A transpose."""
+    comm, rank, nranks, mesh = sharding_context
+    n_local = 4
+    n_global = n_local * nranks
+    row_start = rank * n_local
+
+    # Structurally nonsymmetric: diagonal plus a dense first column. Rank zero
+    # has one fewer entry, exercising packed-value padding as well.
+    data: list[float] = []
+    indices: list[int] = []
+    indptr = [0]
+    for global_row in range(row_start, row_start + n_local):
+        if global_row:
+            data.append(-0.25)
+            indices.append(0)
+        data.append(4.0)
+        indices.append(global_row)
+        indptr.append(len(data))
+
+    A_local = jsp.BCSR(
+        (
+            jnp.asarray(data, dtype=jnp.float32),
+            jnp.asarray(indices, dtype=jnp.int32),
+            jnp.asarray(indptr, dtype=jnp.int32),
+        ),
+        shape=(n_local, n_global),
+    )
+    b_local = np.arange(row_start + 1, row_start + n_local + 1, dtype=np.float32)
+    b_local_device = jnp.asarray(b_local)
+    with jax.transfer_guard_device_to_host("disallow"):
+        b = jaxamg.make_sharded_vector(b_local_device, mesh=mesh, global_size=n_global)
+        matrix = jaxamg.make_sharded_matrix(A_local, b)
+    # Rank-local transpose and halo constants must remain local even when the
+    # surrounding application keeps an explicit global mesh active.
+    with jax.set_mesh(mesh):
+        solver = jaxamg.make_sharded_solver(
+            matrix,
+            b,
+            config={
+                "solver": "GMRES",
+                "preconditioner": {"solver": "JACOBI_L1"},
+                "communicator": "MPI_DIRECT",
+                "max_iters": 100,
+                "tolerance": 1e-8,
+            },
+        )
+
+    # Change every real matrix value after setup. Padding is also changed but
+    # must remain disconnected from both the solve and its gradient.
+    A_data = matrix.data + jnp.asarray(0.1, dtype=matrix.data.dtype)
+
+    def loss(matrix_data, rhs):
+        x, _ = solver(rhs, A=matrix_data)
+        return jnp.sum(x**2)
+
+    with jax.set_mesh(mesh):
+        compiled_solve = jax.jit(lambda matrix_data, rhs: solver(rhs, A=matrix_data))
+        compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1)))
+        compiled_cached_grad = jax.jit(jax.grad(loss, argnums=1))
+        x, info = compiled_solve(A_data, b)
+        grad_A_data, grad_b = compiled_grad(A_data, b)
+        grad_b_cached = compiled_cached_grad(matrix.data, b)
+    # The cached-value convenience remains efficient for a direct call; only
+    # enclosing JAX transforms require an explicit matrix-data operand.
+    x_cached, _ = solver(b)
+    x.block_until_ready()
+    x_cached.block_until_ready()
+    grad_A_data.block_until_ready()
+    grad_b.block_until_ready()
+    grad_b_cached.block_until_ready()
+
+    x_global = _gather_global(x, comm)
+    grad_b_global = _gather_global(grad_b, comm)
+    A_global = 4.1 * np.eye(n_global, dtype=np.float64)
+    A_global[1:, 0] = -0.15
+    b_global = np.arange(1, n_global + 1, dtype=np.float64)
+    x_ref = np.linalg.solve(A_global, b_global)
+    adjoint_ref = np.linalg.solve(A_global.T, 2.0 * x_ref)
+
+    np.testing.assert_allclose(x_global, x_ref, rtol=1e-5, atol=1e-6)
+    A_cached_global = 4.0 * np.eye(n_global, dtype=np.float64)
+    A_cached_global[1:, 0] = -0.25
+    x_cached_ref = np.linalg.solve(A_cached_global, b_global)
+    adjoint_cached_ref = np.linalg.solve(A_cached_global.T, 2.0 * x_cached_ref)
+    np.testing.assert_allclose(
+        _gather_global(x_cached, comm), x_cached_ref, rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        _gather_global(grad_b_cached, comm),
+        adjoint_cached_ref,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(grad_b_global, adjoint_ref, rtol=1e-5, atol=1e-6)
+
+    grad_A_local = matrix.local_matrix(grad_A_data)
+    local_rows = np.repeat(
+        np.arange(row_start, row_start + n_local), np.diff(np.asarray(indptr))
+    )
+    grad_A_ref = -adjoint_ref[local_rows] * x_ref[np.asarray(indices, dtype=np.int64)]
+    np.testing.assert_allclose(
+        np.asarray(grad_A_local.data), grad_A_ref, rtol=1e-5, atol=1e-6
+    )
+
+    packed_gradient = np.asarray(grad_A_data.addressable_shards[0].data)
+    np.testing.assert_array_equal(packed_gradient[len(data) :], 0)
+    assert _local_status(info) == 0
+
+
+def test_sharded_symmetric_warm_start_gradients(sharding_context):
+    """Cover the symmetric optimization and zero x0 cotangent."""
+    comm, rank, nranks, mesh = sharding_context
+    n_local = 4
+    n_global = n_local * nranks
+    A_local, row_start, row_end = tridiagonal_matrix_distributed(
+        n_global, rank, nranks, diagonal_value=4.0, dtype=jnp.float32
+    )
+    b_local = np.linspace(row_start + 1.0, row_end, n_local, dtype=np.float32)
+    x0_local = np.full(n_local, 0.25, dtype=np.float32)
+    b = _global_vector(b_local, n_global, mesh)
+    x0 = _global_vector(x0_local, n_global, mesh)
+    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
+    solver = jaxamg.make_sharded_solver(
+        matrix,
+        b,
+        is_symmetric=True,
+        config={
+            "solver": "CG",
+            "preconditioner": {"solver": "JACOBI_L1"},
+            "communicator": "MPI_DIRECT",
+            "max_iters": 100,
+            "tolerance": 1e-8,
+        },
+    )
+
+    def loss(matrix_data, rhs, guess):
+        x, _ = solver(rhs, guess, A=matrix_data)
+        return jnp.sum(x**2)
+
+    with jax.set_mesh(mesh):
+        compiled_solve = jax.jit(
+            lambda matrix_data, rhs, guess: solver(rhs, guess, A=matrix_data)
+        )
+        compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+        compiled_vmap = jax.jit(
+            lambda matrix_data, rhs_batch: jax.vmap(
+                lambda rhs: solver(rhs, A=matrix_data)[0]
+            )(rhs_batch)
+        )
+        x, info = compiled_solve(matrix.data, b, x0)
+        grad_A_data, grad_b, grad_x0 = compiled_grad(matrix.data, b, x0)
+        x_batched = compiled_vmap(matrix.data, jnp.stack((b, 2 * b)))
+    x.block_until_ready()
+    grad_A_data.block_until_ready()
+    grad_b.block_until_ready()
+    grad_x0.block_until_ready()
+    x_batched.block_until_ready()
+
+    x_global = _gather_global(x, comm)
+    grad_b_global = _gather_global(grad_b, comm)
+    grad_x0_global = _gather_global(grad_x0, comm)
+    A_global = 4.0 * np.eye(n_global, dtype=np.float64)
+    A_global += np.diag(-np.ones(n_global - 1), 1)
+    A_global += np.diag(-np.ones(n_global - 1), -1)
+    b_global = np.arange(1, n_global + 1, dtype=np.float64)
+    x_ref = np.linalg.solve(A_global, b_global)
+    adjoint_ref = np.linalg.solve(A_global.T, 2.0 * x_ref)
+
+    np.testing.assert_allclose(x_global, x_ref, rtol=1e-5, atol=1e-6)
+    x_batched_global = np.concatenate(
+        comm.allgather(np.asarray(x_batched.addressable_shards[0].data)), axis=1
+    )
+    np.testing.assert_allclose(
+        x_batched_global,
+        np.stack((x_ref, 2 * x_ref)),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(grad_b_global, adjoint_ref, rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(grad_x0_global, 0)
+
+    grad_A_local = matrix.local_matrix(grad_A_data)
+    row_indices = np.repeat(
+        np.arange(row_start, row_end), np.diff(np.asarray(A_local.indptr))
+    )
+    grad_A_ref = (
+        -adjoint_ref[row_indices] * x_ref[np.asarray(A_local.indices, dtype=np.int64)]
+    )
+    np.testing.assert_allclose(
+        np.asarray(grad_A_local.data), grad_A_ref, rtol=1e-5, atol=1e-6
+    )
+    assert _local_status(info) == 0
+
+
+@pytest.mark.mpi(min_size=3)
+def test_sharded_uneven_row_partitions(sharding_context):
+    """Exercise padded vectors for a global size not divisible by rank count."""
+    comm, rank, nranks, mesh = sharding_context
+    n_global = 4 * nranks + 1
+    A_local, row_start, row_end = tridiagonal_matrix_distributed(
+        n_global, rank, nranks, diagonal_value=4.0, dtype=jnp.float32
+    )
+    n_local = row_end - row_start
+    b_local = np.arange(row_start + 1, row_end + 1, dtype=np.float32)
+    b_local_device = jnp.asarray(b_local)
+    x0_local = np.full(n_local, 0.25, dtype=np.float32)
+    with jax.transfer_guard_device_to_host("disallow"):
+        b = jaxamg.make_sharded_vector(b_local_device, global_size=n_global)
+    x0 = jaxamg.make_sharded_vector(
+        x0_local, comm=comm, mesh=mesh, global_size=n_global
+    )
+    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
+    solver = jaxamg.make_sharded_solver(
+        matrix,
+        b,
+        config={
+            "solver": "GMRES",
+            "preconditioner": {"solver": "JACOBI_L1"},
+            "communicator": "MPI_DIRECT",
+            "max_iters": 100,
+            "tolerance": 1e-8,
+        },
+    )
+    A_data = matrix.data + jnp.asarray(0.05, matrix.data.dtype)
+
+    def loss(matrix_data, rhs, guess):
+        x, _ = solver(rhs, guess, A=matrix_data)
+        return jnp.sum(x**2)
+
+    with jax.set_mesh(mesh):
+        compiled_solve = jax.jit(
+            lambda matrix_data, rhs, guess: solver(rhs, guess, A=matrix_data)
+        )
+        compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+        x, info = compiled_solve(A_data, b, x0)
+        grad_A_data, grad_b, grad_x0 = compiled_grad(A_data, b, x0)
+    x.block_until_ready()
+    grad_A_data.block_until_ready()
+    grad_b.block_until_ready()
+    grad_x0.block_until_ready()
+
+    x_global = _gather_unpadded(x, solver, comm)
+    grad_b_global = _gather_unpadded(grad_b, solver, comm)
+    grad_x0_global = _gather_unpadded(grad_x0, solver, comm)
+    A_global = 4.05 * np.eye(n_global, dtype=np.float64)
+    A_global += np.diag(-0.95 * np.ones(n_global - 1), 1)
+    A_global += np.diag(-0.95 * np.ones(n_global - 1), -1)
+    b_global = np.arange(1, n_global + 1, dtype=np.float64)
+    x_ref = np.linalg.solve(A_global, b_global)
+    adjoint_ref = np.linalg.solve(A_global.T, 2.0 * x_ref)
+
+    np.testing.assert_allclose(x_global, x_ref, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(grad_b_global, adjoint_ref, rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(grad_x0_global, 0)
+
+    grad_A_local = matrix.local_matrix(grad_A_data)
+    row_indices = np.repeat(
+        np.arange(row_start, row_end), np.diff(np.asarray(A_local.indptr))
+    )
+    grad_A_ref = (
+        -adjoint_ref[row_indices] * x_ref[np.asarray(A_local.indices, dtype=np.int64)]
+    )
+    np.testing.assert_allclose(
+        np.asarray(grad_A_local.data), grad_A_ref, rtol=1e-5, atol=1e-6
+    )
+
+    x_physical = np.asarray(x.addressable_shards[0].data)
+    grad_b_physical = np.asarray(grad_b.addressable_shards[0].data)
+    np.testing.assert_array_equal(x_physical[n_local:], 0)
+    np.testing.assert_array_equal(grad_b_physical[n_local:], 0)
+    assert solver.global_size == n_global
+    assert solver.local_size == n_local
+    assert _local_status(info) == 0
+
+
+def test_sharded_save_stats_file(sharding_context, tmp_path):
+    """A direct call with save_stats_file writes formatted stats on rank zero."""
+    comm, rank, nranks, mesh = sharding_context
+    n_local = 4
+    n_global = n_local * nranks
+    A_local, row_start, row_end = tridiagonal_matrix_distributed(
+        n_global, rank, nranks, diagonal_value=4.0, dtype=jnp.float32
+    )
+    b_local = np.ones(n_local, dtype=np.float32)
+    b = _global_vector(b_local, n_global, mesh)
+    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
+    solver = jaxamg.make_sharded_solver(
+        matrix,
+        b,
+        is_symmetric=True,
+        save_stats=True,
+        config={
+            "solver": "CG",
+            "preconditioner": {"solver": "AMG"},
+            "communicator": "MPI_DIRECT",
+            "max_iters": 100,
+            "tolerance": 1e-8,
+        },
+    )
+
+    stats_file = tmp_path / "sharded_stats.txt"
+    x, info = solver(b, save_stats_file=stats_file)
+    assert _local_status(info) == 0
+    if rank == 0:
+        content = stats_file.read_text()
+        assert "SOLVER ITERATIONS" in content
+    comm.Barrier()
+
+
+@pytest.mark.parametrize("is_symmetric", [True, False])
+def test_sharded_block_matrix_gradients(sharding_context, is_symmetric):
+    """Cover block solves and VJPs with uneven block-aligned partitions."""
+    comm, rank, nranks, mesh = sharding_context
+    block_dim = 2
+    n_blocks = 2 * nranks + 1
+    n_global = block_dim * n_blocks
+    A_local, A_global, row_start, row_end = _distributed_block_system(
+        n_blocks, rank, nranks, symmetric=is_symmetric
+    )
+    n_local = row_end - row_start
+    b_local = np.linspace(row_start + 1.0, row_end, n_local, dtype=np.float32)
+    b = jaxamg.make_sharded_vector(b_local, global_size=n_global)
+    matrix = jaxamg.make_sharded_matrix(A_local, b)
+    solver = jaxamg.make_sharded_solver(
+        matrix,
+        b,
+        is_symmetric=is_symmetric,
+        block_dim=block_dim,
+        config={
+            "solver": "FGMRES",
+            "preconditioner": {"solver": "BLOCK_JACOBI"},
+            "communicator": "MPI_DIRECT",
+            "max_iters": 200,
+            "tolerance": 1e-8,
+        },
+    )
+
+    def loss(matrix_data, rhs):
+        x, _ = solver(rhs, A=matrix_data)
+        return jnp.sum(x**2)
+
+    with jax.set_mesh(mesh):
+        compiled_solve = jax.jit(lambda matrix_data, rhs: solver(rhs, A=matrix_data))
+        compiled_grad = jax.jit(jax.grad(loss, argnums=(0, 1)))
+        x, info = compiled_solve(matrix.data, b)
+        grad_A_data, grad_b = compiled_grad(matrix.data, b)
+    x.block_until_ready()
+    grad_A_data.block_until_ready()
+    grad_b.block_until_ready()
+
+    b_global = np.arange(1, n_global + 1, dtype=np.float64)
+    A_reference = np.asarray(A_global, dtype=np.float64)
+    x_reference = np.linalg.solve(A_reference, b_global)
+    adjoint_reference = np.linalg.solve(A_reference.T, 2.0 * x_reference)
+    np.testing.assert_allclose(
+        _gather_unpadded(x, solver, comm), x_reference, rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        _gather_unpadded(grad_b, solver, comm),
+        adjoint_reference,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    grad_A_local = matrix.local_matrix(grad_A_data)
+    local_rows = np.repeat(
+        np.arange(row_start, row_end), np.diff(np.asarray(A_local.indptr))
+    )
+    grad_A_reference = (
+        -adjoint_reference[local_rows]
+        * x_reference[np.asarray(A_local.indices, dtype=np.int64)]
+    )
+    np.testing.assert_allclose(
+        np.asarray(grad_A_local.data),
+        grad_A_reference,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    x_physical = np.asarray(x.addressable_shards[0].data)
+    grad_b_physical = np.asarray(grad_b.addressable_shards[0].data)
+    grad_A_physical = np.asarray(grad_A_data.addressable_shards[0].data)
+    np.testing.assert_array_equal(x_physical[n_local:], 0)
+    np.testing.assert_array_equal(grad_b_physical[n_local:], 0)
+    np.testing.assert_array_equal(grad_A_physical[len(A_local.data) :], 0)
+    assert n_local % block_dim == 0
+    assert solver.global_size == n_global
+    assert solver.local_size == n_local
+    assert _local_status(info) == 0
+
+
+def test_sharded_operator_parameter_gradients(sharding_context):
+    """``solver(rhs, A=operator)``: eager and compiled gradients of a parameter
+    the operator closes over match the MPI interface's allreduced gradient."""
+    comm, rank, nranks, mesh = sharding_context
+    grid = 8
+    n_global = grid * grid
+    row_start, row_end, n_local = get_partition_info(n_global, rank, nranks)
+    config = {
+        "solver": "PBICGSTAB",
+        "preconditioner": {"solver": "JACOBI_L1"},
+        "communicator": "MPI_DIRECT",
+        "max_iters": 200,
+        "tolerance": 1e-12,
+    }
+
+    def local_operator(skew):
+        operator, _, _ = partition_operator(
+            poisson_operator(skew), n_global, rank, nranks
+        )
+        return operator
+
+    b_local = rhs_ones(n_local)
+    b = jaxamg.make_sharded_vector(b_local, comm=comm, mesh=mesh, global_size=n_global)
+    coloring = jaxamg.cache_coloring(local_operator(0.0), shape=(n_local, n_global))
+    matrix = jaxamg.make_sharded_matrix(
+        jaxamg.with_cache(local_operator(0.0), coloring=coloring),
+        b,
+        comm=comm,
+        mesh=mesh,
+    )
+    solver = jaxamg.make_sharded_solver(matrix, b, config=config)
+
+    true_skew = 3.0
+    with jax.set_mesh(mesh):
+        x_target, info = solver(b, A=local_operator(true_skew))
+    assert _local_status(info) == 0
+
+    def loss(skew, rhs, target):
+        x, _ = solver(rhs, A=local_operator(skew))
+        return jnp.sum((x - target) ** 2) / n_global
+
+    # Reference: the MPI interface's rank-local loss, reduced by hand as in
+    # the MPI demo.
+    mpi_cache = jaxamg.cache_mpi_metadata(
+        config,
+        comm,
+        n_global,
+        (row_start, row_end),
+        jaxamg.with_cache(local_operator(0.0), coloring=coloring),
+    )
+    target_local = np.asarray(solver.local_vector(x_target))
+
+    def loss_local(skew):
+        operator = jaxamg.with_cache(
+            local_operator(skew), coloring=coloring, mpi=mpi_cache
+        )
+        x, _ = jaxamg.solve(operator, b_local)
+        return jnp.sum((x - target_local) ** 2) / n_global
+
+    skew = 1.0
+    reference_loss = comm.allreduce(float(loss_local(skew)), op=MPI.SUM)
+    reference_grad = comm.allreduce(float(jax.grad(loss_local)(skew)), op=MPI.SUM)
+    assert reference_grad != 0.0
+
+    with jax.set_mesh(mesh):
+        eager_loss, eager_grad = jax.value_and_grad(loss)(skew, b, x_target)
+        compiled_loss, compiled_grad = jax.jit(jax.value_and_grad(loss))(
+            skew, b, x_target
+        )
+    for value, grad in ((eager_loss, eager_grad), (compiled_loss, compiled_grad)):
+        assert float(value) == pytest.approx(reference_loss, rel=1e-4)
+        assert float(grad) == pytest.approx(reference_grad, rel=1e-4)
+
+    # A value that differs across ranks cannot be closed over (its cotangent
+    # would be summed). Detected under jit; a use that leaves the operator's
+    # output sharded fails earlier in JAX's sharding checks.
+    def sharded_closure(coefficients, rhs):
+        base = local_operator(1.0)
+        return solver(rhs, A=lambda v: base(v) * jnp.mean(coefficients))[0]
+
+    with jax.set_mesh(mesh):
+        with pytest.raises(ValueError, match="identical on every rank"):
+            jax.jit(sharded_closure).lower(b, b)
+
+
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_sharded_nullspace(sharding_context, symmetric, monkeypatch):
+    """Singular finite-volume Poisson on a stretched grid (nonsymmetric
+    volume-normalized form, or the symmetric flux form): eager and compiled
+    solves and RHS gradients against the pseudo-inverse."""
+    comm, rank, nranks, mesh = sharding_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        from jaxamg.matrices import poisson_matrix_stretched
+        from jaxamg.mpi_utils import partition_csr_matrix
+        from jaxamg.utils import to_scipy
+
+        A_global, V_global = poisson_matrix_stretched(
+            24, 16, 1.08, normalize=not symmetric, dtype=jnp.float64
+        )
+        n = A_global.shape[0]
+        V_np = np.ones(n) if symmetric else np.asarray(V_global)
+        rng = np.random.default_rng(0)
+        b_global = rng.standard_normal(n)
+        b_global -= (V_np @ b_global) / V_np.sum()  # consistent RHS
+        w_global = rng.standard_normal(n) + 0.5
+
+        A_local, row_start, row_end = partition_csr_matrix(A_global, rank, nranks)
+        rows = slice(row_start, row_end)
+        bases = {"nullspace": "constant"}
+        if not symmetric:
+            bases["transpose_nullspace"] = jnp.asarray(V_np[rows])
+        b = jaxamg.make_sharded_vector(b_global[rows], comm=comm, mesh=mesh)
+        w = jaxamg.make_sharded_vector(w_global[rows], comm=comm, mesh=mesh)
+        A = jaxamg.make_sharded_matrix(
+            jaxamg.with_cache(A_local, **bases), b, comm=comm, mesh=mesh
+        )
+        solver = jaxamg.make_sharded_solver(
+            A, b, config={"tolerance": 1e-10, "max_iters": 300}, is_symmetric=symmetric
+        )
+
+        def loss(rhs, A_data, weights):
+            return jnp.sum(weights * solver(rhs, A=A_data)[0])
+
+        # Bases were validated at creation; tracing must not validate again
+        # (that would be a host collective inside the trace).
+        import jaxamg.jaxamg as core
+
+        validations = []
+        monkeypatch.setattr(
+            core, "validate_basis", lambda *args: validations.append(args)
+        )
+        with jax.set_mesh(mesh):
+            jax.jit(loss).lower(b, A.data, w)
+            jax.jit(lambda rhs, x0, A_data: solver(rhs, x0, A=A_data)[0]).lower(
+                b, b, A.data
+            )
+            jax.jit(jax.grad(loss)).lower(b, A.data, w)
+        monkeypatch.undo()
+        assert validations == []
+
+        x, info = solver(b)
+        assert _local_status(info) == 0
+        inconsistency = np.asarray(info["rhs_inconsistency"].addressable_shards[0].data)
+        assert inconsistency.item() < 1e-12
+
+        # Scaling A preserves both null spaces: d(w·x)/ds = -w·x at s = 1.
+        def scaled_loss(scale, rhs, A_data, weights):
+            return loss(rhs, scale * A_data, weights)
+
+        with jax.set_mesh(mesh):
+            g_eager = jax.grad(loss)(b, A.data, w)
+            g_jit = jax.jit(jax.grad(loss))(b, A.data, w)
+            wx, ds_eager = jax.value_and_grad(scaled_loss)(1.0, b, A.data, w)
+            ds_jit = jax.jit(jax.grad(scaled_loss))(1.0, b, A.data, w)
+        np.testing.assert_allclose(float(ds_eager), -float(wx), rtol=1e-6)
+        np.testing.assert_allclose(float(ds_jit), -float(wx), rtol=1e-6)
+
+        x_np = _gather_unpadded(x, solver, comm)
+        g1 = _gather_unpadded(g_eager, solver, comm)
+        g2 = _gather_unpadded(g_jit, solver, comm)
+        if rank == 0:
+            A_dense = to_scipy(A_global).toarray().astype(np.float64)
+            assert abs(x_np.mean()) < 1e-10 * np.linalg.norm(x_np)
+            assert np.linalg.norm(A_dense @ x_np - b_global) < 1e-7 * np.linalg.norm(
+                b_global
+            )
+            g_ref = np.linalg.pinv(A_dense).T @ w_global
+            atol = 1e-8 * np.linalg.norm(g_ref)
+            np.testing.assert_allclose(g1, g_ref, rtol=1e-6, atol=atol)
+            np.testing.assert_allclose(g2, g_ref, rtol=1e-6, atol=atol)
+    finally:
+        jax.config.update("jax_enable_x64", False)

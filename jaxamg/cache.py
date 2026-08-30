@@ -16,6 +16,88 @@ from .utils import *
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
 
+    from .mpi_utils import HaloPlan, TransposePlan
+
+
+def _build_mpi_cache(
+    config: dict,
+    comm: "Comm",
+    nglobal: int,
+    recvcounts_tuple: tuple[int, ...],
+    max_nnz: int,
+    nnz_out: int | None,
+    halo_plan: "HaloPlan",
+    *,
+    transpose_plan: "TransposePlan | None" = None,
+    row_indices: np.ndarray | jax.Array | None = None,
+    save_stats: bool = False,
+    block_dim: int = 1,
+    singular: bool = False,
+    lrank: int | None = None,
+    device: jax.Device | None = None,
+    commit: bool = True,
+) -> dict[str, Any]:
+    """Assemble MPI metadata after structure-dependent collectives are done.
+
+    ``commit`` controls device placement of the routing arrays. The default pins
+    them to one device, which is what repeated eager MPI solves want. A caller
+    that captures them in a ``jax.shard_map`` spanning the whole mesh must pass
+    ``commit=False``: an array committed to a single device cannot be captured
+    there, while an uncommitted one can.
+    """
+    from .mpi_utils import register_comm
+
+    rank = comm.Get_rank()
+    comm_ptr = register_comm(comm)
+    if lrank is None:
+        lrank = rank % jax.device_count()
+
+    # These plans are solve operands, not setup metadata. Keep one device copy
+    # in the cache so repeated eager solves do not re-transfer every routing
+    # array from the host. The original NumPy buffers can then be released.
+    if device is None:
+        local_devices = jax.local_devices()
+        device = local_devices[lrank % len(local_devices)]
+
+    def place(array):
+        return jax.device_put(array, device) if commit else jnp.asarray(array)
+
+    halo_plan = halo_plan._replace(
+        col_to_combined=place(halo_plan.col_to_combined),
+        send_ids_2d=place(halo_plan.send_ids_2d),
+        recv_ghost_slot_2d=place(halo_plan.recv_ghost_slot_2d),
+    )
+    if transpose_plan is not None:
+        with temp_enable_x64():
+            transpose_plan = transpose_plan._replace(
+                indices=place(transpose_plan.indices),
+                indptr=place(transpose_plan.indptr),
+                local_source_ids=place(transpose_plan.local_source_ids),
+                local_target_ids=place(transpose_plan.local_target_ids),
+                send_ids_2d=place(transpose_plan.send_ids_2d),
+                recv_target_ids_2d=place(transpose_plan.recv_target_ids_2d),
+            )
+    if row_indices is not None:
+        row_indices = place(row_indices)
+
+    config_str = amgx_config.prepare_config(
+        config, save_stats=save_stats, mpi=True, block_dim=block_dim, singular=singular
+    )
+    return {
+        "recvcounts_tuple": recvcounts_tuple,
+        "comm_ptr": comm_ptr,
+        "lrank": lrank,
+        "nglobal": nglobal,
+        "config_str": config_str,
+        "max_nnz": max_nnz,
+        "nnz_out": nnz_out,
+        "halo_plan": halo_plan,
+        "transpose_plan": transpose_plan,
+        "row_indices": row_indices,
+        "block_dim": block_dim,
+        "singular": singular,
+    }
+
 
 def with_cache(
     A: MatrixOrOperator,
@@ -151,12 +233,14 @@ def cache_mpi_metadata(
           `None` when `is_symmetric` is True
         - `halo_plan`: Backward-pass halo-exchange plan for the gradient w.r.t.
           A (fetches only referenced remote solution entries)
+        - `transpose_plan`: Fixed transpose structure and value routing for a
+          nonsymmetric matrix, or `None` when `is_symmetric` is True
+        - `row_indices`: Local CSR row index for every matrix nonzero
     """
     singular = singular or any(
         getattr(A, attr, None) is not None
         for attr in ("_nullspace", "_transpose_nullspace")
     )
-    rank = comm.Get_rank()
     row_start, row_end = partition_info
     n_local = row_end - row_start
 
@@ -172,25 +256,20 @@ def cache_mpi_metadata(
     # Compute MPI communication metadata
     all_sizes = comm.allgather(n_local)
 
-    from .mpi_utils import build_halo_plan, local_transpose_nnz, register_comm
-
-    # Register the communicator so the cached solver's backward pass can recover
-    # it for its collectives; comm_ptr is its address.
-    comm_ptr = register_comm(comm)
-    gpu_count = jax.device_count()
-    lrank = rank % gpu_count
-
-    # Prepare config string
-    config_str = amgx_config.prepare_config(
-        config, save_stats=save_stats, mpi=True, block_dim=block_dim, singular=singular
-    )
+    from .mpi_utils import build_halo_plan, build_transpose_plan
 
     # Compute max_nnz across all ranks, and capture this rank's global column
     # indices (needed for nnz_out, the transpose output sizing).
-    # For sparse matrices (BCSR), get nnz/indices from the arrays directly.
-    if hasattr(A, "data"):
+    # For CSR-like matrices (BCSR, SciPy CSR), read the arrays directly. SciPy
+    # CSC/BSR also expose these attributes but with different semantics, so
+    # they take the conversion path below instead.
+    if (
+        all(hasattr(A, field) for field in ("data", "indices", "indptr"))
+        and getattr(A, "format", "csr") == "csr"
+    ):
         local_nnz = len(A.data)
         local_col_indices = np.asarray(A.indices)
+        local_indptr = np.asarray(A.indptr)
     elif callable(A):
         # For distributed operators, we need to use global size for proper materialization
         # The operator shape is (n_local, n_global): takes global vector, returns local portion
@@ -211,11 +290,16 @@ def cache_mpi_metadata(
 
         local_nnz = len(A_materialized.data)
         local_col_indices = np.asarray(A_materialized.indices)
+        local_indptr = np.asarray(A_materialized.indptr)
     else:
-        raise TypeError(
-            f"Matrix A must be BCSR, BCOO, SciPy sparse, dense array, or callable. "
-            f"Got {type(A).__name__}."
+        A_materialized = to_bcsr_matrix(
+            A,
+            b=jnp.empty(n_local, dtype=get_preferred_dtype(A, None)),
+            use_int64_indices=True,
         )
+        local_nnz = len(A_materialized.data)
+        local_col_indices = np.asarray(A_materialized.indices)
+        local_indptr = np.asarray(A_materialized.indptr)
 
     all_nnz = comm.allgather(local_nnz)
     max_nnz = max(all_nnz)
@@ -226,8 +310,16 @@ def cache_mpi_metadata(
     # of non-symmetric solves). Symmetric solves never transpose, so skip it.
     if is_symmetric:
         nnz_out = None
+        transpose_plan = None
     else:
-        nnz_out = local_transpose_nnz(local_col_indices, recvcounts_tuple, comm)
+        transpose_plan = build_transpose_plan(
+            local_col_indices,
+            local_indptr,
+            recvcounts_tuple,
+            partition_info,
+            comm,
+        )
+        nnz_out = transpose_plan.nnz
 
     # Backward-pass halo plan: fetches only the remote solution entries this
     # rank's rows reference for the gradient w.r.t. A, instead of gathering the
@@ -235,18 +327,21 @@ def cache_mpi_metadata(
     halo_plan = build_halo_plan(
         local_col_indices, recvcounts_tuple, partition_info, comm
     )
+    row_indices = np.repeat(
+        np.arange(n_local, dtype=np.int32), np.diff(local_indptr)
+    ).astype(np.int32)
 
-    cache_dict = {
-        "recvcounts_tuple": recvcounts_tuple,
-        "comm_ptr": comm_ptr,
-        "lrank": lrank,
-        "nglobal": nglobal,
-        "config_str": config_str,
-        "max_nnz": max_nnz,
-        "nnz_out": nnz_out,
-        "halo_plan": halo_plan,
-        "block_dim": block_dim,
-        "singular": singular,
-    }
-
-    return cache_dict
+    return _build_mpi_cache(
+        config,
+        comm,
+        nglobal,
+        recvcounts_tuple,
+        max_nnz,
+        nnz_out,
+        halo_plan,
+        transpose_plan=transpose_plan,
+        row_indices=row_indices,
+        save_stats=save_stats,
+        block_dim=block_dim,
+        singular=singular,
+    )

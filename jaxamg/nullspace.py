@@ -116,9 +116,16 @@ def _global_max(value: float, comm: "Comm | None") -> float:
 
 
 def as_nullspace_basis(
-    spec: NullSpaceSpec, n: int, dtype: DTypeLike, name: str
+    spec: NullSpaceSpec,
+    n: int,
+    dtype: DTypeLike,
+    name: str,
+    n_global: int | None = None,
 ) -> jax.Array | None:
-    """Normalize ``"constant"`` / vector / ``(n, k)`` array to ``(n, k)`` (or None)."""
+    """Normalize ``"constant"`` / vector / ``(n, k)`` array to ``(n, k)`` (or None).
+
+    ``n_global`` bounds ``k`` for a distributed basis, whose local slice may
+    have fewer rows than columns."""
     if spec is None:
         return None
     if isinstance(spec, str):
@@ -131,10 +138,11 @@ def as_nullspace_basis(
     basis = jnp.asarray(spec)
     if basis.ndim == 1:
         basis = basis[:, None]
-    if basis.ndim != 2 or basis.shape[0] != n or not 0 < basis.shape[1] <= n:
+    max_k = n if n_global is None else n_global
+    if basis.ndim != 2 or basis.shape[0] != n or not 0 < basis.shape[1] <= max_k:
         raise ValueError(
             f"{name} must be a vector of length {n} or an ({n}, k) array with "
-            f"k ≤ {n}; got shape {basis.shape}"
+            f"k ≤ {max_k}; got shape {basis.shape}"
         )
     if basis.dtype != dtype:
         basis = basis.astype(dtype)

@@ -99,6 +99,7 @@ testpaths = ["tests"]
 markers = [
     "gpu: tests that run the native AmgX solver (skipped without a GPU JAX backend)",
     "mpi: distributed tests; run under mpirun with pytest-mpi's --only-mpi flag",
+    "sharding: multi-process JAX sharding tests",
 ]
 
 [tool.ruff]
@@ -110,7 +111,7 @@ select = ["E", "F", "W", "I", "UP"]
 ignore = ["E501", "F403", "F405", "E731", "E741"]
 
 [tool.ruff.lint.per-file-ignores]
-"demo/*" = ["F841"]
+"demo/*" = ["E402", "F841"]
 "tests/*" = ["F841"]
 
 [tool.black]

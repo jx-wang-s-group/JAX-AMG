@@ -158,16 +158,33 @@ _MOVEMENT_PRIMS = {
     "gather",
 }
 
-_CPU = jax.devices("cpu")[0]
-
 _UNKNOWN = object()  # sentinel: a value that depends on the operator input
+
+_HOST_DEVICE: Any = None  # this process's CPU device, resolved on first use
+
+
+def _host_device() -> Any:
+    """This process's (addressable) CPU device, resolved lazily and cached.
+
+    Under ``jax.distributed`` every process sees every process's CPU devices, so
+    ``jax.devices("cpu")[0]`` is process 0's -- not addressable elsewhere. Binding
+    on it raises, which silently turned every constant fold into ``_UNKNOWN`` and
+    bailed the whole trace on every rank but 0 (e.g. "conv with non-constant
+    kernel"), down to the probing fallback. Resolving lazily also keeps importing
+    this module from initializing the backends, which must not happen before
+    ``jax.distributed.initialize``.
+    """
+    global _HOST_DEVICE
+    if _HOST_DEVICE is None:
+        _HOST_DEVICE = jax.local_devices(backend="cpu")[0]
+    return _HOST_DEVICE
 
 
 @contextlib.contextmanager
 def _host_exact() -> Iterator[None]:
-    """Run host-side index/position binds on CPU with x64 enabled, so position
-    arithmetic stays exact regardless of the global precision config."""
-    with temp_enable_x64(), jax.default_device(_CPU):
+    """Run host-side index/position binds on this process's CPU with x64 enabled,
+    so position arithmetic stays exact regardless of the global precision config."""
+    with temp_enable_x64(), jax.default_device(_host_device()):
         yield
 
 
