@@ -600,3 +600,93 @@ def test_sharded_operator_parameter_gradients(sharding_context):
     with jax.set_mesh(mesh):
         with pytest.raises(ValueError, match="identical on every rank"):
             jax.jit(sharded_closure).lower(b, b)
+
+
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_sharded_nullspace(sharding_context, symmetric, monkeypatch):
+    """Singular finite-volume Poisson on a stretched grid (nonsymmetric
+    volume-normalized form, or the symmetric flux form): eager and compiled
+    solves and RHS gradients against the pseudo-inverse."""
+    comm, rank, nranks, mesh = sharding_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        from jaxamg.matrices import poisson_matrix_stretched
+        from jaxamg.mpi_utils import partition_csr_matrix
+        from jaxamg.utils import to_scipy
+
+        A_global, V_global = poisson_matrix_stretched(
+            24, 16, 1.08, normalize=not symmetric, dtype=jnp.float64
+        )
+        n = A_global.shape[0]
+        V_np = np.ones(n) if symmetric else np.asarray(V_global)
+        rng = np.random.default_rng(0)
+        b_global = rng.standard_normal(n)
+        b_global -= (V_np @ b_global) / V_np.sum()  # consistent RHS
+        w_global = rng.standard_normal(n) + 0.5
+
+        A_local, row_start, row_end = partition_csr_matrix(A_global, rank, nranks)
+        rows = slice(row_start, row_end)
+        bases = {"nullspace": "constant"}
+        if not symmetric:
+            bases["transpose_nullspace"] = jnp.asarray(V_np[rows])
+        b = jaxamg.make_sharded_vector(b_global[rows], comm=comm, mesh=mesh)
+        w = jaxamg.make_sharded_vector(w_global[rows], comm=comm, mesh=mesh)
+        A = jaxamg.make_sharded_matrix(
+            jaxamg.with_cache(A_local, **bases), b, comm=comm, mesh=mesh
+        )
+        solver = jaxamg.make_sharded_solver(
+            A, b, config={"tolerance": 1e-10, "max_iters": 300}, is_symmetric=symmetric
+        )
+
+        def loss(rhs, A_data, weights):
+            return jnp.sum(weights * solver(rhs, A=A_data)[0])
+
+        # Bases were validated at creation; tracing must not validate again
+        # (that would be a host collective inside the trace).
+        import jaxamg.jaxamg as core
+
+        validations = []
+        monkeypatch.setattr(
+            core, "validate_basis", lambda *args: validations.append(args)
+        )
+        with jax.set_mesh(mesh):
+            jax.jit(loss).lower(b, A.data, w)
+            jax.jit(lambda rhs, x0, A_data: solver(rhs, x0, A=A_data)[0]).lower(
+                b, b, A.data
+            )
+            jax.jit(jax.grad(loss)).lower(b, A.data, w)
+        monkeypatch.undo()
+        assert validations == []
+
+        x, info = solver(b)
+        assert _local_status(info) == 0
+        inconsistency = np.asarray(info["rhs_inconsistency"].addressable_shards[0].data)
+        assert inconsistency.item() < 1e-12
+
+        # Scaling A preserves both null spaces: d(w·x)/ds = -w·x at s = 1.
+        def scaled_loss(scale, rhs, A_data, weights):
+            return loss(rhs, scale * A_data, weights)
+
+        with jax.set_mesh(mesh):
+            g_eager = jax.grad(loss)(b, A.data, w)
+            g_jit = jax.jit(jax.grad(loss))(b, A.data, w)
+            wx, ds_eager = jax.value_and_grad(scaled_loss)(1.0, b, A.data, w)
+            ds_jit = jax.jit(jax.grad(scaled_loss))(1.0, b, A.data, w)
+        np.testing.assert_allclose(float(ds_eager), -float(wx), rtol=1e-6)
+        np.testing.assert_allclose(float(ds_jit), -float(wx), rtol=1e-6)
+
+        x_np = _gather_unpadded(x, solver, comm)
+        g1 = _gather_unpadded(g_eager, solver, comm)
+        g2 = _gather_unpadded(g_jit, solver, comm)
+        if rank == 0:
+            A_dense = to_scipy(A_global).toarray().astype(np.float64)
+            assert abs(x_np.mean()) < 1e-10 * np.linalg.norm(x_np)
+            assert np.linalg.norm(A_dense @ x_np - b_global) < 1e-7 * np.linalg.norm(
+                b_global
+            )
+            g_ref = np.linalg.pinv(A_dense).T @ w_global
+            atol = 1e-8 * np.linalg.norm(g_ref)
+            np.testing.assert_allclose(g1, g_ref, rtol=1e-6, atol=atol)
+            np.testing.assert_allclose(g2, g_ref, rtol=1e-6, atol=atol)
+    finally:
+        jax.config.update("jax_enable_x64", False)

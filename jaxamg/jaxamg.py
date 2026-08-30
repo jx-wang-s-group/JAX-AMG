@@ -844,8 +844,11 @@ def solve(
         else:
             assert comm is not None
             comm_obj = comm
-        # Global reductions for the null-space projections.
-        reduce_sum = make_mpi_reduce_sum(comm_obj)
+        # Global reductions for the null-space projections; the sharding
+        # interface supplies its own through the cache (psum inside shard_map).
+        reduce_sum = None if mpi_cache is None else mpi_cache.get("reduce_sum")
+        if reduce_sum is None:
+            reduce_sum = make_mpi_reduce_sum(comm_obj)
 
         def run(b_: jax.Array, x0_: jax.Array) -> tuple[jax.Array, jax.Array]:
             return solver(
@@ -914,9 +917,12 @@ def solve(
     M = as_nullspace_basis(
         transpose_nullspace, n_local, target_dtype, "transpose_nullspace", n_columns
     )
-    if N is not None:
+    # The sharding interface validates its bases collectively when the solver
+    # is created and flags the cache, so no host collective runs in its traces.
+    validated = mpi_cache is not None and mpi_cache.get("nullspaces_validated", False)
+    if N is not None and not validated:
         validate_basis(N, "nullspace", comm_obj)
-    if M is not None:
+    if M is not None and not validated:
         validate_basis(M, "transpose_nullspace", comm_obj)
     if M is None and N is not None:
         if is_symmetric:

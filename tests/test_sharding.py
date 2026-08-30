@@ -185,7 +185,8 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm)
     # Omit mesh to exercise inference from b.sharding.
     solver = jaxamg.make_sharded_solver(matrix, b)
-    assert len(allgather_calls) == 2
+    # Row counts, nonzero counts, and the null-space schema.
+    assert len(allgather_calls) == 3
     assert len(normalization_calls) == 1
     assert len(halo_plan_calls) == 1
     x, info = solver(b)
@@ -368,13 +369,21 @@ def test_make_sharded_vector_normalizes_dtype_and_rejects_empty_ranks():
         jaxamg.make_sharded_vector(np.zeros(0, dtype=np.float32), comm=comm)
 
 
-def test_sharded_matrix_rejects_nullspace():
-    _, b = _single_device_array(np.ones(4, dtype=np.float32))
+def test_sharded_matrix_keeps_nullspace_bases(monkeypatch):
+    mesh, b = _single_device_array(np.ones(4, dtype=np.float32))
+    monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
+    comm = SimpleNamespace(
+        Get_size=lambda: 1, Get_rank=lambda: 0, allgather=lambda value: [value]
+    )
     A_local = jaxamg.with_cache(
         jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32)), nullspace="constant"
     )
-    with pytest.raises(ValueError, match="null spaces"):
-        jaxamg.make_sharded_matrix(A_local, b)
+
+    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
+
+    np.testing.assert_array_equal(np.asarray(matrix._nullspace), np.ones((4, 1)))
+    assert matrix._nullspace.dtype == jnp.float32
+    assert matrix._transpose_nullspace is None
 
 
 def test_distributed_basis_allows_more_columns_than_local_rows():

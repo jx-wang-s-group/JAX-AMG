@@ -28,6 +28,13 @@ from .mpi_utils import (
     build_halo_plan,
     build_transpose_plan,
 )
+from .nullspace import (
+    _MISSING_NULLSPACE_MSG,
+    _MISSING_TRANSPOSE_MSG,
+    NullSpaceWarning,
+    as_nullspace_basis,
+    validate_basis,
+)
 from .utils import (
     MatrixOrOperator,
     get_preferred_dtype,
@@ -135,6 +142,8 @@ class ShardedMatrix:
         row_counts: tuple[int, ...],
         max_local_size: int,
         coloring: tuple | None = None,
+        nullspace: jax.Array | None = None,
+        transpose_nullspace: jax.Array | None = None,
     ) -> None:
         local_nnz = int(local_bcsr.data.shape[0])
         # Keep only the rank-local CSR structure. The matrix values live solely
@@ -164,6 +173,9 @@ class ShardedMatrix:
         # Coloring of the source operator, if any, for materializing
         # operators with this sparsity.
         self._coloring = coloring
+        # Null-space bases of the local rows, fixed like the sparsity.
+        self._nullspace = nullspace
+        self._transpose_nullspace = transpose_nullspace
 
     def local_matrix(self, data: jax.Array | None = None) -> jsp.BCSR:
         """Return this rank's unpadded BCSR matrix for ``data`` or cached values.
@@ -338,15 +350,15 @@ def _require_shard_map() -> None:
         )
 
 
-def _reject_nullspace(A_local: MatrixOrOperator) -> None:
-    if any(
-        getattr(A_local, attr, None) is not None
-        for attr in ("_nullspace", "_transpose_nullspace")
-    ):
-        raise ValueError(
-            "null spaces are not supported by the sharding interface yet; use "
-            "solve(..., comm=...) for singular systems"
-        )
+def _local_basis(
+    A_local: MatrixOrOperator, name: str, n_local: int, n_global: int, dtype: Any
+) -> jax.Array | None:
+    """Normalized ``(n_local, k)`` null-space basis attached to ``A_local``."""
+    basis = as_nullspace_basis(
+        getattr(A_local, f"_{name}", None), n_local, dtype, name, n_global
+    )
+    # Uncommitted, so a shard_map spanning the mesh can capture it.
+    return None if basis is None else jnp.asarray(np.asarray(basis))
 
 
 def _resolve_mesh(
@@ -560,6 +572,8 @@ def _pack_sharded_matrix(
     max_local_size: int,
     max_nnz: int | None = None,
     coloring: tuple | None = None,
+    nullspace: jax.Array | None = None,
+    transpose_nullspace: jax.Array | None = None,
 ) -> ShardedMatrix:
     """Pack normalized local values into a global sharded array."""
     local_nnz = int(A_bcsr.data.shape[0])
@@ -586,6 +600,8 @@ def _pack_sharded_matrix(
         row_counts,
         max_local_size,
         coloring,
+        nullspace,
+        transpose_nullspace,
     )
 
 
@@ -610,6 +626,9 @@ def make_sharded_matrix(
             operator is also accepted, provided it carries cached coloring
             information (``jaxamg.with_cache(op, coloring=...)``) so its shape
             and sparsity pattern are known; it is materialized once here.
+            Null-space bases attached with ``with_cache(A_local,
+            nullspace=..., transpose_nullspace=...)`` (local rows) are kept
+            and applied by every solve.
         b: Global row-sharded RHS used to validate the matrix partition, mesh,
             and numerical dtype.
         comm: MPI communicator spanning every JAX process, with rank order
@@ -629,12 +648,12 @@ def make_sharded_matrix(
     mesh = _resolve_mesh(b, mesh, axis_name)
     _validate_runtime(comm, mesh, axis_name)
 
-    _reject_nullspace(A_local)
     n_local, nglobal = _local_matrix_shape(A_local)
     partition_info, row_counts, max_local_size = _local_partition(
         b, mesh, axis_name, comm, n_local, nglobal
     )
     A_bcsr = _normalize_local_matrix(A_local, b, partition_info)
+    dtype = A_bcsr.data.dtype
     return _pack_sharded_matrix(
         A_bcsr,
         comm,
@@ -645,6 +664,10 @@ def make_sharded_matrix(
         max_local_size,
         coloring=(
             getattr(A_local, "_coloring_info", None) if callable(A_local) else None
+        ),
+        nullspace=_local_basis(A_local, "nullspace", n_local, nglobal, dtype),
+        transpose_nullspace=_local_basis(
+            A_local, "transpose_nullspace", n_local, nglobal, dtype
         ),
     )
 
@@ -761,6 +784,43 @@ def make_sharded_solver(
         )
 
     _validate_matrix(A_structure, nglobal, partition_info, block_dim)
+
+    # Null spaces as in solve(): a symmetric matrix shares one basis.
+    nullspace = A._nullspace
+    transpose_nullspace = A._transpose_nullspace
+    if transpose_nullspace is None and nullspace is not None:
+        if is_symmetric:
+            transpose_nullspace = nullspace
+        else:
+            warnings.warn(_MISSING_TRANSPOSE_MSG, NullSpaceWarning, stacklevel=2)
+    elif nullspace is None and transpose_nullspace is not None:
+        if is_symmetric:
+            nullspace = transpose_nullspace
+        else:
+            warnings.warn(_MISSING_NULLSPACE_MSG, NullSpaceWarning, stacklevel=2)
+    # Every rank must take the same basis-dependent branches and collectives.
+    schema = tuple(
+        None if basis is None else basis.shape[1]
+        for basis in (nullspace, transpose_nullspace)
+    )
+    schemas = comm.allgather(schema)
+    if any(other != schema for other in schemas):
+        raise ValueError(
+            "null-space bases must be declared on every rank with the same "
+            "column counts; (nullspace, transpose_nullspace) columns per rank: "
+            f"{schemas}"
+        )
+    # Validate here, collectively, on the schedule the schema check fixed;
+    # the nested solves are told to skip it (see ``nullspaces_validated``).
+    if nullspace is not None:
+        validate_basis(nullspace, "nullspace", comm)
+    if transpose_nullspace is not None:
+        validate_basis(transpose_nullspace, "transpose_nullspace", comm)
+    singular = nullspace is not None or transpose_nullspace is not None
+    primal_bases = (nullspace, transpose_nullspace)
+    # For Aᵀ the roles of the two null spaces swap.
+    adjoint_bases = primal_bases if is_symmetric else (transpose_nullspace, nullspace)
+
     local_device = mesh.local_devices[0]
     local_hardware_id = getattr(local_device, "local_hardware_id", local_device.id)
 
@@ -826,18 +886,26 @@ def make_sharded_solver(
         row_indices=local_row_indices,
         save_stats=save_stats,
         block_dim=block_dim,
+        singular=singular,
         lrank=int(local_hardware_id),
         device=local_device,
         commit=False,
     )
     if not is_symmetric:
-        # The MPI solve's primal does not consume halo operands, and sharding's
-        # outer VJP computes its matrix gradient from A's existing halo plan.
-        # Therefore the nested A^T solve needs only placeholder halo operands.
-        transpose_cache = {
-            **mpi_cache,
-            "halo_plan": _primal_halo_placeholder(n_local, len(A.row_counts)),
-        }
+        # The nested Aᵀ solve's primal ignores halo operands and the matrix
+        # gradient uses A's own plan; a real plan is needed only for the
+        # null-space check of Aᵀ.
+        transpose_halo = (
+            build_halo_plan(
+                np.asarray(transpose_plan.indices, dtype=np.int64),
+                A.row_counts,
+                partition_info,
+                comm,
+            )
+            if transpose_nullspace is not None
+            else _primal_halo_placeholder(n_local, len(A.row_counts))
+        )
+        transpose_cache = {**mpi_cache, "halo_plan": transpose_halo}
 
     info_specs = {
         "iterations": P(axis_name),
@@ -845,6 +913,8 @@ def make_sharded_solver(
         "status": P(axis_name),
         "residual_history": P(axis_name, None),
     }
+    if transpose_nullspace is not None:
+        info_specs["rhs_inconsistency"] = P(axis_name)
 
     res_history_len = amgx_config.outer_max_iters(mpi_cache["config_str"]) + 1
 
@@ -859,18 +929,24 @@ def make_sharded_solver(
                 (0, res_history_len - history.shape[0]),
                 constant_values=jnp.nan,
             )
-        return {
+        packed = {
             "iterations": jnp.asarray(info["iterations"], dtype=jnp.int32)[None],
             "residual": jnp.asarray(info["residual"])[None],
             "status": jnp.asarray(info["status"], dtype=jnp.int32)[None],
             "residual_history": history[None, :],
         }
+        if "rhs_inconsistency" in info:
+            packed["rhs_inconsistency"] = jnp.asarray(
+                info["rhs_inconsistency"], dtype=A_data.dtype
+            )[None]
+        return packed
 
     def matrix_with_data(
         data_local: jax.Array,
         structure: _CSRStructure,
         cache: dict[str, Any],
         symmetric: bool,
+        bases: tuple[jax.Array | None, jax.Array | None],
     ) -> jsp.BCSR:
         matrix = jsp.BCSR(
             (
@@ -880,7 +956,13 @@ def make_sharded_solver(
             ),
             shape=structure.shape,
         )
-        return with_cache(matrix, mpi=cache, is_symmetric=symmetric)
+        return with_cache(
+            matrix,
+            mpi=cache,
+            is_symmetric=symmetric,
+            nullspace=bases[0],
+            transpose_nullspace=bases[1],
+        )
 
     def pad_local_vector(value: jax.Array) -> jax.Array:
         return jnp.pad(value, (0, max_n_local - n_local))
@@ -903,19 +985,32 @@ def make_sharded_solver(
             save_stats_file=os.devnull if save_stats else None,
         )
 
-    def local_solve(
-        A_data_local: jax.Array, rhs_local: jax.Array
-    ) -> tuple[jax.Array, ShardedInfo]:
-        A_dynamic = matrix_with_data(A_data_local, A_structure, mpi_cache, is_symmetric)
-        x_local, info = solve_one_rhs(A_dynamic, rhs_local)
-        return pad_local_vector(x_local), pack_info(info)
+    def make_local_solves(
+        reduce: Callable[[jax.Array], jax.Array],
+    ) -> tuple[Callable[..., Any], Callable[..., Any]]:
+        # The nested solve reduces its null-space projections with ``reduce``:
+        # psum inside shard_map, mpi4jax for a direct call.
+        cache = {**mpi_cache, "reduce_sum": reduce, "nullspaces_validated": True}
 
-    def local_solve_x0(
-        A_data_local: jax.Array, rhs_local: jax.Array, x0_local: jax.Array
-    ) -> tuple[jax.Array, ShardedInfo]:
-        A_dynamic = matrix_with_data(A_data_local, A_structure, mpi_cache, is_symmetric)
-        x_local, info = solve_one_rhs(A_dynamic, rhs_local, x0_local)
-        return pad_local_vector(x_local), pack_info(info)
+        def local_solve(
+            A_data_local: jax.Array, rhs_local: jax.Array
+        ) -> tuple[jax.Array, ShardedInfo]:
+            A_dynamic = matrix_with_data(
+                A_data_local, A_structure, cache, is_symmetric, primal_bases
+            )
+            x_local, info = solve_one_rhs(A_dynamic, rhs_local)
+            return pad_local_vector(x_local), pack_info(info)
+
+        def local_solve_x0(
+            A_data_local: jax.Array, rhs_local: jax.Array, x0_local: jax.Array
+        ) -> tuple[jax.Array, ShardedInfo]:
+            A_dynamic = matrix_with_data(
+                A_data_local, A_structure, cache, is_symmetric, primal_bases
+            )
+            x_local, info = solve_one_rhs(A_dynamic, rhs_local, x0_local)
+            return pad_local_vector(x_local), pack_info(info)
+
+        return local_solve, local_solve_x0
 
     def make_local_transpose_values(
         exchange: Callable[[jax.Array], jax.Array],
@@ -944,20 +1039,29 @@ def make_sharded_solver(
 
         return local_transpose_values
 
-    def local_adjoint(adjoint_data_local: jax.Array, g_local: jax.Array) -> jax.Array:
+    def make_local_adjoint(
+        reduce: Callable[[jax.Array], jax.Array],
+    ) -> Callable[[jax.Array, jax.Array], jax.Array]:
         if is_symmetric:
             structure = A_structure
-            cache = mpi_cache
+            base_cache = mpi_cache
         else:
             assert transpose_structure is not None
             assert transpose_cache is not None
             structure = transpose_structure
-            cache = transpose_cache
-        A_adjoint = matrix_with_data(
-            adjoint_data_local, structure, cache, symmetric=is_symmetric
-        )
-        adjoint_local, _ = solve_one_rhs(A_adjoint, g_local)
-        return pad_local_vector(adjoint_local)
+            base_cache = transpose_cache
+        cache = {**base_cache, "reduce_sum": reduce, "nullspaces_validated": True}
+
+        def local_adjoint(
+            adjoint_data_local: jax.Array, g_local: jax.Array
+        ) -> jax.Array:
+            A_adjoint = matrix_with_data(
+                adjoint_data_local, structure, cache, is_symmetric, adjoint_bases
+            )
+            adjoint_local, _ = solve_one_rhs(A_adjoint, g_local)
+            return pad_local_vector(adjoint_local)
+
+        return local_adjoint
 
     halo_plan = mpi_cache["halo_plan"]
     max_n_ghost = halo_plan.max_n_ghost
@@ -1015,6 +1119,22 @@ def make_sharded_solver(
 
             return mpi4jax.alltoall(values, comm=comm)
 
+    def lax_reduce(value: jax.Array) -> jax.Array:
+        return jax.lax.psum(value, axis_name)
+
+    if nranks == 1:
+
+        def mpi_reduce(value: jax.Array) -> jax.Array:
+            return value
+
+    else:
+
+        def mpi_reduce(value: jax.Array) -> jax.Array:
+            import mpi4jax
+            from mpi4py import MPI
+
+            return mpi4jax.allreduce(value, op=MPI.SUM, comm=comm)
+
     # The mesh-local device as a one-device mesh. The eager local branch runs
     # under it so that its single-device operations dispatch cleanly even when
     # the caller sits inside jax.set_mesh over the whole multi-process mesh
@@ -1047,19 +1167,21 @@ def make_sharded_solver(
 
         return invoke
 
+    eager_solve, eager_solve_x0 = make_local_solves(mpi_reduce)
+    traced_solve, traced_solve_x0 = make_local_solves(lax_reduce)
     mapped_solve = dispatch(
-        local_solve,
+        eager_solve,
         jax.shard_map(
-            local_solve,
+            traced_solve,
             mesh=mesh,
             in_specs=(A_data_spec, rhs_spec),
             out_specs=(rhs_spec, info_specs),
         ),
     )
     mapped_solve_x0 = dispatch(
-        local_solve_x0,
+        eager_solve_x0,
         jax.shard_map(
-            local_solve_x0,
+            traced_solve_x0,
             mesh=mesh,
             in_specs=(A_data_spec, rhs_spec, rhs_spec),
             out_specs=(rhs_spec, info_specs),
@@ -1079,9 +1201,9 @@ def make_sharded_solver(
             ),
         )
     mapped_adjoint = dispatch(
-        local_adjoint,
+        make_local_adjoint(mpi_reduce),
         jax.shard_map(
-            local_adjoint,
+            make_local_adjoint(lax_reduce),
             mesh=mesh,
             in_specs=(A_data_spec, scalar_spec),
             out_specs=scalar_spec,
@@ -1162,22 +1284,6 @@ def make_sharded_solver(
                 f"{local_nnz}"
             )
         return jnp.pad(values.astype(A_data.dtype), (0, max_nnz - local_nnz))
-
-    def lax_reduce(value: jax.Array) -> jax.Array:
-        return jax.lax.psum(value, axis_name)
-
-    if nranks == 1:
-
-        def mpi_reduce(value: jax.Array) -> jax.Array:
-            return value
-
-    else:
-
-        def mpi_reduce(value: jax.Array) -> jax.Array:
-            import mpi4jax
-            from mpi4py import MPI
-
-            return mpi4jax.allreduce(value, op=MPI.SUM, comm=comm)
 
     def require_replicated(value: jax.Array) -> None:
         sharding = getattr(getattr(value, "aval", None), "sharding", None)
@@ -1285,7 +1391,6 @@ def make_sharded_solver(
     def pack_operator(A_local: MatrixOrOperator, traced: bool) -> jax.Array:
         """Global packed values of a local operator or matrix, differentiable
         with respect to the traced values it closes over."""
-        _reject_nullspace(A_local)
         closed = jax.make_jaxpr(lambda: local_values_of(A_local))()
         # Traced closed-over values become explicit inputs; the rest stay
         # jaxpr constants.

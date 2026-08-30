@@ -23,14 +23,15 @@ The initial interface supports:
 - row-sharded vectors with equal or unequal local row counts;
 - scalar and block matrices, provided every rank's true row count is divisible
   by `block_dim`;
-- symmetric and nonsymmetric distributed matrices; and
+- symmetric and nonsymmetric distributed matrices;
+- singular systems with declared null spaces; and
 - JIT compilation and reverse-mode differentiation with respect to matrix
   values and the RHS.
 
 The local CSR structure is fixed when the solver is created. It requires JAX
 0.8 or newer, a communicator spanning every JAX process
 (no subcommunicators), and at least one row per rank. Multiple local GPUs per
-MPI process and singular systems (`nullspace`) are not supported yet.
+MPI process are not supported yet.
 
 ## Process and Device Setup
 
@@ -165,6 +166,26 @@ grad_A_local = A.local_matrix(grad_A_data)
 A direct `solver(b)` call uses the cached values. Under a JAX transformation
 `A` is required, even for RHS-only differentiation, so the values stay a
 dynamic operand rather than a constant baked into the executable.
+
+## Singular Systems
+
+Attach the null-space bases (local rows) to the matrix before packing it, as
+for `solve`:
+
+```python
+A_local = jaxamg.with_cache(A_local, nullspace="constant", transpose_nullspace=V_local)
+A = jaxamg.make_sharded_matrix(A_local, b)
+solver = jaxamg.make_sharded_solver(A, b, config=config)
+```
+
+The bases are fixed at creation, like the sparsity, and applied to every solve
+(including through `A=`): the RHS is projected onto `range(A)`, the solution is
+pinned orthogonal to `null(A)`, the adjoint solve applies the transposed
+projections, and the AMG configuration switches to the singular-system
+defaults. `info["rhs_inconsistency"]` has one entry per rank. With
+`is_symmetric=True` one basis serves both roles. Every rank must declare the
+same bases (column counts included). As in `solve`, gradients with respect to
+matrix values assume perturbations that preserve the declared null spaces.
 
 ## Differentiating Operator Parameters
 
