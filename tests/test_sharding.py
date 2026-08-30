@@ -375,3 +375,14 @@ def test_sharded_matrix_rejects_nullspace():
     )
     with pytest.raises(ValueError, match="null spaces"):
         jaxamg.make_sharded_matrix(A_local, b)
+
+
+def test_distributed_basis_allows_more_columns_than_local_rows():
+    from jaxamg.nullspace import as_nullspace_basis
+
+    basis = np.ones((1, 2), dtype=np.float32)
+    assert as_nullspace_basis(basis, 1, jnp.float32, "nullspace", 4).shape == (1, 2)
+    with pytest.raises(ValueError, match="k ≤ 1"):
+        as_nullspace_basis(basis, 1, jnp.float32, "nullspace")
+    with pytest.raises(ValueError, match="k ≤ 1"):
+        as_nullspace_basis(basis, 1, jnp.float32, "nullspace", 1)

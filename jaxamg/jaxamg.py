@@ -906,9 +906,13 @@ def solve(
     # Null-space projections as JAX ops around the primitive; their
     # transposes are the adjoint projections (see nullspace.py).
     n_local = A_csr.shape[0]
-    N = as_nullspace_basis(nullspace, n_local, target_dtype, "nullspace")
+    if comm_obj is None:
+        n_columns = None
+    else:
+        n_columns = mpi_cache["nglobal"] if mpi_cache is not None else nglobal
+    N = as_nullspace_basis(nullspace, n_local, target_dtype, "nullspace", n_columns)
     M = as_nullspace_basis(
-        transpose_nullspace, n_local, target_dtype, "transpose_nullspace"
+        transpose_nullspace, n_local, target_dtype, "transpose_nullspace", n_columns
     )
     if N is not None:
         validate_basis(N, "nullspace", comm_obj)
