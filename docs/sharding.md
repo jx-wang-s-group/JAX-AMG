@@ -29,7 +29,7 @@ The initial interface supports:
   values and the RHS.
 
 The local CSR structure is fixed when the solver is created. It requires JAX
-0.8 or newer, a communicator spanning every JAX process
+0.9 or newer, a communicator spanning every JAX process
 (no subcommunicators), and at least one row per rank. Multiple local GPUs per
 MPI process are not supported yet.
 

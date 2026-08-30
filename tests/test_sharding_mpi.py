@@ -33,11 +33,15 @@ from jaxamg.matrices import (  # noqa: E402
     tridiagonal_matrix_distributed,
 )
 from jaxamg.mpi_utils import get_partition_info, partition_operator  # noqa: E402
-from jaxamg.sharding import ShardedSolve  # noqa: E402
+from jaxamg.sharding import ShardedSolve, has_supported_jax  # noqa: E402
 
 pytestmark = [
     pytest.mark.mpi(min_size=2),
     pytest.mark.sharding,
+    pytest.mark.skipif(
+        not has_supported_jax(),
+        reason="the sharding interface requires JAX 0.9 or newer",
+    ),
     pytest.mark.skipif(
         not _SHARDING_TEST,
         reason="run this module separately under mpirun with at least two ranks",

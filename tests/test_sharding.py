@@ -14,7 +14,8 @@ import jaxamg.sharding as sharding_module
 from jaxamg.mpi_utils import TransposePlan
 
 pytestmark = pytest.mark.skipif(
-    not hasattr(jax, "shard_map"), reason="jax.shard_map is unavailable"
+    not sharding_module.has_supported_jax(),
+    reason="the sharding interface requires JAX 0.9 or newer",
 )
 
 

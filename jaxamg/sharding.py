@@ -8,6 +8,7 @@ to use one MPI rank per GPU for the distributed solve.
 from __future__ import annotations
 
 import os
+import re
 import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -274,6 +275,7 @@ def make_sharded_vector(
         length is ``comm.size * max(local_sizes)``; values are cast to
         ``float32`` unless already ``float32`` or ``float64``.
     """
+    _require_supported_jax()
     comm = _resolve_comm(comm)
     if mesh is None:
         # One device per MPI rank. In a multi-process job this covers all JAX
@@ -342,11 +344,23 @@ def _local_mesh(mesh: Mesh, axis_name: str) -> Mesh:
     return jax.make_mesh((1,), (axis_name,), devices=[mesh.local_devices[0]])
 
 
-def _require_shard_map() -> None:
-    if not hasattr(jax, "shard_map"):
+# Older releases default meshes to Auto axes, which drop the sharding spec of
+# derived arrays; the interface relies on explicit sharding throughout.
+_MIN_JAX = (0, 9)
+
+
+def has_supported_jax() -> bool:
+    """Whether the installed JAX release supports the sharding interface."""
+    major, minor = (int(part) for part in re.findall(r"\d+", jax.__version__)[:2])
+    return (major, minor) >= _MIN_JAX
+
+
+def _require_supported_jax() -> None:
+    if not has_supported_jax():
         raise RuntimeError(
-            "JAX-AMG's sharding interface requires a JAX version that exposes "
-            "jax.shard_map. Upgrade JAX or use solve(..., comm=...) instead."
+            "JAX-AMG's sharding interface requires JAX "
+            f"{'.'.join(map(str, _MIN_JAX))} or newer (found {jax.__version__}); "
+            "upgrade JAX or use solve(..., comm=...) instead."
         )
 
 
@@ -641,7 +655,7 @@ def make_sharded_matrix(
         A :class:`ShardedMatrix` whose ``data`` attribute contains the global
         sharded values. The original global matrix is never materialized.
     """
-    _require_shard_map()
+    _require_supported_jax()
     if not isinstance(b, jax.Array):
         raise TypeError("b must be a global jax.Array")
     comm = _resolve_comm(comm)
@@ -758,7 +772,7 @@ def make_sharded_solver(
         unpacks a packed matrix gradient and ``solver.local_vector(value)``
         removes vector padding. Info values have one entry per rank.
     """
-    _require_shard_map()
+    _require_supported_jax()
     if not isinstance(A, ShardedMatrix):
         raise TypeError("A must be created with jaxamg.make_sharded_matrix")
     if not isinstance(b, jax.Array):
