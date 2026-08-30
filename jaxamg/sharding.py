@@ -46,7 +46,7 @@ try:
 except Exception:  # pragma: no cover - exercised only if the private API moves
 
     def _backends_are_initialized() -> bool:
-        return False
+        return True  # never report a flag as effective without knowing
 
 
 def _disable_shard_autotuning() -> bool:
@@ -259,7 +259,8 @@ def make_sharded_vector(
 
     Returns:
         A global JAX array whose axis uses ``P(axis_name)``. Its physical
-        length is ``comm.size * max(local_sizes)``.
+        length is ``comm.size * max(local_sizes)``; values are cast to
+        ``float32`` unless already ``float32`` or ``float64``.
     """
     comm = _resolve_comm(comm)
     if mesh is None:
@@ -281,6 +282,9 @@ def make_sharded_vector(
         values = np.asarray(local_values)
     if values.ndim != 1:
         raise ValueError(f"local_values must be one-dimensional; got {values.shape}")
+    if values.dtype not in (jnp.float32, jnp.float64):
+        # The solver's precision rule, so solutions share the RHS dtype.
+        values = values.astype(jnp.float32)
     if tuple(mesh.axis_names) != (axis_name,):
         raise ValueError(
             f"mesh must have the single axis {axis_name!r}; got {mesh.axis_names!r}"
@@ -295,6 +299,10 @@ def make_sharded_vector(
 
     local_shapes = tuple(tuple(shape) for shape in comm.allgather(values.shape))
     local_sizes = tuple(int(shape[0]) for shape in local_shapes)
+    if min(local_sizes) == 0:
+        raise ValueError(
+            f"every rank must own at least one row; got local sizes {local_sizes}"
+        )
     inferred_global_size = sum(local_sizes)
     if global_size is not None and int(global_size) != inferred_global_size:
         raise ValueError(
@@ -456,6 +464,10 @@ def _local_partition(
     n_global: int,
 ) -> tuple[tuple[int, int], tuple[int, ...], int]:
     local_sizes = tuple(int(size) for size in comm.allgather(n_local))
+    if min(local_sizes) == 0:
+        raise ValueError(
+            f"every rank must own at least one row; got row counts {local_sizes}"
+        )
     if sum(local_sizes) != n_global:
         raise ValueError(
             "the distributed matrix row counts must sum to its global column "

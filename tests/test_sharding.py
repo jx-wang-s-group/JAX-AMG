@@ -351,3 +351,13 @@ def test_shard_autotuning_warning(monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         sharding_module._check_shard_autotuning()
+
+
+def test_make_sharded_vector_normalizes_dtype_and_rejects_empty_ranks():
+    comm = SimpleNamespace(Get_size=lambda: 1, allgather=lambda value: [value])
+
+    b = jaxamg.make_sharded_vector(np.arange(4), comm=comm)
+    assert b.dtype == jnp.float32
+
+    with pytest.raises(ValueError, match="at least one row"):
+        jaxamg.make_sharded_vector(np.zeros(0, dtype=np.float32), comm=comm)
