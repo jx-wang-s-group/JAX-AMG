@@ -1074,6 +1074,27 @@ def make_sharded_solver(
 
     coloring = A._coloring
 
+    def check_structure(matrix: jsp.BCSR) -> None:
+        """Reject a matrix whose CSR structure differs from the fixed one."""
+        for given, fixed in (
+            (matrix.indices, A_structure.indices),
+            (matrix.indptr, A_structure.indptr),
+        ):
+            if given is fixed:
+                continue
+            if isinstance(given, jax.core.Tracer):
+                raise ValueError(
+                    "A's sparsity structure must be concrete; pass traced matrix "
+                    "values in the packed A.data layout instead"
+                )
+            if given.shape != fixed.shape or not np.array_equal(
+                np.asarray(given), np.asarray(fixed)
+            ):
+                raise ValueError(
+                    "A must have the sparsity structure fixed when the solver "
+                    "was created"
+                )
+
     def local_values_of(A_local: MatrixOrOperator) -> jax.Array:
         """This rank's padded values of ``A_local`` in the packed layout."""
         if callable(A_local):
@@ -1097,11 +1118,13 @@ def make_sharded_solver(
                 A_local, shape, rows, cols, column_colors, n_colors
             ).data
         else:
-            values = to_bcsr_matrix(
+            matrix = to_bcsr_matrix(
                 A_local,
                 b=jnp.zeros(n_local, dtype=A_data.dtype),
                 use_int64_indices=True,
-            ).data
+            )
+            check_structure(matrix)
+            values = matrix.data
         if values.shape[0] != local_nnz:
             raise ValueError(
                 "A must have the sparsity structure fixed when the solver was "

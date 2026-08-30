@@ -264,6 +264,15 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
 
     with pytest.raises(ValueError, match="sparsity structure"):
         solver(b, A=jsp.BCSR.fromdense(jnp.ones((4, 4), dtype=jnp.float32)))
+    # Same nnz, different column indices.
+    with pytest.raises(ValueError, match="sparsity structure"):
+        solver(b, A=jsp.BCSR.fromdense(jnp.fliplr(jnp.eye(4, dtype=jnp.float32))))
+    with pytest.raises(ValueError, match="concrete"):
+        jax.jit(
+            lambda idx, rhs: solver(
+                rhs, A=jsp.BCSR((A_local.data, idx, A_local.indptr), shape=(4, 4))
+            )[0]
+        )(A_local.indices, b)
 
     # Stats: written after a direct call, rejected under a transform, and a
     # solver created without save_stats warns about incomplete output.

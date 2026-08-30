@@ -164,7 +164,9 @@ dynamic operand rather than a constant baked into the executable.
 When the values depend on parameters, pass this rank's operator or matrix as
 `A=`, exactly as `solve(A, b)` takes it in the MPI interface. The solver
 materializes it with the sparsity fixed at construction and differentiates
-through it:
+through it. A matrix must carry exactly that CSR structure, with concrete
+indices and row pointers; traced values with the fixed structure go through
+the packed `A.data` layout.
 
 ```python
 from jaxamg.matrices import poisson_operator
