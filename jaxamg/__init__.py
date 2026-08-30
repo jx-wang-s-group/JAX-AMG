@@ -10,6 +10,7 @@ from .jaxamg import (
     get_solver_cache_info,
     solve,
 )
+from .nullspace import NullSpaceWarning
 from .preconditioners import make_lineax_preconditioner, make_preconditioner
 from .sharding import (
     ShardedMatrix,
@@ -32,6 +33,7 @@ __all__ = [
     "make_sharded_solver",
     "make_sharded_vector",
     "AMGXStatus",
+    "NullSpaceWarning",
     "make_preconditioner",
     "make_lineax_preconditioner",
     "clear_solver_cache",

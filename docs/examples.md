@@ -390,6 +390,49 @@ If you use [Lineax](https://docs.kidger.site/lineax/), `jaxamg.make_lineax_preco
     Converged!
     ```
 
+### Singular systems
+
+For a singular matrix (e.g. a Poisson problem with periodic or Neumann boundaries), pass the null-space bases: `nullspace` (of `A`) pins the solution and keeps the adjoint solve consistent, `transpose_nullspace` (of `Aᵀ`) projects `b` onto the range of `A`. For a symmetric matrix the two coincide; for a volume-normalized finite-volume operator `A = D⁻¹L` the first is the constant vector and the second the cell volumes. See [`jaxamg.solve`](api.md#jaxamg.solve) for details.
+
+=== "Python"
+
+    ```python
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import jaxamg
+    from jaxamg.matrices import poisson_matrix_stretched
+
+    jax.config.update("jax_enable_x64", True)
+
+    # Volume-normalized Poisson operator on a stretched grid: A·1 = 0, Aᵀ·V = 0
+    A, V = poisson_matrix_stretched(64, 48, stretch=1.06, dtype=jnp.float64)
+    n = A.shape[0]
+    rng = np.random.default_rng(0)
+    b = rng.standard_normal(n)
+    b -= (np.asarray(V) @ b) / np.asarray(V).sum()  # compatible RHS
+    w = jnp.asarray(rng.standard_normal(n))
+    b = jnp.asarray(b)
+
+    def loss(b):
+        x, _ = jaxamg.solve(A, b, nullspace="constant", transpose_nullspace=V, tolerance=1e-10)
+        return jnp.dot(w, x)
+
+    x, info = jaxamg.solve(A, b, nullspace="constant", transpose_nullspace=V, tolerance=1e-10)
+    g = jax.jit(jax.grad(loss))(b)
+
+    g_ref = np.linalg.pinv(np.asarray(A.todense())).T @ np.asarray(w)
+    print(f"Iterations: {info['iterations']}, mean(x): {float(x.mean()):.1e}")
+    print(f"Gradient error: {np.linalg.norm(g - g_ref) / np.linalg.norm(g_ref):.1e}")
+    ```
+
+=== "Result"
+
+    ```text
+    Iterations: 13, mean(x): 0.0e+00
+    Gradient error: 1.2e-10
+    ```
+
 ### Optimization with color caching for operator
 
 For parameterized operators, compute coloring once and reuse it during optimization.

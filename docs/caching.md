@@ -52,6 +52,12 @@ When to use each option:
     - This allows the backward pass to skip transpose-related work for symmetric systems.
     - Set it only when the matrix is truly symmetric and remains symmetric.
     - You can set it directly in `with_cache(...)`.
+    - It also lets `transpose_nullspace` default to `nullspace`.
+
+- `nullspace=...` / `transpose_nullspace=...`
+    - Defaults for the arguments of the same name in `jaxamg.solve(...)`; see
+      [Singular systems](examples.md#singular-systems).
+    - In MPI mode also prepare the cached config with `cache_mpi_metadata(..., singular=True)`.
 
 ## Native AmgX resource cache
 

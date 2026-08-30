@@ -306,6 +306,7 @@ def prepare_config(
     save_stats: bool = False,
     mpi: bool = False,
     block_dim: int = 1,
+    singular: bool = False,
     **kwargs: Any,
 ) -> str:
     """
@@ -316,6 +317,8 @@ def prepare_config(
     ``config_version: 2`` nested JSON format. For block matrices
     (``block_dim > 1``) the AMG defaults switch from classical to
     aggregation AMG, the only AmgX AMG algorithm that supports blocks.
+    ``singular=True`` (set when a null space is declared) replaces the
+    ``DENSE_LU_SOLVER`` coarse solve by block-Jacobi sweeps.
     """
     # Clean copy of AMG defaults
     amg_defaults = deep_merge(
@@ -329,6 +332,14 @@ def prepare_config(
     # distributed block solves; single-GPU block solves keep DENSE_LU.
     if mpi and block_dim > 1:
         amg_defaults["coarse_solver"] = {"solver": "BLOCK_JACOBI", "max_iters": 50}
+        amg_defaults.pop("dense_lu_num_rows", None)
+
+    # DENSE_LU on the (singular) coarsest matrix diverges; a few Jacobi sweeps
+    # do not (many slow the transposed solve). The coarse floor keeps a
+    # k-dimensional null space from collapsing the coarsest level to zero rows.
+    if singular:
+        amg_defaults["coarse_solver"] = {"solver": "BLOCK_JACOBI", "max_iters": 10}
+        amg_defaults["min_coarse_rows"] = 8
         amg_defaults.pop("dense_lu_num_rows", None)
 
     defaults = {
@@ -371,6 +382,27 @@ def prepare_config(
     validate_config(merged_config, mpi=mpi, block_dim=block_dim)
 
     return _format_config(merged_config)
+
+
+def uses_dense_lu_coarse_solver(config_str: str) -> bool:
+    """Whether an AMG scope of a prepared config string uses ``DENSE_LU_SOLVER``
+    as its coarse solver (see `prepare_config`'s ``singular`` option)."""
+    try:
+        cfg = json.loads(config_str)
+    except (TypeError, ValueError):
+        return False
+    scope = cfg
+    if isinstance(cfg, dict) and isinstance(cfg.get("solver"), dict):
+        scope = cfg["solver"]
+    if not isinstance(scope, dict):
+        return False
+    for amg in _amg_blocks(scope):
+        entry = amg.get("coarse_solver")
+        if isinstance(entry, dict):
+            entry = entry.get("solver")
+        if _as_upper(entry) == "DENSE_LU_SOLVER":
+            return True
+    return False
 
 
 def outer_max_iters(config_str: str) -> int:

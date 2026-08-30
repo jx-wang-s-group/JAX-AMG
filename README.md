@@ -4,7 +4,7 @@
 [![Docs](https://img.shields.io/github/actions/workflow/status/jx-wang-s-group/JAX-AMG/docs.yml?style=flat-square&label=docs)](https://jx-wang-s-group.github.io/JAX-AMG/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square)](https://github.com/jx-wang-s-group/JAX-AMG/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org/)
-[![arXiv](https://img.shields.io/badge/arXiv-2606.09001-b31b1b.svg?style=flat-square)](https://arxiv.org/abs/2606.09001)
+[![DOI](https://img.shields.io/badge/DOI-10.1016%2Fj.softx.2026.102966-blue?style=flat-square)](https://doi.org/10.1016/j.softx.2026.102966)
 
 **JAX-AMG** brings the power of NVIDIA's [AmgX](https://developer.nvidia.com/amgx) library to the JAX ecosystem, providing high-performance, GPU-accelerated sparse linear solvers with full support for automatic differentiation.
 
@@ -106,16 +106,16 @@ if rank == 0: print(x_global)
 
 ## Citation
 
-If you use JAX-AMG in your work, please consider using the following citation ([arXiv:2606.09001](https://arxiv.org/abs/2606.09001)):
+If you use JAX-AMG in your work, please consider using the following citation:
 
 ```bibtex
-@misc{jaxamg2026,
-      title={JAX-AMG: A GPU-Accelerated Differentiable Sparse Linear Solver Library for JAX},
-      author={Yi Liu and Xiantao Fan and Jian-Xun Wang},
-      year={2026},
-      eprint={2606.09001},
-      archivePrefix={arXiv},
-      primaryClass={cs.MS},
-      url={https://arxiv.org/abs/2606.09001},
+@article{jaxamg2026,
+  title={JAX-AMG: A GPU-accelerated differentiable sparse linear solver library for JAX},
+  author={Yi Liu and Xiantao Fan and Jian-Xun Wang},
+  journal={SoftwareX},
+  volume={35},
+  pages={102966},
+  year={2026},
+  doi={10.1016/j.softx.2026.102966},
 }
 ```

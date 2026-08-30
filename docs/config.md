@@ -114,6 +114,18 @@ strongly coupled system, `BLOCK_JACOBI` under `block_dim=2` inverts true
 2x2 diagonal blocks (instead of scalar diagonal entries) and can converge in
 a handful of iterations where the scalar-preconditioned solve stalls.
 
+### Singular systems
+
+When a null space is declared (`solve(..., nullspace=...)` or
+`with_cache(A, nullspace=...)`), the AMG defaults change on the coarse level:
+`coarse_solver` becomes `{"solver": "BLOCK_JACOBI", "max_iters": 10}`,
+`min_coarse_rows` becomes `8`, and `dense_lu_num_rows` is dropped.
+`DENSE_LU_SOLVER` factorizes the coarsest matrix, which is singular for these
+systems, and the V-cycle diverges; Jacobi sweeps do not. Explicit
+`coarse_solver` / `min_coarse_rows` settings are kept, and `DENSE_LU_SOLVER`
+with a null space emits a `NullSpaceWarning`. For cached MPI metadata pass
+`singular=True` to `cache_mpi_metadata(...)`.
+
 ### MPI config
 
 The `communicator` key can be set to `MPI` for standard CPU-based MPI or `MPI_DIRECT` for GPU-aware MPI. The default is `MPI`. To use GPU-aware MPI, ensure that your MPI installation supports it. For more details, see the [MPI Guide](mpi.md).

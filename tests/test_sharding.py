@@ -361,3 +361,12 @@ def test_make_sharded_vector_normalizes_dtype_and_rejects_empty_ranks():
 
     with pytest.raises(ValueError, match="at least one row"):
         jaxamg.make_sharded_vector(np.zeros(0, dtype=np.float32), comm=comm)
+
+
+def test_sharded_matrix_rejects_nullspace():
+    _, b = _single_device_array(np.ones(4, dtype=np.float32))
+    A_local = jaxamg.with_cache(
+        jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32)), nullspace="constant"
+    )
+    with pytest.raises(ValueError, match="null spaces"):
+        jaxamg.make_sharded_matrix(A_local, b)

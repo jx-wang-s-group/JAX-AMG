@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import jax
 import numpy as np
+from jax.typing import ArrayLike
 
 from . import config as amgx_config
 from .utils import *
@@ -31,6 +32,7 @@ def _build_mpi_cache(
     row_indices: np.ndarray | jax.Array | None = None,
     save_stats: bool = False,
     block_dim: int = 1,
+    singular: bool = False,
     lrank: int | None = None,
     device: jax.Device | None = None,
     commit: bool = True,
@@ -79,7 +81,7 @@ def _build_mpi_cache(
         row_indices = place(row_indices)
 
     config_str = amgx_config.prepare_config(
-        config, save_stats=save_stats, mpi=True, block_dim=block_dim
+        config, save_stats=save_stats, mpi=True, block_dim=block_dim, singular=singular
     )
     return {
         "recvcounts_tuple": recvcounts_tuple,
@@ -93,6 +95,7 @@ def _build_mpi_cache(
         "transpose_plan": transpose_plan,
         "row_indices": row_indices,
         "block_dim": block_dim,
+        "singular": singular,
     }
 
 
@@ -104,9 +107,11 @@ def with_cache(
     ) = None,
     mpi: dict[str, Any] | None = None,
     is_symmetric: bool = False,
+    nullspace: ArrayLike | str | None = None,
+    transpose_nullspace: ArrayLike | str | None = None,
 ) -> MatrixOrOperator:
     """
-    Attach cached metadata (coloring, MPI info, or symmetry) to a matrix or operator.
+    Attach cached metadata (coloring, MPI info, symmetry, null spaces) to a matrix or operator.
 
     This cache allows using matrices/operators inside JIT-compiled functions
     without recomputing metadata or passing it as separate arguments. See [Caching Guide](caching.md) for more details.
@@ -117,6 +122,9 @@ def with_cache(
         mpi: Cached MPI metadata from `cache_mpi_metadata()`.
         is_symmetric: If True, indicates the matrix is symmetric, allowing
                       optimizations like skipping transpose in backward pass.
+        nullspace: Default for `jaxamg.solve`'s `nullspace` (`"constant"`, a
+                   vector, or an `(n, k)` array; local rows in MPI mode).
+        transpose_nullspace: Default for `jaxamg.solve`'s `transpose_nullspace`.
 
     Returns:
         The same matrix/operator with requested cache attached.
@@ -148,6 +156,19 @@ def with_cache(
                 f"Error: {e}"
             )
 
+    for attr, value in (
+        ("_nullspace", nullspace),
+        ("_transpose_nullspace", transpose_nullspace),
+    ):
+        if value is not None:
+            try:
+                object.__setattr__(A, attr, value)
+            except Exception as e:
+                raise TypeError(
+                    f"Cannot attach null-space info to object of type "
+                    f"{type(A).__name__}. Error: {e}"
+                )
+
     return A
 
 
@@ -160,6 +181,7 @@ def cache_mpi_metadata(
     is_symmetric: bool = False,
     save_stats: bool = False,
     block_dim: int = 1,
+    singular: bool = False,
 ) -> dict[str, Any]:
     """
     Pre-compute and cache MPI metadata for JIT-compatible solver usage.
@@ -191,6 +213,9 @@ def cache_mpi_metadata(
             matrix produces a complete stats file.
         block_dim: BSR block size for AmgX (see `jaxamg.solve`). Each rank's
             local partition must be divisible by it.
+        singular: Use the singular-system AMG defaults (see
+            [Solver Configuration](config.md#singular-systems)). Implied when
+            null-space bases are already attached to `A` via `with_cache`.
 
     Returns:
         A dictionary containing MPI metadata.
@@ -212,6 +237,10 @@ def cache_mpi_metadata(
           nonsymmetric matrix, or `None` when `is_symmetric` is True
         - `row_indices`: Local CSR row index for every matrix nonzero
     """
+    singular = singular or any(
+        getattr(A, attr, None) is not None
+        for attr in ("_nullspace", "_transpose_nullspace")
+    )
     row_start, row_end = partition_info
     n_local = row_end - row_start
 
@@ -314,4 +343,5 @@ def cache_mpi_metadata(
         row_indices=row_indices,
         save_stats=save_stats,
         block_dim=block_dim,
+        singular=singular,
     )

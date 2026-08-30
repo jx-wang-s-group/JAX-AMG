@@ -338,6 +338,17 @@ def _require_shard_map() -> None:
         )
 
 
+def _reject_nullspace(A_local: MatrixOrOperator) -> None:
+    if any(
+        getattr(A_local, attr, None) is not None
+        for attr in ("_nullspace", "_transpose_nullspace")
+    ):
+        raise ValueError(
+            "null spaces are not supported by the sharding interface yet; use "
+            "solve(..., comm=...) for singular systems"
+        )
+
+
 def _resolve_mesh(
     b: jax.Array,
     mesh: Mesh | None,
@@ -618,6 +629,7 @@ def make_sharded_matrix(
     mesh = _resolve_mesh(b, mesh, axis_name)
     _validate_runtime(comm, mesh, axis_name)
 
+    _reject_nullspace(A_local)
     n_local, nglobal = _local_matrix_shape(A_local)
     partition_info, row_counts, max_local_size = _local_partition(
         b, mesh, axis_name, comm, n_local, nglobal
@@ -1268,6 +1280,7 @@ def make_sharded_solver(
     def pack_operator(A_local: MatrixOrOperator, traced: bool) -> jax.Array:
         """Global packed values of a local operator or matrix, differentiable
         with respect to the traced values it closes over."""
+        _reject_nullspace(A_local)
         closed = jax.make_jaxpr(lambda: local_values_of(A_local))()
         # Traced closed-over values become explicit inputs; the rest stay
         # jaxpr constants.

@@ -55,16 +55,16 @@ Refer to [Examples](examples.md) for additional usage examples.
 
 ## Citation
 
-If you use JAX-AMG in your work, please consider using the following citation ([arXiv:2606.09001](https://arxiv.org/abs/2606.09001)):
+If you use JAX-AMG in your work, please consider using the following citation:
 
 ```bibtex
-@misc{jaxamg2026,
-      title={JAX-AMG: A GPU-Accelerated Differentiable Sparse Linear Solver Library for JAX},
-      author={Yi Liu and Xiantao Fan and Jian-Xun Wang},
-      year={2026},
-      eprint={2606.09001},
-      archivePrefix={arXiv},
-      primaryClass={cs.MS},
-      url={https://arxiv.org/abs/2606.09001},
+@article{jaxamg2026,
+  title={JAX-AMG: A GPU-accelerated differentiable sparse linear solver library for JAX},
+  author={Yi Liu and Xiantao Fan and Jian-Xun Wang},
+  journal={SoftwareX},
+  volume={35},
+  pages={102966},
+  year={2026},
+  doi={10.1016/j.softx.2026.102966},
 }
 ```
