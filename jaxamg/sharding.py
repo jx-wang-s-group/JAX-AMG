@@ -1156,7 +1156,11 @@ def make_sharded_solver(
     local_mesh = _local_mesh(mesh, axis_name)
 
     def local_shard(value: jax.Array) -> jax.Array:
-        return value.addressable_shards[0].data
+        # Typed as replicated on the one-device mesh (no copy): JAX 0.11
+        # rejects gathers on an untyped shard under jax.set_mesh.
+        return jax.device_put(
+            value.addressable_shards[0].data, NamedSharding(local_mesh, P())
+        )
 
     def assemble_global(local_value: jax.Array) -> jax.Array:
         spec = P(axis_name, *(None,) * (local_value.ndim - 1))
