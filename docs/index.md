@@ -55,7 +55,7 @@ Refer to [Examples](examples.md) for additional usage examples.
 
 ## Citation
 
-If you use JAX-AMG in your work, please consider using the following citation:
+If you use JAX-AMG in your work, please cite our [SoftwareX paper](https://doi.org/10.1016/j.softx.2026.102966):
 
 ```bibtex
 @article{jaxamg2026,
