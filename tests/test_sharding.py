@@ -85,7 +85,7 @@ def test_make_sharded_vector_rejects_batched_rhs():
         )
 
 
-def test_sharded_inputs_preserve_device_arrays(monkeypatch):
+def test_sharded_inputs_preserve_device_arrays(monkeypatch, mock_mpi):
     mesh, local_values = _single_device_array(np.arange(4, dtype=np.float32))
     A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
     comm = SimpleNamespace(
@@ -110,7 +110,7 @@ def test_sharded_inputs_preserve_device_arrays(monkeypatch):
 
 
 @pytest.fixture
-def mock_sharded_solver(monkeypatch):
+def mock_sharded_solver(monkeypatch, mock_mpi):
     mesh, b = _single_device_array(np.arange(4, dtype=np.float32))
     A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
     allgather_calls = []
@@ -464,7 +464,7 @@ def test_make_sharded_vector_normalizes_dtype_and_rejects_empty_ranks():
         jaxamg.make_sharded_vector(np.zeros(0, dtype=np.float32), comm=comm)
 
 
-def test_sharded_matrix_keeps_nullspace_bases(monkeypatch):
+def test_sharded_matrix_keeps_nullspace_bases(monkeypatch, mock_mpi):
     mesh, b = _single_device_array(np.ones(4, dtype=np.float32))
     monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
     comm = SimpleNamespace(

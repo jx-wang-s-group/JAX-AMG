@@ -2,6 +2,7 @@
 
 import os
 import sys
+from types import ModuleType, SimpleNamespace
 
 # Under mpirun, pin each rank to a single distinct GPU before JAX initializes
 # its CUDA backend (test collection already allocates on device). Otherwise
@@ -23,6 +24,17 @@ def configure_jax():
     """Configure JAX for testing."""
     # Ensure JAX uses 32-bit floats by default
     jax.config.update("jax_enable_x64", False)
+
+
+@pytest.fixture
+def mock_mpi(monkeypatch):
+    """MPI constants for unit tests that provide their own fake communicator."""
+    mpi4py = ModuleType("mpi4py")
+    mpi4py.MPI = SimpleNamespace(
+        MAX=object(), MIN=object(), SUM=object(), LAND=object(), IN_PLACE=object()
+    )
+    monkeypatch.setitem(sys.modules, "mpi4py", mpi4py)
+    return mpi4py.MPI
 
 
 def pytest_collection_modifyitems(config, items):

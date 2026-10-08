@@ -268,7 +268,7 @@ class TestPure:
         )(v)
         np.testing.assert_allclose(gradient.ravel(), expected, atol=3e-6)
 
-    def test_label_range_rejection_is_collective(self):
+    def test_label_range_rejection_is_collective(self, mock_mpi):
         from types import SimpleNamespace
 
         # This rank's labels are valid; the remote rank reports an invalid
