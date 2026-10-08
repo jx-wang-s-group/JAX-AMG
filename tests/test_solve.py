@@ -308,12 +308,12 @@ class TestSolver:
             return b, jnp.zeros(3 + res_history_len, dtype=b.dtype)
 
         monkeypatch.setattr(jaxamg_module, "_amgx_solve_impl", fake_amgx_solve)
-        jaxamg_module._get_solver_primitive.cache_clear()
+        jaxamg_module._get_adjoint_primitive.cache_clear()
 
         try:
             A = poisson_matrix(2, skew=0.7)
             b = rhs_ones(A.shape[0])
-            solver = jaxamg_module._get_solver_primitive(
+            solver = jaxamg_module._get_adjoint_primitive(
                 "test-config", reuse_setup=True
             )
 
@@ -330,7 +330,7 @@ class TestSolver:
                 for call in calls[1:]
             )
         finally:
-            jaxamg_module._get_solver_primitive.cache_clear()
+            jaxamg_module._get_adjoint_primitive.cache_clear()
 
     def test_save_stats_file(self, tmp_path):
         """Test that jaxamg.solve generates a stats file correctly."""

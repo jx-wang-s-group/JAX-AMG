@@ -3,6 +3,8 @@ from .cache import (
     cache_mpi_metadata,
     with_cache,
 )
+from .global_operator import GlobalOperator, global_operator
+from .halo import HaloOperator, halo_operator
 from .jaxamg import (
     AMGXStatus,
     clear_solver_cache,
@@ -30,6 +32,10 @@ __all__ = [
     "Pattern",
     "pattern",
     "cache_mpi_metadata",
+    "halo_operator",
+    "global_operator",
+    "GlobalOperator",
+    "HaloOperator",
     "ShardedMatrix",
     "ShardedSolve",
     "make_sharded_matrix",

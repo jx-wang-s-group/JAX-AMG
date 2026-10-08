@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77.0.0", "pybind11>=2.10.0", "jax>=0.5.0"]
+requires = ["setuptools>=77.0.0", "pybind11>=2.10.0", "jax>=0.9.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,7 +9,7 @@ description = "JAX bindings for NVIDIA AmgX sparse linear solver with automatic 
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "Yi Liu" },
     { name = "Xiantao Fan" },
@@ -34,7 +34,6 @@ classifiers = [
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -48,7 +47,7 @@ classifiers = [
 dependencies = [
     "numpy>=1.24.0",
     "scipy>=1.10.0",
-    "jax>=0.5.0",
+    "jax>=0.9.1",
 ]
 
 [project.urls]
@@ -60,8 +59,8 @@ Issues = "https://github.com/jx-wang-s-group/JAX-AMG/issues"
 [project.optional-dependencies]
 # CUDA-enabled JAX. Pick the extra matching the CUDA major version your AmgX and
 # CUDA toolkit were built with (mirrors jax[cuda12] / jax[cuda13]).
-cuda12 = ["jax[cuda12]>=0.5.0"]
-cuda13 = ["jax[cuda13]>=0.5.0"]
+cuda12 = ["jax[cuda12]>=0.9.1"]
+cuda13 = ["jax[cuda13]>=0.9.1"]
 # Convenience only: pulls a generic mpi4py wheel plus mpi4jax. For GPU-aware or
 # HPC MPI, build mpi4py against your system MPI first
 # (pip install mpi4py --no-binary mpi4py); pip then leaves it untouched here.

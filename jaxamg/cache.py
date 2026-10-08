@@ -25,8 +25,6 @@ def _build_mpi_cache(
     comm: "Comm",
     nglobal: int,
     recvcounts_tuple: tuple[int, ...],
-    max_nnz: int,
-    nnz_out: int | None,
     halo_plan: "HaloPlan",
     *,
     transpose_plan: "TransposePlan | None" = None,
@@ -34,39 +32,24 @@ def _build_mpi_cache(
     save_stats: bool = False,
     block_dim: int = 1,
     singular: bool = False,
-    lrank: int | None = None,
-    device: jax.Device | None = None,
-    commit: bool = True,
 ) -> dict[str, Any]:
-    """Assemble MPI metadata after structure-dependent collectives are done.
-
-    ``commit`` controls device placement of the routing arrays. The default pins
-    them to one device, which is what repeated eager MPI solves want. A caller
-    that captures them in a ``jax.shard_map`` spanning the whole mesh must pass
-    ``commit=False``: an array committed to a single device cannot be captured
-    there, while an uncommitted one can.
-    """
+    """Assemble MPI metadata after structure-dependent collectives are done."""
     from .mpi_utils import register_comm
 
-    rank = comm.Get_rank()
     comm_ptr = register_comm(comm)
-    if lrank is None:
-        lrank = rank % jax.device_count()
+    lrank = comm.Get_rank() % jax.device_count()
 
-    # These plans are solve operands, not setup metadata. Keep one device copy
-    # in the cache so repeated eager solves do not re-transfer every routing
-    # array from the host. The original NumPy buffers can then be released.
-    if device is None:
-        local_devices = jax.local_devices()
-        device = local_devices[lrank % len(local_devices)]
+    # These plans are solve operands: keep one device copy so repeated eager
+    # solves do not re-transfer the routing arrays from the host.
+    local_devices = jax.local_devices()
+    device = local_devices[lrank % len(local_devices)]
 
     def place(array):
-        return jax.device_put(array, device) if commit else jnp.asarray(array)
+        return jax.device_put(array, device)
 
     halo_plan = halo_plan._replace(
         col_to_combined=place(halo_plan.col_to_combined),
-        send_ids_2d=place(halo_plan.send_ids_2d),
-        recv_ghost_slot_2d=place(halo_plan.recv_ghost_slot_2d),
+        send_ids=place(halo_plan.send_ids),
     )
     if transpose_plan is not None:
         with temp_enable_x64():
@@ -75,8 +58,8 @@ def _build_mpi_cache(
                 indptr=place(transpose_plan.indptr),
                 local_source_ids=place(transpose_plan.local_source_ids),
                 local_target_ids=place(transpose_plan.local_target_ids),
-                send_ids_2d=place(transpose_plan.send_ids_2d),
-                recv_target_ids_2d=place(transpose_plan.recv_target_ids_2d),
+                send_ids=place(transpose_plan.send_ids),
+                recv_target_ids=place(transpose_plan.recv_target_ids),
             )
     if row_indices is not None:
         row_indices = place(row_indices)
@@ -90,13 +73,10 @@ def _build_mpi_cache(
         "lrank": lrank,
         "nglobal": nglobal,
         "config_str": config_str,
-        "max_nnz": max_nnz,
-        "nnz_out": nnz_out,
         "halo_plan": halo_plan,
         "transpose_plan": transpose_plan,
         "row_indices": row_indices,
         "block_dim": block_dim,
-        "singular": singular,
     }
 
 
@@ -111,6 +91,8 @@ def with_cache(
     nullspace: ArrayLike | str | None = None,
     transpose_nullspace: ArrayLike | str | None = None,
     pattern: "Pattern | None" = None,
+    labels: Any = None,
+    label_sum: Any = None,
 ) -> MatrixOrOperator:
     """
     Attach cached metadata (coloring, MPI info, symmetry, null spaces) to a matrix or operator.
@@ -127,7 +109,15 @@ def with_cache(
         nullspace: Default for `jaxamg.solve`'s `nullspace` (`"constant"`, a
                    vector, or an `(n, k)` array; local rows in MPI mode).
         transpose_nullspace: Default for `jaxamg.solve`'s `transpose_nullspace`.
-        pattern: A declared `jaxamg.Pattern`; exclusive with `coloring`.
+        pattern: A declared `jaxamg.Pattern` (from `jaxamg.pattern`); its
+                 colouring is attached. Exclusive with `coloring`.
+        labels: Default for `jaxamg.solve`'s `labels` (`(count, labels)`,
+                local rows in MPI mode).
+        label_sum: Default for `jaxamg.solve`'s `label_sum`.
+
+    Note:
+        The metadata is attached to the object passed in, which is also
+        returned: two names bound to one object share it.
 
     Returns:
         The same matrix/operator with requested cache attached.
@@ -144,7 +134,8 @@ def with_cache(
         try:
             object.__setattr__(A, "_coloring_info", coloring)
             object.__setattr__(A, "_pattern", pattern)
-            # Explicit colouring replaces discovery at every precision.
+            # A newly attached colouring replaces any colourings discovered
+            # earlier on this object, at every dtype.
             discovered = getattr(coloring, "dtype", None)
             object.__setattr__(
                 A,
@@ -178,6 +169,8 @@ def with_cache(
     for attr, value in (
         ("_nullspace", nullspace),
         ("_transpose_nullspace", transpose_nullspace),
+        ("_labels", labels),
+        ("_label_sum", label_sum),
     ):
         if value is not None:
             try:
@@ -189,6 +182,12 @@ def with_cache(
                 )
 
     return A
+
+
+def _halo_operator_type():
+    from .halo import HaloOperator
+
+    return HaloOperator
 
 
 def cache_mpi_metadata(
@@ -214,7 +213,7 @@ def cache_mpi_metadata(
         - Computes static MPI communication metadata (recvcounts, displs)
         - Prepares MPI communicator pointer and local rank
         - Prepares config string
-        - Computes max nnz across all ranks
+        - Builds the halo and transpose exchange plans
 
 
     Args:
@@ -222,11 +221,12 @@ def cache_mpi_metadata(
         comm: MPI communicator (from mpi4py.MPI.COMM_WORLD)
         nglobal: Global matrix size (total rows across all ranks)
         partition_info: tuple (row_start, row_end) indicating which rows this rank owns
-        A: Matrix or operator to compute max nnz for buffer sizing
-        is_symmetric: If True, the backward pass never transposes, so the
-            transpose output size (`nnz_out`) is left unset (``None``). Should
-            match the `is_symmetric` passed to `with_cache`; the default (False)
-            computes it, which is always safe.
+        A: Matrix or operator whose sparsity structure the plans are built from.
+            Reuse the metadata only with the same CSR structure and entry order;
+            values may change.
+        is_symmetric: If True, the backward pass never transposes, so no
+            transpose plan is built. Should match the `is_symmetric` passed to
+            `with_cache`; the default (False) builds it, which is always safe.
         save_stats: If True, prepare the config with solver statistics output
             enabled, so a later `solve(..., save_stats_file=...)` on the cached
             matrix produces a complete stats file.
@@ -247,14 +247,12 @@ def cache_mpi_metadata(
         - `lrank`: Local GPU rank
         - `nglobal`: Global matrix size
         - `config_str`: Prepared configuration string
-        - `max_nnz`: Maximum nnz across all ranks
-        - `nnz_out`: This rank's local nnz(A^T) for the transpose output, or
-          `None` when `is_symmetric` is True
         - `halo_plan`: Backward-pass halo-exchange plan for the gradient w.r.t.
           A (fetches only referenced remote solution entries)
         - `transpose_plan`: Fixed transpose structure and value routing for a
           nonsymmetric matrix, or `None` when `is_symmetric` is True
         - `row_indices`: Local CSR row index for every matrix nonzero
+        - `block_dim`: BSR block size
     """
     singular = singular or any(
         getattr(A, attr, None) is not None
@@ -277,58 +275,42 @@ def cache_mpi_metadata(
 
     from .mpi_utils import build_halo_plan, build_transpose_plan
 
-    # Compute max_nnz across all ranks, and capture this rank's global column
-    # indices (needed for nnz_out, the transpose output sizing).
-    # For CSR-like matrices (BCSR, SciPy CSR), read the arrays directly. SciPy
-    # CSC/BSR also expose these attributes but with different semantics, so
-    # they take the conversion path below instead.
+    # This rank's CSR structure (global columns). For CSR-like matrices (BCSR,
+    # SciPy CSR), read the arrays directly. SciPy CSC/BSR also expose these
+    # attributes but with different semantics, so they take the conversion path.
     if (
         all(hasattr(A, field) for field in ("data", "indices", "indptr"))
         and getattr(A, "format", "csr") == "csr"
     ):
-        local_nnz = len(A.data)
         local_col_indices = np.asarray(A.indices)
         local_indptr = np.asarray(A.indptr)
-    elif callable(A):
-        # For distributed operators, we need to use global size for proper materialization
-        # The operator shape is (n_local, n_global): takes global vector, returns local portion
-        from .sparsity import cache_coloring, materialize_sparse_matrix
-
-        # Check if operator already has cached coloring
-        cached_info = getattr(A, "_coloring_info", None)
-
-        if cached_info is None:
-            # Detect + colour via cache_coloring (tracing, then one-hot probing as
-            # fallback) using the distributed (n_local, n_global) shape.
-            cached_info = cache_coloring(A, (n_local, nglobal))
-
-        rows, cols, column_colors, n_colors, shape = cached_info
-        A_materialized = materialize_sparse_matrix(
-            A, shape, rows, cols, column_colors, n_colors
+    elif isinstance(A, _halo_operator_type()):
+        local_col_indices, local_indptr = A._host_structure(
+            row_start, get_preferred_dtype(None, None)
         )
+    elif callable(A):
+        # The operator's shape is (n_local, n_global); its structure comes from
+        # the cached or discovered colouring's coordinates.
+        from .sparsity import cache_coloring, csr_structure
 
-        local_nnz = len(A_materialized.data)
-        local_col_indices = np.asarray(A_materialized.indices)
-        local_indptr = np.asarray(A_materialized.indptr)
+        cached_info = getattr(A, "_coloring_info", None)
+        if cached_info is None:
+            cached_info = cache_coloring(A, (n_local, nglobal))
+        rows, cols = np.asarray(cached_info[0]), np.asarray(cached_info[1])
+        _, local_col_indices, local_indptr = csr_structure(rows, cols, n_local)
     else:
         A_materialized = to_bcsr_matrix(
             A,
             b=jnp.empty(n_local, dtype=get_preferred_dtype(A, None)),
             use_int64_indices=True,
         )
-        local_nnz = len(A_materialized.data)
         local_col_indices = np.asarray(A_materialized.indices)
         local_indptr = np.asarray(A_materialized.indptr)
 
-    all_nnz = comm.allgather(local_nnz)
-    max_nnz = max(all_nnz)
-
     recvcounts_tuple = tuple(int(s) for s in all_sizes)
 
-    # This rank's local nnz(A^T) for the transpose output buffers (backward pass
-    # of non-symmetric solves). Symmetric solves never transpose, so skip it.
+    # The transpose plan serves the backward pass of nonsymmetric solves.
     if is_symmetric:
-        nnz_out = None
         transpose_plan = None
     else:
         transpose_plan = build_transpose_plan(
@@ -338,7 +320,6 @@ def cache_mpi_metadata(
             partition_info,
             comm,
         )
-        nnz_out = transpose_plan.nnz
 
     # Backward-pass halo plan: fetches only the remote solution entries this
     # rank's rows reference for the gradient w.r.t. A, instead of gathering the
@@ -355,8 +336,6 @@ def cache_mpi_metadata(
         comm,
         nglobal,
         recvcounts_tuple,
-        max_nnz,
-        nnz_out,
         halo_plan,
         transpose_plan=transpose_plan,
         row_indices=row_indices,

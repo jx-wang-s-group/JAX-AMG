@@ -390,6 +390,18 @@ If you use [Lineax](https://docs.kidger.site/lineax/), `jaxamg.make_lineax_preco
     Converged!
     ```
 
+#### How the solve is differentiated
+
+`jaxamg.solve` differentiates `x = A⁻¹b`. Choose `derivative=`:
+
+- `"implicit"` (default): forward, reverse, and higher-order derivatives,
+  where supported by your operator.
+- `"adjoint"`: reverse mode only, with the same first-order gradients. Used by the
+  preconditioner helpers.
+
+Each tangent or reverse gradient requires an extra solve. Tighten
+`tolerance` when gradients need more accuracy.
+
 ### Singular systems
 
 For a singular matrix (e.g. a Poisson problem with periodic or Neumann boundaries), pass the null-space bases: `nullspace` (of `A`) pins the solution and keeps the adjoint solve consistent, `transpose_nullspace` (of `Aᵀ`) projects `b` onto the range of `A`. For a symmetric matrix the two coincide; for a volume-normalized finite-volume operator `A = D⁻¹L` the first is the constant vector and the second the cell volumes. See [`jaxamg.solve`](api.md#jaxamg.solve) for details.
@@ -432,6 +444,21 @@ For a singular matrix (e.g. a Poisson problem with periodic or Neumann boundarie
     Iterations: 13, mean(x): 0.0e+00
     Gradient error: 1.2e-10
     ```
+
+### Disconnected domains
+
+Pass `labels=(count, labels)` to apply the null-space bases separately to each
+disconnected part. This is the format returned by
+`scipy.sparse.csgraph.connected_components`: a count and one integer per row.
+Use `-1` for rows that need no null-space projection, such as anchored parts.
+
+```python
+# For A = D⁻¹L, V contains the cell volumes.
+x, info = jaxamg.solve(A, b, nullspace="constant", transpose_nullspace=V, labels=(count, labels))
+```
+
+Labels avoid storing a dense basis column for every part. Multiple basis
+columns per part are also supported. See `demo/disconnected_domain.py`.
 
 ### Optimization with color caching for operator
 

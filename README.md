@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/jaxamg.svg?style=flat-square)](https://pypi.org/project/jaxamg/)
 [![Docs](https://img.shields.io/github/actions/workflow/status/jx-wang-s-group/JAX-AMG/docs.yml?style=flat-square&label=docs)](https://jx-wang-s-group.github.io/JAX-AMG/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square)](https://github.com/jx-wang-s-group/JAX-AMG/blob/main/LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg?style=flat-square)](https://www.python.org/)
 [![DOI](https://img.shields.io/badge/DOI-10.1016%2Fj.softx.2026.102966-blue?style=flat-square)](https://doi.org/10.1016/j.softx.2026.102966)
 
 **JAX-AMG** brings the power of NVIDIA's [AmgX](https://developer.nvidia.com/amgx) library to the JAX ecosystem, providing high-performance, GPU-accelerated sparse linear solvers with full support for automatic differentiation.
@@ -13,15 +13,15 @@ Documentation: <https://jx-wang-s-group.github.io/JAX-AMG/>
 ## Features
 
 - **GPU-Accelerated Solvers**: Leverages NVIDIA AmgX for a broad range of GPU-accelerated sparse linear solvers, including algebraic multigrid (AMG), Krylov methods, and various variants, with flexible configuration options for solvers, smoothers, and preconditioners.
-- **Automatic Differentiation**: Supports adjoint-based gradient computation and integrates seamlessly with JAX for end-to-end differentiable workflows.
+- **Automatic Differentiation**: Supports forward- and reverse-mode gradient computation and integrates seamlessly with JAX for end-to-end differentiable workflows.
 - **JIT Compilation**: Built as a native JAX primitive, fully compatible with Just-in-Time compilation (`jax.jit`) for efficient, low-overhead execution.
 - **Distributed Solving**: Supports multi-GPU MPI, GPU-aware communication, and JAX sharding.
 - **Matrix-Free Operators**: Beyond explicit matrices, `A` can be a callable operator. The library recovers the exact sparsity pattern in a single pass by tracing the operator's computation graph, then assembles the matrix the solver needs.
 
 ## Prerequisites
 
-- Python 3.10+
-- JAX 0.5.0+ with CUDA support
+- Python 3.11+
+- JAX 0.9.1+ with CUDA support
 - AmgX 2.5.0+
 - CUDA Toolkit 12.0+
 

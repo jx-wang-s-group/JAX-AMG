@@ -1,3 +1,4 @@
+import copy
 import json
 
 import numpy as np
@@ -6,6 +7,65 @@ import pytest
 import jaxamg
 from jaxamg.config import prepare_config
 from jaxamg.matrices import rhs_ones, tridiagonal_matrix
+from jaxamg.preconditioners import _prepare_preconditioner_config
+
+
+@pytest.mark.parametrize("preconditioner", [False, True])
+@pytest.mark.parametrize(
+    "config, overrides, mode",
+    [
+        ({}, {}, None),
+        ({"communicator": "MPI_DIRECT"}, {}, "MPI_DIRECT"),
+        ({"solver": {}, "communicator": "MPI"}, {}, "MPI"),
+        ({"solver": {"communicator": "mpi_direct"}}, {}, "MPI_DIRECT"),
+        (
+            {"communicator": "MPI", "solver": {"communicator": "mpi"}},
+            {},
+            "MPI",
+        ),
+        ({}, {"communicator": "mpi_direct"}, "MPI_DIRECT"),
+        (
+            {"solver": {}, "communicator": "MPI"},
+            {"communicator": "MPI_DIRECT"},
+            "MPI_DIRECT",
+        ),
+        (
+            {"solver": {"communicator": "MPI_DIRECT"}},
+            {"communicator": "MPI"},
+            "MPI",
+        ),
+    ],
+)
+def test_communicator_resource_scope(preconditioner, config, overrides, mode):
+    """Every public input form selects the actual AmgX resource transport."""
+    original = copy.deepcopy(config)
+    if preconditioner:
+        prepared = _prepare_preconditioner_config(config, **overrides)
+        assert prepared.get("communicator") == mode
+        assert "communicator" not in prepared["solver"]
+        # Preconditioners pass the result through solve's config preparation.
+        result = json.loads(prepare_config(prepared))
+    else:
+        result = json.loads(prepare_config(config, **overrides))
+    assert result.get("communicator") == mode
+    assert "communicator" not in result["solver"]
+    assert config == original
+
+
+@pytest.mark.parametrize("preconditioner", [False, True])
+@pytest.mark.parametrize(
+    "config, overrides",
+    [
+        ({"solver": {}, "communicator": "BAD"}, {}),
+        ({"solver": {"communicator": None}}, {}),
+        ({}, {"communicator": []}),
+        ({"communicator": "MPI", "solver": {"communicator": "MPI_DIRECT"}}, {}),
+    ],
+)
+def test_invalid_communicator_scope(preconditioner, config, overrides):
+    prepare = _prepare_preconditioner_config if preconditioner else prepare_config
+    with pytest.raises(ValueError, match="communicator"):
+        prepare(config, **overrides)
 
 
 @pytest.fixture

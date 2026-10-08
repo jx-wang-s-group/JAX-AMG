@@ -13,6 +13,8 @@ from jax.typing import ArrayLike
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
 
+    from .transport import NeighbourPlan
+
 
 def _mpi4jax_allgatherv(
     sendbuf: jax.Array,
@@ -75,19 +77,119 @@ def resolve_comm(comm_ptr: int) -> "Comm":
 
 
 class TransposePlan(NamedTuple):
-    """Fixed CSR structure and value routing for a distributed transpose."""
+    """Fixed CSR structure of this rank's rows of ``Aᵀ`` and the value routing
+    from ``A`` (each entry travels to its column's owner).
+
+    Fields:
+        indices, indptr: ``Aᵀ``'s local CSR structure (global column ids, int64).
+        local_source_ids, local_target_ids: entries of ``A`` whose column this
+            rank owns, and their positions in ``Aᵀ``'s values.
+        send_ids: entries of ``A`` to send, packed by owner (ascending).
+        recv_target_ids: positions in ``Aᵀ``'s values of the received entries,
+            packed by source (ascending).
+        exchange: the neighbour plan (one value per entry).
+        max_nnz: the largest ``nnz(Aᵀ)`` over ranks, for padded (sharded)
+            layouts; ``None`` unless the plan was built with ``pad=True``.
+
+    The routing arrays are padded with one-past-the-end sentinels (a zero is
+    appended to each values array): to at least one entry, and with
+    ``pad=True`` to the global maxima. Reversing the roles gives the routing
+    back from ``Aᵀ`` to ``A``.
+    """
 
     indices: np.ndarray | jax.Array
     indptr: np.ndarray | jax.Array
     local_source_ids: np.ndarray | jax.Array
     local_target_ids: np.ndarray | jax.Array
-    send_ids_2d: np.ndarray | jax.Array
-    recv_target_ids_2d: np.ndarray | jax.Array
-    max_nnz: int
+    send_ids: np.ndarray | jax.Array
+    recv_target_ids: np.ndarray | jax.Array
+    exchange: "NeighbourPlan"
+    max_nnz: int | None = None
 
     @property
     def nnz(self) -> int:
         return len(self.indices)
+
+
+# Plans memoized by structure, so repeated uncached solves reuse their
+# registered exchanges (a collective LAND keeps every rank's decision alike).
+_PLAN_MEMO: dict[tuple, tuple] = {}
+_PLAN_MEMO_SIZE = 64
+
+
+def _memoized(kind: str, comm: "Comm", parts: tuple, build: Callable[[], NamedTuple]):
+    import hashlib
+
+    from mpi4py import MPI
+
+    digest = hashlib.blake2b(digest_size=16)
+    for part in parts:
+        if isinstance(part, np.ndarray):
+            digest.update(np.ascontiguousarray(part).tobytes())
+            digest.update(str((part.dtype, part.shape)).encode())
+        else:
+            digest.update(repr(part).encode())
+    from .transport import transport_comm
+
+    key = (kind, int(MPI._handleof(comm)), digest.hexdigest())
+    tcomm = transport_comm(comm)
+    # A hit needs the plan's own transport communicator: a communicator handle
+    # can be reused by a new communicator after the old one is freed.
+    cached = _PLAN_MEMO.get(key)
+    hit = cached is not None and cached[0] is tcomm
+    if comm.allreduce(hit, op=MPI.LAND):
+        assert cached is not None
+        return cached[1]
+    plan = build()
+    if len(_PLAN_MEMO) >= _PLAN_MEMO_SIZE:
+        _PLAN_MEMO.pop(next(iter(_PLAN_MEMO)))
+    _PLAN_MEMO[key] = (tcomm, plan)
+    return plan
+
+
+def _global_maxima(comm: "Comm", values: list[int]) -> list[int]:
+    """One O(1) control reduction (sizes for padded layouts)."""
+    from mpi4py import MPI
+
+    local = np.asarray(values, dtype=np.int64)
+    out = np.empty_like(local)
+    comm.Allreduce(local, out, op=MPI.MAX)
+    return [int(v) for v in out]
+
+
+def _validate_plan_structure(indices, recvcounts, partition_info, comm, indptr=None):
+    """Reject bad local structure on all ranks before peer discovery."""
+    from mpi4py import MPI
+
+    start, end = partition_info
+    total = sum(recvcounts)
+    limit = np.iinfo(np.int32).max
+    valid = (
+        len(recvcounts) == comm.Get_size()
+        and all(n >= 0 for n in recvcounts)
+        and 0 <= start <= end <= total <= np.iinfo(np.int64).max
+        and start == sum(recvcounts[: comm.Get_rank()])
+        and end - start == recvcounts[comm.Get_rank()]
+        and end - start <= limit
+        and indices.ndim == 1
+        and (indices.size == 0 or indices.dtype.kind in "iu")
+        and indices.size <= limit
+        and np.all((indices >= 0) & (indices < total))
+    )
+    if indptr is not None:
+        valid = valid and (
+            indptr.ndim == 1
+            and indptr.dtype.kind in "iu"
+            and indptr.size == end - start + 1
+            and indptr[0] == 0
+            and indptr[-1] == indices.size
+            and np.all(indptr[1:] >= indptr[:-1])
+        )
+    if comm.allreduce(not valid, op=MPI.LOR):
+        raise ValueError(
+            "invalid CSR structure or partition in MPI plan; columns must be "
+            "in range and local row/nonzero counts must fit signed 32-bit indices"
+        )
 
 
 def build_transpose_plan(
@@ -96,138 +198,161 @@ def build_transpose_plan(
     recvcounts: tuple[int, ...],
     partition_info: tuple[int, int],
     comm: "Comm",
+    *,
+    pad: bool = False,
 ) -> TransposePlan:
-    """Precompute the structure and value routing for ``A.T``."""
+    """Precompute the structure and neighbour value routing for ``A.T``.
+
+    Setup exchanges each off-rank entry's coordinates with its column's owner
+    only (sparse peer discovery); nothing of size P is sent or allocated beyond
+    the partition offsets.
+    """
+    indices = np.asarray(indices)
+    indptr = np.asarray(indptr)
+    return _memoized(
+        "transpose",
+        comm,
+        (indices, indptr, tuple(recvcounts), tuple(partition_info), pad),
+        lambda: _build_transpose_plan(
+            indices, indptr, recvcounts, partition_info, comm, pad
+        ),
+    )
+
+
+def _build_transpose_plan(indices, indptr, recvcounts, partition_info, comm, pad):
     from mpi4py import MPI
 
-    indices = np.asarray(indices, dtype=np.int64)
-    indptr = np.asarray(indptr, dtype=np.int64)
+    from .transport import make_plan, owners_of, sparse_exchange
+
+    _validate_plan_structure(indices, recvcounts, partition_info, comm, indptr)
+    indices = indices.astype(np.int64, copy=False)
+    indptr = indptr.astype(np.int64, copy=False)
+    rank = comm.Get_rank()
     row_start, row_end = partition_info
     n_local = row_end - row_start
-    n_global = sum(recvcounts)
-    nranks = len(recvcounts)
+    offsets = np.cumsum(np.array([0, *recvcounts], dtype=np.int64))
 
     source_rows = np.repeat(
         np.arange(row_start, row_end, dtype=np.int64), np.diff(indptr)
     )
-    invalid_columns = bool(np.any(indices < 0) or np.any(indices >= n_global))
-    if comm.allreduce(invalid_columns, op=MPI.LOR):
-        raise ValueError("A_local contains a global column index outside the matrix")
-
-    row_bounds = np.cumsum(np.array([0, *recvcounts], dtype=np.int64))
-    owners = np.searchsorted(row_bounds, indices, side="right") - 1
-    send_order = np.argsort(owners, kind="stable")
-    send_counts = np.bincount(owners, minlength=nranks).astype(np.int32)
-    recv_counts = np.empty(nranks, dtype=np.int32)
-    comm.Alltoall(send_counts, recv_counts)
-    send_displs = np.insert(np.cumsum(send_counts[:-1]), 0, 0).astype(np.int32)
-    recv_displs = np.insert(np.cumsum(recv_counts[:-1]), 0, 0).astype(np.int32)
-
-    send_coordinates = np.ascontiguousarray(
-        np.column_stack((indices[send_order], source_rows[send_order]))
+    owners = owners_of(indices, offsets)
+    order = np.argsort(owners, kind="stable")
+    sorted_owners = owners[order]
+    peers, starts, counts = np.unique(
+        sorted_owners, return_index=True, return_counts=True
     )
-    send_ids = np.ascontiguousarray(np.arange(len(indices), dtype=np.int64)[send_order])
-    recv_nnz = int(recv_counts.sum())
-    recv_coordinates = np.empty((recv_nnz, 2), dtype=np.int64)
-    comm.Alltoallv(
-        [send_coordinates, 2 * send_counts, 2 * send_displs, MPI.INT64_T],
-        [recv_coordinates, 2 * recv_counts, 2 * recv_displs, MPI.INT64_T],
+    by_owner = {int(p): order[s : s + c] for p, s, c in zip(peers, starts, counts)}
+    outgoing = {
+        p: np.column_stack((indices[ids], source_rows[ids])).ravel()
+        for p, ids in by_owner.items()
+        if p != rank
+    }
+    received = {s: v.reshape(-1, 2) for s, v in sparse_exchange(comm, outgoing).items()}
+
+    # Arrivals in ascending source order (this rank's own entries in its slot);
+    # the Aᵀ order is the sort by (local row, column), independent of arrival.
+    local_ids = by_owner.get(rank, np.zeros(0, np.int64))
+    segments = []
+    for source in sorted(set(received) | {rank}):
+        if source == rank:
+            coords = np.column_stack((indices[local_ids], source_rows[local_ids]))
+        else:
+            coords = received[source]
+        segments.append((source, coords))
+    arrivals = (
+        np.concatenate([c for _, c in segments])
+        if segments
+        else np.zeros((0, 2), np.int64)
     )
-    recv_rows = recv_coordinates[:, 0]
-    recv_cols = recv_coordinates[:, 1]
-    local_rows = recv_rows - row_start
-    order = np.lexsort((recv_cols, local_rows))
-    local_rows = local_rows[order]
-    recv_cols = recv_cols[order]
-    row_counts = np.bincount(local_rows, minlength=n_local)
+    local_rows = arrivals[:, 0] - row_start
+    columns = arrivals[:, 1]
+    if comm.allreduce(len(columns) > np.iinfo(np.int32).max, op=MPI.LOR):
+        raise ValueError(
+            "transposed local nonzero count exceeds signed 32-bit indexing"
+        )
+    ordering = np.lexsort((columns, local_rows))
+    position = np.empty(len(ordering), dtype=np.int64)
+    position[ordering] = np.arange(len(ordering), dtype=np.int64)
+    row_counts = np.bincount(local_rows[ordering], minlength=n_local)
     transpose_indptr = np.concatenate(([0], np.cumsum(row_counts))).astype(np.int32)
 
-    rank = comm.Get_rank()
-    remote_send_counts = send_counts.copy()
-    remote_recv_counts = recv_counts.copy()
-    remote_send_counts[rank] = 0
-    remote_recv_counts[rank] = 0
-    local_maxima = np.array(
-        [max(remote_send_counts.max(), remote_recv_counts.max()), recv_nnz],
-        dtype=np.int64,
+    offset = 0
+    local_target_ids = np.zeros(0, np.int64)
+    recv_targets, recv_counts = [], {}
+    for source, coords in segments:
+        span = position[offset : offset + len(coords)]
+        offset += len(coords)
+        if source == rank:
+            local_target_ids = span
+        else:
+            recv_targets.append(span)
+            recv_counts[source] = len(coords)
+    send_counts = {p: len(ids) for p, ids in by_owner.items() if p != rank}
+    send_ids = (
+        np.concatenate([by_owner[p] for p in sorted(send_counts)])
+        if send_counts
+        else np.zeros(0, np.int64)
     )
-    global_maxima = np.empty_like(local_maxima)
-    comm.Allreduce(local_maxima, global_maxima, op=MPI.MAX)
-    max_per_rank = max(int(global_maxima[0]), 1)
-    max_nnz = int(global_maxima[1])
+    recv_target_ids = (
+        np.concatenate(recv_targets) if recv_targets else np.zeros(0, np.int64)
+    )
+    plan = make_plan(comm, send_counts, recv_counts)
 
-    # Padding uses a one-past-the-end sentinel. Applying the plan pads both the
-    # input and output by one zero, so reversing the four routing arrays also
-    # gives the value routing for ``A.T.T``.
-    send_ids_2d = np.full((nranks, max_per_rank), len(indices), dtype=np.int32)
-    recv_target_ids_2d = np.full((nranks, max_per_rank), recv_nnz, dtype=np.int32)
-    inverse_order = np.empty(recv_nnz, dtype=np.int32)
-    inverse_order[order] = np.arange(recv_nnz, dtype=np.int32)
-    for peer in range(nranks):
-        if peer == rank:
-            continue
-        send_count = int(send_counts[peer])
-        if send_count:
-            start = int(send_displs[peer])
-            send_ids_2d[peer, :send_count] = send_ids[start : start + send_count]
-        recv_count = int(recv_counts[peer])
-        if recv_count:
-            start = int(recv_displs[peer])
-            recv_target_ids_2d[peer, :recv_count] = inverse_order[
-                start : start + recv_count
-            ]
-
-    local_send_start = int(send_displs[rank])
-    local_recv_start = int(recv_displs[rank])
-    local_count = int(send_counts[rank])
-    local_source_ids = send_ids[
-        local_send_start : local_send_start + local_count
-    ].astype(np.int32)
-    local_target_ids = inverse_order[local_recv_start : local_recv_start + local_count]
-
+    # Routing arrays keep at least one entry (sentinels one past the end), so
+    # every rank's exchange depends on its values: see ``transport.exchange``.
+    nnz_t = len(ordering)
+    max_nnz = None
+    send_width, recv_width = max(len(send_ids), 1), max(len(recv_target_ids), 1)
+    if pad:
+        max_send, max_recv, max_nnz = _global_maxima(
+            comm, [len(send_ids), len(recv_target_ids), nnz_t]
+        )
+        send_width, recv_width = max(max_send, 1), max(max_recv, 1)
+    send_ids = np.pad(
+        send_ids, (0, send_width - len(send_ids)), constant_values=len(indices)
+    )
+    recv_target_ids = np.pad(
+        recv_target_ids, (0, recv_width - len(recv_target_ids)), constant_values=nnz_t
+    )
     return TransposePlan(
-        np.asarray(recv_cols, dtype=np.int64),
+        columns[ordering].astype(np.int64),
         transpose_indptr,
-        local_source_ids,
-        local_target_ids,
-        send_ids_2d,
-        recv_target_ids_2d,
+        local_ids.astype(np.int32),
+        local_target_ids.astype(np.int32),
+        send_ids.astype(np.int32),
+        recv_target_ids.astype(np.int32),
+        plan,
         max_nnz,
     )
 
 
 class HaloPlan(NamedTuple):
-    """Static communication plan for the backward pass halo exchange.
+    """Static neighbour plan for the solution halo ``[x_local | x_ghost]``.
 
-    The gradient ``dL/dA_ij = -adj_b[i] * x[j]`` needs ``x[j]`` only for the
-    global columns ``j`` this rank's local rows reference. Those split into
-    locally owned columns (already in ``x_local``) and a small set of remote
-    "ghost" columns owned by other ranks. This plan, built once from the fixed
-    sparsity pattern, fetches only the ghost values instead of all-gathering the
-    entire global solution.
+    SpMV and the gradient ``dL/dA_ij = -adj_b[i] * x[j]`` need ``x[j]`` for the
+    global columns ``j`` this rank's rows reference: locally owned ones and a
+    set of remote "ghost" columns, fetched from their owners only.
 
-    Fields (all static, captured at setup):
+    Fields:
         n_local: Rows owned by this rank.
-        n_ghost: Distinct remote columns this rank references.
-        max_n_ghost: Largest ``n_ghost`` across ranks, used for equal shard
-            shapes in the JAX sharding interface.
-        max_per_rank: Padded per-rank chunk size for the ``alltoall`` (a global
-            max, so every rank uses the same buffer size).
+        n_ghost: Distinct remote columns this rank references, in ascending
+            global order (the ghost slots; also the order they arrive in).
         col_to_combined: For each local nonzero, its index into the combined
             ``[x_local | x_ghost]`` vector (length nnz).
-        send_ids_2d: Local ``x`` indices to send to each rank, padded
-            ``(nranks, max_per_rank)``.
-        recv_ghost_slot_2d: Ghost slot each received value fills, padded
-            ``(nranks, max_per_rank)`` with ``n_ghost`` as an ignored sentinel.
+        send_ids: Local ``x`` indices to send, packed by requesting rank.
+        exchange: The neighbour plan.
+        max_n_ghost: Largest ``n_ghost`` over ranks, for padded (sharded)
+            layouts (then ``send_ids`` is padded with index 0 to the largest
+            send total); ``None`` unless built with ``pad=True``. ``send_ids``
+            always keeps at least one entry.
     """
 
     n_local: int
     n_ghost: int
-    max_n_ghost: int
-    max_per_rank: int
     col_to_combined: np.ndarray | jax.Array
-    send_ids_2d: np.ndarray | jax.Array
-    recv_ghost_slot_2d: np.ndarray | jax.Array
+    send_ids: np.ndarray | jax.Array
+    exchange: "NeighbourPlan"
+    max_n_ghost: int | None = None
 
 
 def build_halo_plan(
@@ -235,117 +360,78 @@ def build_halo_plan(
     recvcounts_tuple: tuple[int, ...],
     partition_info: tuple[int, int],
     comm: "Comm",
+    *,
+    pad: bool = False,
 ) -> HaloPlan:
-    """Build the backward-pass halo-exchange plan (see :class:`HaloPlan`).
+    """Build the halo plan (see :class:`HaloPlan`). Each rank tells the owners
+    of its ghost columns which ids it needs (sparse peer discovery); the
+    sparsity pattern is fixed, so this runs once."""
+    cols = np.asarray(local_col_indices)
+    return _memoized(
+        "halo",
+        comm,
+        (cols, tuple(recvcounts_tuple), tuple(partition_info), pad),
+        lambda: _build_halo_plan(cols, recvcounts_tuple, partition_info, comm, pad),
+    )
 
-    Determines which remote solution entries this rank needs for its local
-    gradient and the reciprocal entries it must supply to other ranks, via two
-    small host-side collectives (``Alltoall`` of counts, ``Alltoallv`` of the
-    requested global indices). The sparsity pattern is fixed, so this runs once.
-    """
+
+def _build_halo_plan(cols, recvcounts_tuple, partition_info, comm, pad):
     from mpi4py import MPI
 
-    nranks = len(recvcounts_tuple)
+    from .transport import make_plan, owners_of, sparse_exchange
+
+    _validate_plan_structure(cols, recvcounts_tuple, partition_info, comm)
+    cols = cols.astype(np.int64, copy=False)
     row_start, row_end = partition_info
     n_local = row_end - row_start
-    row_bounds = np.cumsum(np.array([0, *recvcounts_tuple], dtype=np.int64))
+    offsets = np.cumsum(np.array([0, *recvcounts_tuple], dtype=np.int64))
 
-    cols = np.asarray(local_col_indices).astype(np.int64)
     uniq = np.unique(cols)
-    is_remote = (uniq < row_start) | (uniq >= row_end)
-    ghost_global_ids = uniq[is_remote]  # sorted (np.unique is sorted)
+    ghost_global_ids = uniq[(uniq < row_start) | (uniq >= row_end)]  # ascending
     n_ghost = int(ghost_global_ids.size)
-
-    # Owner rank of each ghost column, and how many ghosts this rank needs from
-    # each owner (recv_counts). The reciprocal send_counts come from an Alltoall.
-    ghost_owner = np.clip(
-        np.searchsorted(row_bounds, ghost_global_ids, side="right") - 1, 0, nranks - 1
-    ).astype(np.int32)
-    recv_counts = np.bincount(ghost_owner, minlength=nranks).astype(np.int32)
-    send_counts = np.empty(nranks, dtype=np.int32)
-    comm.Alltoall(recv_counts, send_counts)
-
-    recv_displs = np.insert(np.cumsum(recv_counts[:-1]), 0, 0).astype(np.int32)
-    send_displs = np.insert(np.cumsum(send_counts[:-1]), 0, 0).astype(np.int32)
-
-    # Group this rank's requests by owner (stable keeps ghost order within owner),
-    # then tell each owner which global ids we want and learn which ids others
-    # want from us.
-    order = np.argsort(ghost_owner, kind="stable")
-    ghost_ids_by_owner = ghost_global_ids[order].astype(np.int64)
-    ghost_slot_by_owner = order.astype(np.int32)
-
-    requested_ids = np.empty(int(send_counts.sum()), dtype=np.int64)
-    comm.Alltoallv(
-        [ghost_ids_by_owner, recv_counts, recv_displs, MPI.INT64_T],
-        [requested_ids, send_counts, send_displs, MPI.INT64_T],
+    if comm.allreduce(n_local + n_ghost > np.iinfo(np.int32).max, op=MPI.LOR):
+        raise ValueError("local and ghost row count exceeds signed 32-bit indexing")
+    ghost_owner = owners_of(ghost_global_ids, offsets)
+    peers, starts, counts = np.unique(
+        ghost_owner, return_index=True, return_counts=True
     )
-    send_local_ids = (requested_ids - row_start).astype(np.int32)
-
-    # The all-to-all chunk and sharded ghost-vector sizes must agree globally.
-    # Reduce both maxima together so sharding does not need another collective.
-    local_maxima = np.array(
-        [max(send_counts.max(), recv_counts.max()), n_ghost], dtype=np.int64
+    requests = {
+        int(p): ghost_global_ids[s : s + c] for p, s, c in zip(peers, starts, counts)
+    }
+    asked = sparse_exchange(comm, requests)
+    send_counts = {s: len(ids) for s, ids in asked.items()}
+    send_ids = (
+        np.concatenate([asked[s] - row_start for s in sorted(asked)])
+        if asked
+        else np.zeros(0, np.int64)
     )
-    global_maxima = np.empty_like(local_maxima)
-    comm.Allreduce(local_maxima, global_maxima, op=MPI.MAX)
-    max_per_rank = max(int(global_maxima[0]), 1)
-    max_n_ghost = int(global_maxima[1])
+    plan = make_plan(comm, send_counts, {p: len(v) for p, v in requests.items()})
 
-    send_ids_2d = np.zeros((nranks, max_per_rank), dtype=np.int32)
-    recv_ghost_slot_2d = np.full((nranks, max_per_rank), n_ghost, dtype=np.int32)
-    for p in range(nranks):
-        sc = int(send_counts[p])
-        if sc:
-            send_ids_2d[p, :sc] = send_local_ids[send_displs[p] : send_displs[p] + sc]
-        rc = int(recv_counts[p])
-        if rc:
-            recv_ghost_slot_2d[p, :rc] = ghost_slot_by_owner[
-                recv_displs[p] : recv_displs[p] + rc
-            ]
+    # Index arrays keep at least one entry (index 0, whose value is never
+    # sent): see ``transport.exchange``.
+    max_n_ghost = None
+    width = max(len(send_ids), 1)
+    if pad:
+        max_send, max_n_ghost = _global_maxima(comm, [len(send_ids), n_ghost])
+        width = max(max_send, 1)
+    send_ids = np.pad(send_ids, (0, width - len(send_ids)))
 
-    # Map each local nonzero to its slot in the combined [x_local | x_ghost].
     local_mask = (cols >= row_start) & (cols < row_end)
     ghost_pos = np.clip(np.searchsorted(ghost_global_ids, cols), 0, max(n_ghost - 1, 0))
     col_to_combined = np.where(
         local_mask, cols - row_start, n_local + ghost_pos
     ).astype(np.int32)
-
     return HaloPlan(
         n_local,
         n_ghost,
-        max_n_ghost,
-        max_per_rank,
         col_to_combined,
-        send_ids_2d,
-        recv_ghost_slot_2d,
+        send_ids.astype(np.int32),
+        plan,
+        max_n_ghost,
     )
 
 
-def _mpi4jax_halo_gather(
-    x_local: jax.Array,
-    send_ids: jax.Array,
-    recv_ghost_slot: jax.Array,
-    n_ghost: int,
-    comm: "Comm",
-) -> jax.Array:
-    """Assemble ``[x_local | x_ghost]`` by exchanging only the needed remote
-    solution entries (see :class:`HaloPlan` for the plan arrays). ``send_ids``
-    and ``recv_ghost_slot`` are the padded ``(nranks, max_per_rank)`` plan
-    arrays; ``n_ghost`` is a static ghost count. JIT-compatible, GPU-direct."""
-    import mpi4jax
-
-    send_buf = x_local[send_ids]  # (nranks, max_per_rank); padded slots gather x[0]
-    recv_buf = mpi4jax.alltoall(send_buf, comm=comm)
-
-    # Scatter valid received values into ghost slots; padded slots hit the
-    # sentinel index n_ghost, which is sliced off.
-    x_ghost = jnp.zeros(n_ghost + 1, dtype=x_local.dtype)
-    x_ghost = x_ghost.at[recv_ghost_slot.reshape(-1)].set(recv_buf.reshape(-1))
-    return jnp.concatenate([x_local, x_ghost[:n_ghost]])
-
-
-def _apply_transpose_plan(
+def apply_transpose_plan(
     data: jax.Array,
     local_source_ids: jax.Array,
     local_target_ids: jax.Array,
@@ -354,35 +440,48 @@ def _apply_transpose_plan(
     nnz_out: int,
     exchange: Callable[[jax.Array], jax.Array],
 ) -> jax.Array:
-    """Apply a fixed transpose plan using the supplied all-to-all operation."""
+    """Route values along a transpose plan; ``exchange`` moves the packed
+    ``data[send_ids]`` (the neighbour exchange, or its reverse). Sentinel
+    entries point one past the end, at an appended zero."""
     data = jnp.pad(data, (0, 1))
     values = jnp.zeros(nnz_out + 1, dtype=data.dtype)
     values = values.at[local_target_ids].set(data[local_source_ids])
-    received = exchange(data[send_ids])
-    values = values.at[recv_target_ids.reshape(-1)].set(received.reshape(-1))
+    values = values.at[recv_target_ids].set(exchange(data[send_ids]))
     return values[:-1]
 
 
-def _mpi4jax_transpose_values(
+def transpose_values(
     data: jax.Array,
-    local_source_ids: jax.Array,
-    local_target_ids: jax.Array,
-    send_ids: jax.Array,
-    recv_target_ids: jax.Array,
+    plan_arrays: tuple,
+    plan: "NeighbourPlan",
     nnz_out: int,
-    comm: "Comm",
+    *,
+    reverse: bool = False,
+    ordered: bool = True,
 ) -> jax.Array:
-    """Exchange only matrix values for a preplanned distributed transpose."""
-    import mpi4jax
+    """``Aᵀ``'s values from ``A``'s (or, ``reverse``, ``A``'s from ``Aᵀ``'s),
+    with the plan's arrays ``(local_source, local_target, send, recv_target)``
+    passed as runtime operands."""
+    from .transport import exchange
 
-    return _apply_transpose_plan(
+    local_source, local_target, send, recv_target = plan_arrays
+    if reverse:
+        local_source, local_target = local_target, local_source
+        send, recv_target = recv_target, send
+    return apply_transpose_plan(
         data,
-        local_source_ids,
-        local_target_ids,
-        send_ids,
-        recv_target_ids,
+        local_source,
+        local_target,
+        send,
+        recv_target,
         nnz_out,
-        lambda values: mpi4jax.alltoall(values, comm=comm),
+        lambda packed: exchange(
+            packed,
+            plan,
+            reverse=reverse,
+            ordered=ordered,
+            out_size=recv_target.shape[0],
+        ),
     )
 
 

@@ -20,6 +20,8 @@
 #include <vector>
 #include <list>
 #include <unordered_map>
+#include <map>
+#include <tuple>
 #include <functional>
 #include <utility>
 #include <string_view>
@@ -109,7 +111,9 @@ namespace
       return true;
     }
 
-    void put(const Key &key, const Value &value, std::function<void(Value &)> destructor)
+    // `evict` false: the caller has already made room (see evict_lru_if_needed).
+    void put(const Key &key, const Value &value, std::function<void(Value &)> destructor,
+             bool evict = true)
     {
       std::lock_guard<std::mutex> lock(mutex_);
 
@@ -133,7 +137,7 @@ namespace
       }
       else
       {
-        if (cache_map_.size() >= capacity_)
+        if (evict && cache_map_.size() >= capacity_)
         {
           auto last = lru_list_.end();
           last--;
@@ -172,9 +176,11 @@ namespace
       cache_map_.clear();
     }
 
-    // Evict LRU entries so there is room for `incoming` new entries.
-    // Returns true if any eviction happened.
-    bool evict_lru_if_needed(size_t incoming, std::function<void(Value &)> destructor)
+    // Evict LRU entries so there is room for `incoming` new entries. With
+    // `scope`, only entries it selects are counted and evicted (the capacity
+    // then applies per scope). Returns true if any eviction happened.
+    bool evict_lru_if_needed(size_t incoming, std::function<void(Value &)> destructor,
+                             std::function<bool(const Key &)> scope = nullptr)
     {
       std::lock_guard<std::mutex> lock(mutex_);
 
@@ -183,17 +189,26 @@ namespace
         return false;
       }
 
-      bool evicted = false;
-      while (cache_map_.size() + incoming > capacity_ && !lru_list_.empty())
+      size_t count = 0;
+      for (const auto &pair : lru_list_)
       {
-        auto last = lru_list_.end();
-        --last;
+        count += !scope || scope(pair.first);
+      }
+      bool evicted = false;
+      for (auto it = lru_list_.end(); count + incoming > capacity_ && it != lru_list_.begin();)
+      {
+        --it;
+        if (scope && !scope(it->first))
+        {
+          continue;
+        }
         if (destructor)
         {
-          destructor(last->second);
+          destructor(it->second);
         }
-        cache_map_.erase(last->first);
-        lru_list_.pop_back();
+        cache_map_.erase(it->first);
+        it = lru_list_.erase(it);
+        --count;
         evicted = true;
       }
 
@@ -214,7 +229,7 @@ namespace
     int mode; // AMGX_Mode (dFFI vs dDDI)
     bool transpose_solve;
     int block_dim;
-    size_t structure_hash; // FNV-1a of row_ptrs + col_indices content
+    size_t structure_hash; // device fingerprint of row_ptrs + col_indices (_pattern_hash.cu)
     std::string config;
 
     bool operator==(const CacheKey &other) const
@@ -229,45 +244,20 @@ namespace
     }
   };
 
-  // Word-wise FNV-1a-style hash: four lanes break the multiply dependency chain
-  // so hashing the structure (row_ptrs + col_indices, hundreds of MB at n~1e7)
-  // isn't a bottleneck on repeated solves. Not canonical FNV-1a but a
-  // deterministic, content-sensitive digest, which is all the cache key needs.
-  // Pass `seed` to chain buffers into one digest; inputs are >=4-byte aligned.
-  inline size_t fnv1a_hash(const void *data, size_t len,
-                           size_t seed = 14695981039346656037ULL)
+  // A 64-bit finalizer (Steele, Lea and Flood's SplitMix64) for mixing hashes.
+  inline uint64_t SplitMix64(uint64_t z)
   {
-    constexpr size_t PRIME = 1099511628211ULL;
-    const uint8_t *bytes = static_cast<const uint8_t *>(data);
-    const uint32_t *words = static_cast<const uint32_t *>(data);
-    const size_t nwords = len / 4;
-    size_t h0 = seed, h1 = seed ^ 0x9e3779b97f4a7c15ULL,
-           h2 = seed + 1ULL, h3 = seed ^ 0xff51afd7ed558ccdULL;
-    size_t i = 0;
-    for (; i + 4 <= nwords; i += 4)
-    {
-      h0 = (h0 ^ words[i]) * PRIME;
-      h1 = (h1 ^ words[i + 1]) * PRIME;
-      h2 = (h2 ^ words[i + 2]) * PRIME;
-      h3 = (h3 ^ words[i + 3]) * PRIME;
-    }
-    size_t hash = (h0 * PRIME) ^ (h1 * PRIME) ^ (h2 * PRIME) ^ (h3 * PRIME);
-    for (; i < nwords; ++i)
-    {
-      hash = (hash ^ words[i]) * PRIME;
-    }
-    for (size_t b = nwords * 4; b < len; ++b)
-    {
-      hash = (hash ^ bytes[b]) * PRIME;
-    }
-    return hash;
+    z += 0x9e3779b97f4a7c15ULL;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
   }
 
   struct MPICacheKey
   {
     // No device pointers: JAX eager calls get new addresses each time, causing
-    // cache thrashing. Value-based keys + structure_hash (FNV-1a of row_ptrs +
-    // col_indices content) ensure stable hits and correct structural identity
+    // cache thrashing. Value-based keys + structure_hash (a device fingerprint of
+    // row_ptrs + col_indices content) ensure stable hits and correct structural identity
     // for AMGX_matrix_replace_coefficients on the cache-hit path.
     int n_local;
     int n_global;
@@ -278,6 +268,10 @@ namespace
     int block_dim;
     uint64_t comm_ptr;
     size_t structure_hash;
+    // Every rank's structure combined over the communicator, so the ranks'
+    // entries describe the same distributed matrix (a local structure alone
+    // can match on some ranks and not others, e.g. for A and Aᵀ).
+    uint64_t global_structure_hash;
     std::string config;
 
     bool operator==(const MPICacheKey &other) const
@@ -291,6 +285,7 @@ namespace
              block_dim == other.block_dim &&
              comm_ptr == other.comm_ptr &&
              structure_hash == other.structure_hash &&
+             global_structure_hash == other.global_structure_hash &&
              config == other.config;
     }
   };
@@ -331,10 +326,11 @@ namespace std
       size_t h8 = hash<size_t>()(k.structure_hash);
       size_t h9 = hash<string>()(k.config);
       size_t h10 = hash<int>()(k.block_dim);
+      size_t h11 = hash<uint64_t>()(k.global_structure_hash);
 
       return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^
              (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7) ^ (h9 << 8) ^
-             (h10 << 9);
+             (h10 << 9) ^ (h11 << 10);
     }
   };
 } // namespace std
@@ -361,6 +357,7 @@ namespace
     void *bsr_scatter_map = nullptr;       // block mode: scalar-entry -> BSR value slot map (device int32)
     int bsr_nnzb = 0;                      // block mode: number of BSR blocks
     bool owns_resources = false;           // true if isolated (JAXAMG_CACHE_SIZE=0)
+    bool owns_config = true;               // false only for a shared resource's founding config
   };
 
   // Parse JAXAMG_CACHE_SIZE env var (default: 1).
@@ -424,11 +421,10 @@ namespace
 
       if (res.owns_resources) {
           if (res.rsrc) AMGX_resources_destroy(res.rsrc);
-          if (res.cfg) AMGX_config_destroy(res.cfg);
       }
-      // In shared mode (owns_resources == false), the founding config is
-      // owned by Global{MPI}Resources and destroyed in its Destroy().
-      // Non-founding configs are tiny and cleaned up at process exit.
+      // Shared resources retain their founding config; every other config
+      // belongs to its solver entry and is released on eviction.
+      if (res.owns_config && res.cfg) AMGX_config_destroy(res.cfg);
       if (res.values_buf) cudaFree(res.values_buf);
       if (res.row_ptrs_buf) cudaFree(res.row_ptrs_buf);
       if (res.col_indices_buf) cudaFree(res.col_indices_buf);
@@ -472,11 +468,12 @@ namespace
           return *instance;
       }
 
-      AMGX_resources_handle GetHandle(AMGX_config_handle cfg) {
+      AMGX_resources_handle GetHandle(AMGX_config_handle cfg, bool &owns_config) {
           std::lock_guard<std::mutex> lock(mutex_);
           if (!handle_) {
               AMGX_SAFE_CALL_VOID(AMGX_resources_create_simple(&handle_, cfg));
               cfg_ = cfg;
+              owns_config = false;
           }
           return handle_;
       }
@@ -504,7 +501,7 @@ namespace
 
 #ifdef JAXAMG_WITH_MPI
   // Singleton for global MPI AmgX resource management. Keeps one
-  // AMGX_resources_handle per communicator: solves on the same communicator
+  // AMGX_resources_handle per communicator, device and transport: compatible solves
   // share it, distinct communicators each get their own (one handle reused
   // across communicators would run AmgX's collectives on the wrong one). Owns
   // the founding config handle per communicator (as GlobalResources does).
@@ -516,18 +513,20 @@ namespace
       }
 
       AMGX_resources_handle GetHandle(AMGX_config_handle cfg,
-                                       MPI_Comm *comm, int ndevs, int *devs) {
+                                       MPI_Comm *comm, int device, bool device_mpi,
+                                       bool &owns_config) {
           std::lock_guard<std::mutex> lock(mutex_);
           // Key on the communicator's identity (the same pointer Python passes as
           // comm_ptr), so each communicator gets its own resources handle.
-          uint64_t key = reinterpret_cast<uint64_t>(comm);
+          auto key = std::make_tuple(reinterpret_cast<uint64_t>(comm), device, device_mpi);
           auto it = handles_.find(key);
           if (it != handles_.end()) {
               return it->second.handle;
           }
           AMGX_resources_handle handle = nullptr;
-          AMGX_SAFE_CALL_VOID(AMGX_resources_create(&handle, cfg, comm, ndevs, devs));
+          AMGX_SAFE_CALL_VOID(AMGX_resources_create(&handle, cfg, comm, 1, &device));
           handles_[key] = {handle, cfg};
+          owns_config = false;
           return handle;
       }
 
@@ -548,7 +547,7 @@ namespace
       GlobalMPIResources() {}
       ~GlobalMPIResources() { Destroy(); }
 
-      std::unordered_map<uint64_t, Entry> handles_;
+      std::map<std::tuple<uint64_t, int, bool>, Entry> handles_;
       std::mutex mutex_;
   };
 #endif // JAXAMG_WITH_MPI

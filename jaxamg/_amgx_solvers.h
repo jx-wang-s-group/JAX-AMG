@@ -23,6 +23,11 @@
 
 #include "_amgx_utils.h"
 
+// Device fingerprint of a CSR pattern (_pattern_hash.cu); nullptr on success.
+extern "C" const char *jaxamg_pattern_hash(cudaStream_t stream, const int *row_ptrs,
+                                           int64_t n_row_ptrs, const void *col_indices,
+                                           int64_t nnz, int col_index_bytes, uint64_t *hash_out);
+
 namespace ffi = xla::ffi;
 
 namespace
@@ -362,20 +367,15 @@ namespace
 
     // The cache-hit path only replaces coefficient values, so the key must
     // capture the full sparsity pattern (row_ptrs + col_indices) for a changed
-    // pattern to miss and trigger a fresh setup. Reuse host buffers across calls
-    // to avoid reallocating these large arrays on every solve.
-    static thread_local std::vector<int> h_row_ptrs, h_col_indices;
-    if (static_cast<int>(h_row_ptrs.size()) < n_rows + 1)
-      h_row_ptrs.resize(n_rows + 1);
-    if (static_cast<int>(h_col_indices.size()) < nnz)
-      h_col_indices.resize(nnz);
-    cudaMemcpyAsync(h_row_ptrs.data(), row_ptrs_data,
-                    (n_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(h_col_indices.data(), col_indices_data,
-                    nnz * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_rows + 1) * sizeof(int));
-    structure_hash = fnv1a_hash(h_col_indices.data(), nnz * sizeof(int), structure_hash);
+    // pattern to miss and trigger a fresh setup. Fingerprinted on the device:
+    // only 16 bytes come back per solve.
+    uint64_t device_hash = 0;
+    if (const char *hash_err = jaxamg_pattern_hash(stream, row_ptrs_data, n_rows + 1,
+                                                   col_indices_data, nnz, sizeof(int), &device_hash))
+    {
+      return ffi::Error::Internal(hash_err);
+    }
+    const size_t structure_hash = static_cast<size_t>(device_hash);
 
     CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, bs, structure_hash, std::string(config)};
     bool cache_hit = GetSolverCache().get(key, res);
@@ -467,7 +467,7 @@ namespace
       else
       {
         res.owns_resources = false;
-        res.rsrc = GlobalResources::Get().GetHandle(res.cfg);
+        res.rsrc = GlobalResources::Get().GetHandle(res.cfg, res.owns_config);
       }
 
       AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
@@ -478,8 +478,14 @@ namespace
       if (bs > 1)
       {
         // Build the BSR structure (of A, or A^T for transpose solves) plus
-        // the value scatter map on the host; the pattern is already there
-        // from the cache-key hashing above.
+        // the value scatter map on the host, from a host copy of the pattern
+        // (on this setup path only).
+        std::vector<int> h_row_ptrs(n_rows + 1), h_col_indices(nnz);
+        cudaMemcpyAsync(h_row_ptrs.data(), row_ptrs_data,
+                        (n_rows + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(h_col_indices.data(), col_indices_data,
+                        nnz * sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
         std::vector<int> bsr_row_ptrs, bsr_col_indices, scatter_map;
         const char *build_err = BuildBsrScatterMap<int>(
             n_rows, nnz, bs, transpose_solve != 0,
@@ -638,7 +644,7 @@ namespace
   /*
    * AmgxSolveMPIInternal: MPI-aware templated core implementation.
    * Uses AMGX_resources_create() with MPI communicator and
-   * AMGX_matrix_upload_all_global() for distributed matrices.
+   * AMGX_matrix_upload_distributed() with contiguous partition offsets.
    */
   template <typename T, ffi::DataType DType, AMGX_Mode Mode>
   inline ffi::Error AmgxSolveMPIInternal(cudaStream_t stream,
@@ -657,7 +663,10 @@ namespace
                                          int32_t return_stats,
                                          int32_t reuse_setup,
                                          int32_t use_x0,
-                                         int32_t block_dim)
+                                         int32_t block_dim,
+                                         int32_t device_mpi,
+                                         int n_override = -1,
+                                         int nnz_override = -1)
   {
     if (transpose_solve != 0)
     {
@@ -701,8 +710,12 @@ namespace
     T *x_data = x->typed_data();
     T *stats_data = stats->typed_data();
 
-    const int n_local = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
-    const int nnz = static_cast<int>(values.element_count());
+    // Padded (rank-identical) callers pass the true local sizes; the buffers'
+    // prefixes are used and the solution's tail is zeroed by the caller.
+    const int n_local = n_override >= 0
+                            ? n_override
+                            : static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
+    const int nnz = nnz_override >= 0 ? nnz_override : static_cast<int>(values.element_count());
 
     // Block mode (block_dim > 1): local scalar CSR (with global columns) is
     // converted to BSR. Both the local partition and the global size must be
@@ -717,22 +730,28 @@ namespace
 
     CachedResources res;
 
-    // Hash row_ptrs and the (global, int64) col_indices; see the single-GPU
-    // path for the rationale. Reuse host buffers across calls to avoid
-    // reallocating these large arrays on every solve.
-    static thread_local std::vector<int> h_row_ptrs;
-    static thread_local std::vector<int64_t> h_col_indices;
-    if (static_cast<int>(h_row_ptrs.size()) < n_local + 1)
-      h_row_ptrs.resize(n_local + 1);
-    if (static_cast<int>(h_col_indices.size()) < nnz)
-      h_col_indices.resize(nnz);
-    cudaMemcpyAsync(h_row_ptrs.data(), row_ptrs_data,
-                    (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(h_col_indices.data(), col_indices_data,
-                    nnz * sizeof(int64_t), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    size_t structure_hash = fnv1a_hash(h_row_ptrs.data(), (n_local + 1) * sizeof(int));
-    structure_hash = fnv1a_hash(h_col_indices.data(), nnz * sizeof(int64_t), structure_hash);
+    // Fingerprint row_ptrs and the (global, int64) col_indices on the device;
+    // see the single-GPU path for the rationale. A failure is agreed with the
+    // cache decision below, so no rank is left waiting in a collective.
+    uint64_t device_hash = 0;
+    const char *hash_err = jaxamg_pattern_hash(stream, row_ptrs_data, n_local + 1,
+                                               col_indices_data, nnz, sizeof(int64_t), &device_hash);
+    const size_t structure_hash = static_cast<size_t>(device_hash);
+
+    // The cache lifecycle (hit and resetup, or miss, setup and eviction) runs
+    // AmgX collectives, so every rank must take the same branch: the key holds
+    // the distributed structure, and the decision is agreed below.
+    int comm_rank = 0;
+    MPI_Comm_rank(*mpi_comm, &comm_rank);
+    const uint64_t rank_structure = SplitMix64(
+        static_cast<uint64_t>(structure_hash) ^
+        SplitMix64((static_cast<uint64_t>(comm_rank) << 32) ^ static_cast<uint32_t>(n_local)));
+    uint64_t global_structure_hash = 0;
+    if (MPI_Allreduce(&rank_structure, &global_structure_hash, 1, MPI_UINT64_T, MPI_BXOR,
+                      *mpi_comm) != MPI_SUCCESS)
+    {
+      return ffi::Error::Internal("MPI_Allreduce of the structure hash failed");
+    }
 
     MPICacheKey key = {
         n_local,
@@ -744,8 +763,34 @@ namespace
         bs,
         comm_ptr_val,
         structure_hash,
+        global_structure_hash,
         std::string(config)};
-    bool cache_hit = GetMPISolverCache().get(key, res);
+    // No lookup after a failed hash (a lookup reorders the cache).
+    bool cache_hit = !hash_err && GetMPISolverCache().get(key, res);
+    // Every rank's cache sees the same sequence of keys (collective solves,
+    // per-communicator eviction), so the ranks hit or miss together. A split
+    // means the caches were changed on some ranks only (for example cleared
+    // on one rank); every rank then refuses alike, with the entries left
+    // intact rather than torn down on some ranks only.
+    int hits[3] = {cache_hit ? 1 : 0, cache_hit ? -1 : 0, hash_err ? -1 : 0};
+    if (MPI_Allreduce(MPI_IN_PLACE, hits, 3, MPI_INT, MPI_MIN, *mpi_comm) != MPI_SUCCESS)
+    {
+      return ffi::Error::Internal("MPI_Allreduce of the cache decision failed");
+    }
+    if (hits[2] != 0)
+    {
+      return ffi::Error::Internal(hash_err ? hash_err
+                                           : "pattern hash: failed on another rank, so the "
+                                             "solve is refused on every rank");
+    }
+    if (hits[0] != -hits[1])
+    {
+      return ffi::Error::Internal(
+          "the native solver caches differ across ranks (a cache was cleared or "
+          "changed on some ranks only), so the solve is refused on every rank. "
+          "The failed call ends this process's ordered MPI program; restart, and "
+          "call jaxamg.clear_solver_cache() on every rank or on none");
+    }
 
     // Destroys freshly created resources on any early return below (armed only
     // on the cache-miss path; disarmed once the cache takes ownership).
@@ -803,7 +848,11 @@ namespace
       // On cache miss, evict first (if full) so we never create a new MPI
       // resources handle while stale distributed resources are still alive.
       // This avoids communicator setup crashes under small cache capacities.
-      GetMPISolverCache().evict_lru_if_needed(1, DestroyResources);
+      // The capacity applies per communicator, so the ranks' eviction order
+      // does not depend on their other communicators.
+      GetMPISolverCache().evict_lru_if_needed(
+          1, DestroyResources,
+          [comm_ptr_val](const MPICacheKey &k) { return k.comm_ptr == comm_ptr_val; });
 
       fresh_guard.armed = true;
 
@@ -817,7 +866,8 @@ namespace
       else
       {
         res.owns_resources = false;
-        res.rsrc = GlobalMPIResources::Get().GetHandle(res.cfg, mpi_comm, 1, &lrank_host);
+        res.rsrc = GlobalMPIResources::Get().GetHandle(
+            res.cfg, mpi_comm, lrank_host, device_mpi != 0, res.owns_config);
       }
       AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, Mode, res.cfg));
@@ -828,9 +878,17 @@ namespace
       // mode the cache-owned buffers hold the BSR structure/values instead of
       // the scalar CSR; in scalar mode col_indices is narrowed to int32 (the
       // low 4 bytes of each int64; valid since global indices are <
-      // nglobal_host, an int) for the 32-bit upload path below.
+      // nglobal_host, an int) for the 32-bit distributed upload below.
       if (bs > 1)
       {
+        // The pattern on the host for the BSR build (on this setup path only).
+        std::vector<int> h_row_ptrs(n_local + 1);
+        std::vector<int64_t> h_col_indices(nnz);
+        cudaMemcpyAsync(h_row_ptrs.data(), row_ptrs_data,
+                        (n_local + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(h_col_indices.data(), col_indices_data,
+                        nnz * sizeof(int64_t), cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
         std::vector<int> bsr_row_ptrs, bsr_col_indices, scatter_map;
         const char *build_err = BuildBsrScatterMap<int64_t>(
             n_local, nnz, bs, /*transpose=*/false,
@@ -881,9 +939,9 @@ namespace
         cudaStreamSynchronize(stream);
       }
 
-      // Contiguous row partition (owning rank per global row -- block row in
-      // block mode), required for AMGX to build the multi-ring halo (classical
-      // AMG uses 2 rings).
+      // Contiguous scalar/block row boundaries need only O(nranks) metadata.
+      // An owning-rank vector would replicate O(nglobal) host storage on every
+      // rank even when each rank owns a fixed-size subdomain.
       int nranks_host = 1;
       MPI_Comm_size(*mpi_comm, &nranks_host);
       std::vector<int> counts(nranks_host);
@@ -892,29 +950,45 @@ namespace
                         *mpi_comm) != MPI_SUCCESS)
         return ffi::Error::Internal("MPI_Allgather of local sizes failed");
       const int nglobal_b = nglobal_host / bs;
-      std::vector<int> partition_vector(nglobal_b);
-      for (int r = 0, off = 0; r < nranks_host; ++r)
+      std::vector<int> partition_offsets(nranks_host + 1, 0);
+      for (int r = 0; r < nranks_host; ++r)
       {
-        if (counts[r] % bs != 0)
+        if (counts[r] < 0 || counts[r] % bs != 0)
           return ffi::Error::Internal(
               "a rank's partition is not divisible by block_dim");
-        for (int i = 0; i < counts[r] / bs && off < nglobal_b; ++i)
-          partition_vector[off++] = r;
+        const int64_t end = static_cast<int64_t>(partition_offsets[r]) + counts[r] / bs;
+        if (end > nglobal_b)
+          return ffi::Error::Internal("partition row counts exceed the global size");
+        partition_offsets[r + 1] = static_cast<int>(end);
       }
+      if (partition_offsets.back() != nglobal_b)
+        return ffi::Error::Internal("partition row counts do not match the global size");
 
-      // 32-bit index upload path; the 64-bit AMGX_matrix_upload_all_global
-      // produces a diverging AMG hierarchy at >= 4 ranks. In block mode the
-      // cache-owned buffers hold the BSR structure and values.
-      int nrings = 1;
-      AMGX_SAFE_CALL(AMGX_config_get_default_number_of_rings(res.cfg, &nrings));
-      AMGX_SAFE_CALL(AMGX_matrix_upload_all_global_32(
-          res.A, nglobal_b, n_local_b, bs > 1 ? res.bsr_nnzb : nnz, bs, bs,
-          static_cast<int *>(res.row_ptrs_buf),
-          static_cast<int *>(res.col_indices_buf),
-          bs > 1 ? static_cast<T *>(res.bsr_values)
-                 : static_cast<T *>(res.values_buf),
-          nullptr,
-          nrings, nrings, partition_vector.data()));
+      // Keep the 32-bit column path: the former 64-bit upload produced a
+      // diverging AMG hierarchy at >=4 ranks. Offsets change only how ownership
+      // is described, not index precision. Creating the distribution from the
+      // solver config preserves its import-ring count (classical AMG uses 2).
+      {
+        struct DistributionGuard
+        {
+          AMGX_distribution_handle handle = nullptr;
+          ~DistributionGuard()
+          {
+            if (handle) AMGX_distribution_destroy(handle);
+          }
+        } distribution;
+        AMGX_SAFE_CALL(AMGX_distribution_create(&distribution.handle, res.cfg));
+        AMGX_SAFE_CALL(AMGX_distribution_set_32bit_colindices(distribution.handle, 1));
+        AMGX_SAFE_CALL(AMGX_distribution_set_partition_data(
+            distribution.handle, AMGX_DIST_PARTITION_OFFSETS, partition_offsets.data()));
+        AMGX_SAFE_CALL(AMGX_matrix_upload_distributed(
+            res.A, nglobal_b, n_local_b, bs > 1 ? res.bsr_nnzb : nnz, bs, bs,
+            static_cast<int *>(res.row_ptrs_buf),
+            static_cast<int *>(res.col_indices_buf),
+            bs > 1 ? static_cast<T *>(res.bsr_values)
+                   : static_cast<T *>(res.values_buf),
+            nullptr, distribution.handle));
+      }
 
       AMGX_SAFE_CALL(AMGX_vector_create(&res.x_vec, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_vector_create(&res.b_vec, res.rsrc, Mode));
@@ -964,7 +1038,7 @@ namespace
     if (!cache_hit)
     {
       fresh_guard.armed = false;
-      GetMPISolverCache().put(key, res, DestroyResources);
+      GetMPISolverCache().put(key, res, DestroyResources, /*evict=*/false);
     }
 
     // Required for JIT forward+backward reuse of cached handles.
@@ -1032,10 +1106,13 @@ namespace
                                      int32_t return_stats,
                                      int32_t reuse_setup,
                                      int32_t use_x0,
-                                     int32_t block_dim)
+                                     int32_t block_dim,
+                                     int32_t device_mpi,
+                                     int n_override = -1,
+                                     int nnz_override = -1)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim, device_mpi, n_override, nnz_override);
   }
 
   // MPI Double implementation
@@ -1055,10 +1132,13 @@ namespace
                                            int32_t return_stats,
                                            int32_t reuse_setup,
                                            int32_t use_x0,
-                                           int32_t block_dim)
+                                           int32_t block_dim,
+                                           int32_t device_mpi,
+                                     int n_override = -1,
+                                     int nnz_override = -1)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim, device_mpi, n_override, nnz_override);
   }
 
 #endif // JAXAMG_WITH_MPI

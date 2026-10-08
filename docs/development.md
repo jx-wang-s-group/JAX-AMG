@@ -39,9 +39,10 @@ CUDA_VISIBLE_DEVICES=0 python -m pytest tests/
 
 ### MPI tests
 
-The MPI tests (`tests/test_mpi.py`) must be launched under `mpirun` and enabled
-with the `--only-mpi` flag provided by `pytest-mpi`. Most need at least two
-ranks; assign a distinct GPU to each via `CUDA_VISIBLE_DEVICES`:
+The MPI tests (`tests/test_mpi.py`, `tests/test_transport_mpi.py` and
+`tests/test_distributed_coloring_mpi.py`) must be launched under `mpirun` and
+enabled with the `--only-mpi` flag provided by `pytest-mpi`. Most need at least
+two ranks; assign a distinct GPU to each via `CUDA_VISIBLE_DEVICES`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
@@ -50,6 +51,9 @@ mpirun -n 2 python -m pytest --only-mpi tests/
 ```
 
 - `--only-mpi` runs *only* the MPI-marked tests.
+- The distributed-colouring tests need no GPU: run them on CPU ranks with
+  `JAX_PLATFORMS=cpu mpirun -n 4 python -m pytest --only-mpi
+  tests/test_distributed_coloring_mpi.py`.
 - Omit the GPU-aware MPI variables (or set `MPI4JAX_USE_CUDA_MPI=0`) to stage
   communication through host memory when GPU-aware MPI is unavailable. See the
   [MPI Guide](mpi.md#gpu-aware-mpi) and

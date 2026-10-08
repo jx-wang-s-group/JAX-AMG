@@ -48,6 +48,9 @@ def make_preconditioner(
 ) -> Callable:
     """Create a callable approximate inverse for external Krylov solvers.
 
+    Its derivative is the reverse-only `derivative="adjoint"` rule of
+    `jaxamg.solve`.
+
     The returned callable can be passed directly as the `M` argument to
     `jax.scipy.sparse.linalg.cg(...)` or `jax.scipy.sparse.linalg.bicgstab(...)`.
 
@@ -87,6 +90,7 @@ def make_preconditioner(
             nglobal=nglobal,
             partition_info=partition_info,
             save_stats_file=save_stats_file,
+            derivative="adjoint",  # an approximate inverse: reverse-only rule
         )
         if return_info:
             return x, info

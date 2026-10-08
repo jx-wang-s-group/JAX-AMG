@@ -31,18 +31,13 @@ Recompute the colouring if new nonzero entries appear.
 When to use each option:
 
 - `coloring=...`
-    - For callable operators, this avoids recomputing sparsity and coloring on every
-      solve.
-    - It is especially helpful in iterative loops where the operator structure stays
-      the same while values change.
-    - In practice, pass the result of `cache_coloring(...)` into `with_cache(...)`.
-    - Under the hood, `cache_coloring(...)` detects the operator's sparsity pattern
-      by **tracing** its jaxpr — propagating an index-set structure through each
-      primitive to recover the exact pattern in a single trace — and falls back to
-      exhaustive **probing** with basis vectors for operators it cannot trace
-      (opaque calls, data-dependent indexing). The tracing method follows
-      [Hill & Dalle (2025)](https://arxiv.org/abs/2501.17737); their Julia package
-      is [SparseConnectivityTracer.jl](https://github.com/adrhill/SparseConnectivityTracer.jl).
+    - For callable operators: reuse the sparsity pattern and colouring instead of
+      discovering them on every solve. Pass the result of `cache_coloring(...)`.
+    - Discovery traces the operator's jaxpr
+      ([Hill & Dalle, 2025](https://arxiv.org/abs/2501.17737)), else probes it with
+      basis vectors, at its current values: entries that are zero there are
+      dropped. Reuse the colouring only while that pattern covers every parameter
+      value you use.
 
 - `pattern=...`
     - Declare all possible couplings with `jaxamg.pattern(rows, cols, shape)`,
@@ -54,10 +49,10 @@ When to use each option:
       replaces the old declaration and any discovered colourings.
 
 - `mpi=...`
-    - This reuses MPI metadata such as counts, displacements, communicator pointer,
-      config string, and max nnz.
-    - Use it when you run repeated MPI solves with the same communicator and
-      partition layout.
+    - This reuses MPI metadata: counts, communicator pointer, config string and
+      exchange plans.
+    - Reuse it only with the same communicator, partition layout, and CSR
+      structure (including entry order). Values may change.
     - In practice, pass the result of `cache_mpi_metadata(...)` into `with_cache(...)`.
 
 - `is_symmetric=True`
@@ -108,6 +103,11 @@ Behavior (two modes):
     - Larger values enable multi-entry reuse when alternating among multiple matrix
     structures/configs, including cases where the forward pass uses `A` and the
     gradient/backward pass uses a structurally different `A^T`.
+
+MPI cache capacity applies per communicator. Call `clear_solver_cache()` on
+every rank together; inconsistent caches cause the solve to fail on all ranks.
+Shared MPI resources are separate for each communicator, device, and transport
+mode; `finalize()` releases them.
 
 ### Solver setup reuse
 

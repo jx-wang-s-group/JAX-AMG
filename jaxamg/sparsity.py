@@ -3,8 +3,8 @@
 ``cache_coloring`` detects an operator's pattern at its current values (by
 tracing its jaxpr, else by one-hot probing), colours the columns, and
 materializes the values with one operator evaluation per colour. Entries that
-are zero at those values are dropped. Reuse a discovered pattern only while it
-covers every parameter value in use.
+are zero at those values are dropped: a declared pattern
+(``with_cache(..., pattern=...)``) covers couplings that appear later.
 """
 
 from __future__ import annotations
