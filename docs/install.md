@@ -5,7 +5,7 @@
 JAX-AMG compiles a native extension against CUDA and AmgX, so a build toolchain
 and these libraries must be in place before installing:
 
-- Python 3.10+ and a C++ compiler
+- Python 3.11+ and a C++ compiler
 - [CUDA Toolkit](https://developer.nvidia.com/cuda/toolkit) 12.0+
 - [NVIDIA AmgX](https://developer.nvidia.com/amgx) 2.5.0+, built from source (see the [build instructions](https://github.com/NVIDIA/AMGX#quickstart))
 - For distributed (MPI) mode: an MPI library (e.g., OpenMPI or MPICH), with AmgX built against it. A CUDA-aware MPI build is optional but recommended for GPU-direct communication.
@@ -62,7 +62,7 @@ export AMGX_BUILD=/usr/local/amgx/build   # Optional (defaults to $AMGX_ROOT/bui
     cd JAX-AMG
 
     # Install JAX with CUDA support (or jax[cuda13])
-    pip install "jax[cuda12]>=0.5.0"
+    pip install "jax[cuda12]>=0.9.1"
 
     # Single-GPU
     pip install -e .

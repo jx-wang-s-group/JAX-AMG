@@ -25,6 +25,11 @@
 #endif
 #include "_amgx_utils.h"
 #include "_amgx_solvers.h"
+#include "_local_arrays.h"
+#include <pybind11/stl.h>
+#ifdef JAXAMG_WITH_MPI
+#include "_neighbour_exchange.h"
+#endif
 
 namespace py = pybind11;
 namespace ffi = xla::ffi;
@@ -154,10 +159,26 @@ PYBIND11_MODULE(_amgx, m)
         { return py::capsule(reinterpret_cast<void *>(AmgxSolveMPI)); });
   m.def("get_amgx_solve_mpi_double_handler", []()
         { return py::capsule(reinterpret_cast<void *>(AmgxSolveMPIDouble)); });
+  m.def("get_neighbour_exchange_handler", []()
+        { return py::capsule(reinterpret_cast<void *>(jaxamg_exchange::NeighbourExchange)); });
+  m.def("register_exchange_plan", &jaxamg_exchange::RegisterPlan,
+        py::arg("plan_id"), py::arg("comm_handle"), py::arg("send_peers"),
+        py::arg("send_counts"), py::arg("recv_peers"), py::arg("recv_counts"));
+  m.def("release_exchange_plan", &jaxamg_exchange::ReleasePlan);
+  m.def("exchange_plan_count", &jaxamg_exchange::PlanCount);
   m.attr("mpi_enabled") = py::bool_(true);
 #else
   m.attr("mpi_enabled") = py::bool_(false);
 #endif
+
+  m.def("get_local_array_handler", []()
+        { return py::capsule(reinterpret_cast<void *>(jaxamg_local::LoadLocalArray)); });
+  m.def("register_local_array", &jaxamg_local::Register, py::arg("array_id"),
+        py::arg("data_pointer"), py::arg("nbytes"));
+  m.def("release_local_array", &jaxamg_local::Release);
+  m.def("local_array_count", &jaxamg_local::Count);
+  m.def("synchronize_devices", &jaxamg_local::SynchronizeDevices,
+        py::call_guard<py::gil_scoped_release>());
 
   m.def("initialize", &EnsureAmgxInitialized);
   m.def("finalize", &AmgxFinalize);
