@@ -85,7 +85,7 @@ class TestCacheColoringProbingFallback:
 
     def test_non_vmappable_operator_uses_sequential_fallback(self):
         # pure_callback with the default vmap_method has NO vmap rule, so probing
-        # must fall back to a sequential lax.map (this used to raise outright).
+        # must fall back to a sequential lax.map.
         n = 16
 
         def opaque(u):
@@ -251,7 +251,7 @@ class TestDynamicUpdateSlice:
             return jax.lax.dynamic_update_slice(3.0 * x, x[0:4] + x[4:8], (10,))
 
         pat = trace_sparsity_pattern(op, (n, n))
-        assert pat is not None  # handled now, no longer bails to probing
+        assert pat is not None
         assert _pat_set(pat) == _pat_set(probe_sparsity_pattern(op, (n, n)))
 
         cache = cache_coloring(op, (n, n))
@@ -432,3 +432,140 @@ class TestProbeBatching:
         c_ref, r_ref = np.nonzero(J.T)
         np.testing.assert_array_equal(rows_1, r_ref)
         np.testing.assert_array_equal(cols_1, c_ref)
+
+
+class TestScaleFreePatterns:
+    """Detection keeps every exact nonzero whatever the operator's scale."""
+
+    @pytest.mark.parametrize("scale", [1.0, 1e-6, 1e-10, 1e-14])
+    def test_traced_pattern_keeps_small_entries(self, scale):
+        n = 32
+        op = lambda x: scale * (2 * x - jnp.roll(x, 1) - jnp.roll(x, -1))
+        cache = cache_coloring(op, (n, n))
+        truth = _dense(op, n)
+        assert cache[0].size == np.count_nonzero(truth)
+        np.testing.assert_allclose(
+            _materialize_dense(op, cache), truth, rtol=1e-6, atol=0
+        )
+
+    @pytest.mark.parametrize("scale", [1.0, 1e-10, 1e-14])
+    def test_probed_pattern_keeps_small_entries(self, scale):
+        n = 16
+
+        def opaque(u):
+            return jax.pure_callback(
+                lambda v: scale * (np.asarray(v) * 2.0 - np.roll(np.asarray(v), 1)),
+                jax.ShapeDtypeStruct((n,), u.dtype),
+                u,
+                vmap_method="sequential",
+            )
+
+        rows, cols = probe_sparsity_pattern(opaque, (n, n))
+        assert rows.size == 2 * n
+        explicit = probe_sparsity_pattern(opaque, (n, n), tol=1e-9)
+        assert explicit[0].size == (2 * n if scale > 1e-9 else 0)
+
+
+class TestProbePrecision:
+    """Probes follow the unknowns' precision, so an operator whose arithmetic
+    follows its input dtype is not rounded to float32 before a float64 solve."""
+
+    @pytest.fixture
+    def x64(self):
+        jax.config.update("jax_enable_x64", True)
+        yield
+        jax.config.update("jax_enable_x64", False)
+
+    def _operator(self, n):
+        k = jnp.asarray(np.exp(0.3 * np.random.default_rng(0).standard_normal(n + 1)))
+
+        def op(x):
+            flux = k[1:-1].astype(x.dtype) * (x[1:] - x[:-1])
+            y = jnp.zeros(n, x.dtype).at[1:].add(-flux).at[:-1].add(flux)
+            return 0.37 * x - y
+
+        return op
+
+    def test_default_probe_is_float64_under_x64(self, x64):
+        n = 24
+        op = self._operator(n)
+        rows, cols, colors, count, shape = cache_coloring(op, (n, n))
+        A = materialize_sparse_matrix(op, shape, rows, cols, colors, count)
+        assert A.data.dtype == jnp.float64
+        truth = np.asarray(jax.jacfwd(op)(jnp.ones(n, jnp.float64)))
+        np.testing.assert_allclose(np.asarray(A.todense()), truth, rtol=1e-14, atol=0)
+
+    def test_explicit_probe_dtype(self, x64):
+        n = 24
+        op = self._operator(n)
+        rows, cols, colors, count, shape = cache_coloring(op, (n, n))
+        A = materialize_sparse_matrix(
+            op, shape, rows, cols, colors, count, dtype=jnp.float32
+        )
+        assert A.data.dtype == jnp.float32
+        with pytest.raises(TypeError, match="floating"):
+            materialize_sparse_matrix(
+                op, shape, rows, cols, colors, count, dtype=jnp.int32
+            )
+
+
+class TestDiscoveryDtype:
+    """Discovery (tracing, probing, recovery check) runs at the dtype the
+    operator will be materialized at, and the colouring remembers it."""
+
+    @staticmethod
+    def _dtype_dependent(x):
+        # Linear at either dtype, with a different pattern in float32.
+        return x if x.dtype == jnp.float64 else x + 0.25 * jnp.roll(x, 1)
+
+    @pytest.fixture
+    def x64(self):
+        jax.config.update("jax_enable_x64", True)
+        yield
+        jax.config.update("jax_enable_x64", False)
+
+    def test_float32_rhs_under_x64(self, x64):
+        from jaxamg.utils import to_bcsr_matrix
+
+        n = 4
+        b = jnp.arange(1, n + 1, dtype=jnp.float32)
+        A = to_bcsr_matrix(self._dtype_dependent, b=b)
+        expected = jax.vmap(self._dtype_dependent)(jnp.eye(n, dtype=jnp.float32)).T
+        assert A.data.dtype == jnp.float32
+        np.testing.assert_array_equal(np.asarray(A.todense()), np.asarray(expected))
+
+    def test_colouring_per_dtype(self, x64):
+        from jaxamg.sparsity import ColoringInfo, coloring_for
+
+        n = 4
+        op = lambda x: self._dtype_dependent(x)
+        c64 = cache_coloring(op, (n, n))
+        assert isinstance(c64, ColoringInfo) and c64.dtype == jnp.float64
+        rows, cols, colors, count, shape = c64  # still unpacks as the 5-tuple
+        assert rows.size == n
+        # Another dtype inside a trace is refused, never silently reused ...
+        with pytest.raises(ValueError, match="discovered at float64"):
+            coloring_for(op, (n, n), jnp.float32, traced=True)
+        # ... and discovered (then cached) outside one.
+        c32 = coloring_for(op, (n, n), jnp.float32, traced=False)
+        assert c32.dtype == jnp.float32 and c32[0].size == 2 * n
+        assert coloring_for(op, (n, n), jnp.float32, traced=True) is c32
+        assert coloring_for(op, (n, n), jnp.float64, traced=True) is c64
+
+    def test_plain_tuple_is_used_as_given(self, x64):
+        from jaxamg import with_cache
+        from jaxamg.sparsity import coloring_for
+
+        n = 4
+        op = lambda x: self._dtype_dependent(x)
+        plain = tuple(cache_coloring(lambda x: self._dtype_dependent(x), (n, n)))
+        attached = with_cache(op, coloring=plain)
+        assert coloring_for(attached, (n, n), jnp.float32, traced=True) is plain
+
+    def test_default_float32_without_x64(self):
+        n = 8
+        op = lambda x: 2 * x - jnp.roll(x, 1)
+        rows, cols, colors, count, shape = cache_coloring(op, (n, n))
+        assert cache_coloring(op, (n, n)).dtype == jnp.float32
+        A = materialize_sparse_matrix(op, shape, rows, cols, colors, count)
+        assert A.data.dtype == jnp.float32

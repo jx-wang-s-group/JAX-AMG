@@ -25,6 +25,9 @@ the library. It usually does not require user tuning, so it is not a focus here.
   metadata outside traced solve code.
 - This is object-level metadata attachment, not native AmgX-handle caching.
 
+Before JIT, call `cache_coloring(..., dtype=...)` for each solve precision.
+Recompute the colouring if new nonzero entries appear.
+
 When to use each option:
 
 - `coloring=...`

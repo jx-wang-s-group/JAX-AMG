@@ -132,6 +132,13 @@ def with_cache(
     if coloring is not None:
         try:
             object.__setattr__(A, "_coloring_info", coloring)
+            # Explicit colouring replaces discovery at every precision.
+            discovered = getattr(coloring, "dtype", None)
+            object.__setattr__(
+                A,
+                "_coloring_by_dtype",
+                {} if discovered is None else {discovered: coloring},
+            )
         except Exception as e:
             raise TypeError(
                 f"Cannot attach coloring cache to object of type {type(A).__name__}. "

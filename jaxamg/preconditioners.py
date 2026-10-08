@@ -183,7 +183,7 @@ def make_lineax_preconditioner(
             from .sparsity import cache_coloring
 
             n = int(leaves[0].shape[0])
-            cache_coloring(_action, (n, n))
+            cache_coloring(_action, (n, n), dtype=in_dtype)
         amg_input = _action
 
     apply = make_preconditioner(

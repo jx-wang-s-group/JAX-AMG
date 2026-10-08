@@ -1,6 +1,6 @@
 """Tracing-based sparsity detection: interpret an operator's jaxpr and propagate a
-connectivity (index-set) structure through each primitive to recover the EXACT
-global sparsity pattern in a single trace.
+connectivity (index-set) structure through each primitive, recovering the
+operator's connectivity in a single trace.
 
 This is the JAX-native analogue of the operator-overloading sparsity detection of
 SparseConnectivityTracer.jl [1, 2]: JAX is trace-based rather than dispatch-based,
@@ -1001,7 +1001,7 @@ def _dce(closed: Any) -> tuple[Jaxpr, Sequence[Any]]:
 
 
 def trace_sparsity_pattern(
-    operator: Callable, shape: tuple[int, int]
+    operator: Callable, shape: tuple[int, int], dtype: Any = None
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Recover (rows, cols) of a JAX operator's sparsity, or None to fall back.
 
@@ -1014,6 +1014,8 @@ def trace_sparsity_pattern(
         operator: callable ``A(x)`` mapping a length-``n_global`` vector to a
             length-``n_local`` vector (the local row block for distributed use).
         shape: ``(n_local, n_global)``.
+        dtype: Floating dtype of the traced input (default: the default float
+            dtype). A dtype-dependent operator is traced at this dtype.
 
     Returns:
         ``(rows, cols)`` int32 arrays of the local block's nonzero pattern, or
@@ -1022,7 +1024,9 @@ def trace_sparsity_pattern(
     """
     n_local, n_global = shape
     try:
-        closed = jax.make_jaxpr(operator)(jnp.ones(n_global))
+        closed = jax.make_jaxpr(operator)(
+            jnp.ones(n_global, dtype=jnp.result_type(float) if dtype is None else dtype)
+        )
     except Exception:
         return None
     if len(closed.jaxpr.invars) != 1:
