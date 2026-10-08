@@ -44,6 +44,15 @@ When to use each option:
       [Hill & Dalle (2025)](https://arxiv.org/abs/2501.17737); their Julia package
       is [SparseConnectivityTracer.jl](https://github.com/adrhill/SparseConnectivityTracer.jl).
 
+- `pattern=...`
+    - Declare all possible couplings with `jaxamg.pattern(rows, cols, shape)`,
+      including entries that are zero initially but may appear later.
+    - Pass the same declaration to new callable instances as parameters change.
+      It covers all precisions used with those operators.
+    - The declaration copies its inputs into immutable arrays.
+      `pattern=` and `coloring=` are mutually exclusive. Attaching new colouring
+      replaces the old declaration and any discovered colourings.
+
 - `mpi=...`
     - This reuses MPI metadata such as counts, displacements, communicator pointer,
       config string, and max nnz.
