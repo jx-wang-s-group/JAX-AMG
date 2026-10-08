@@ -9,29 +9,25 @@ The interface targets `shard_map` and `NamedSharding` rather than adding a
 separate `pmap` wrapper. This keeps inputs and outputs as JAX global arrays and
 fits JAX's current explicit-sharding model.
 
-The interface is experimental. Every process issues the same collectives, but
-its compiled program carries rank-specific constants (the local CSR structure
-and communication plans), which JAX's SPMD model does not formally promise to
-support. Expect the API to evolve.
+The interface is experimental; expect the API to evolve.
 
 ## Current Scope
 
 The initial interface supports:
 
-- one MPI process and one mesh-local GPU per rank;
-- a one-dimensional JAX mesh where device position `i` belongs to MPI rank `i`;
+- one MPI process and one mesh-local GPU per rank, with matching GPU models;
+- a mesh in MPI rank order, with rows partitioned over `axis_name` (one axis
+  or a tuple); all other axes must have size one;
 - row-sharded vectors with equal or unequal local row counts;
 - scalar and block matrices, provided every rank's true row count is divisible
   by `block_dim`;
 - symmetric and nonsymmetric distributed matrices;
 - singular systems with declared null spaces; and
-- JIT compilation and reverse-mode differentiation with respect to matrix
-  values and the RHS.
+- JIT compilation and differentiation with respect to matrix values, the RHS
+  and operator parameters.
 
-The local CSR structure is fixed when the solver is created. It requires JAX
-0.9 or newer, a communicator spanning every JAX process
-(no subcommunicators), and at least one row per rank. Multiple local GPUs per
-MPI process are not supported yet.
+The CSR structure is fixed at creation. The communicator must include every
+JAX process, with at least one row per rank.
 
 ## Process and Device Setup
 
@@ -56,17 +52,12 @@ environments whose launcher variables JAX does not recognize automatically.
 
 ## XLA Sharded Autotuning
 
-XLA's cross-process sharded autotuning assumes every process compiles the
-identical program. A sharded solver compiles each rank's local CSR structure
-and communication plans into that process's program, so compiling a
-multi-process loss under that autotuning deadlocks. Importing jaxamg therefore
-disables it (`--xla_gpu_shard_autotuning=false`; this only affects compile
-time). XLA reads `XLA_FLAGS` when its backend initializes, so import jaxamg
-before the first JAX device call. Otherwise set the flag in the environment
-yourself or pass `compiler_options={"xla_gpu_shard_autotuning": False}` to
-the outer `jax.jit`; `make_sharded_solver` warns when the flag was not applied
-in time. An explicit `xla_gpu_shard_autotuning` setting in `XLA_FLAGS` is left
-untouched.
+Import `jaxamg` before querying JAX devices. It disables sharded autotuning
+to prevent deadlocks when ranks compile different operator code, unless you
+explicitly set the flag in `XLA_FLAGS`.
+
+If JAX is already initialized, pass
+`compiler_options={"xla_gpu_shard_autotuning": False}` to the outer `jax.jit`.
 
 ## Sharded Solve
 
@@ -95,6 +86,14 @@ The sharding helpers use `MPI.COMM_WORLD` and a one-dimensional mesh over all
 JAX devices by default. Pass `comm=` or `mesh=` explicitly to override them;
 the matrix otherwise infers the mesh from `b`, and the solver uses the matrix's
 communicator and mesh.
+
+On a multi-axis mesh, pass the mesh and the axes that partition the rows:
+
+```python
+mesh = jax.make_mesh((2, 2, 1), ("x", "y", "z"))  # the application's mesh
+b = jaxamg.make_sharded_vector(b_local, mesh=mesh, axis_name=("x", "y"))
+A = jaxamg.make_sharded_matrix(A_local, b, axis_name=("x", "y"))
+```
 
 `A` stores the CSR structure only on its owning rank and exposes its padded,
 globally sharded values as `A.data`; it does not replicate the global matrix.
@@ -178,14 +177,19 @@ A = jaxamg.make_sharded_matrix(A_local, b)
 solver = jaxamg.make_sharded_solver(A, b, config=config)
 ```
 
-The bases are fixed at creation, like the sparsity, and applied to every solve
-(including through `A=`): the RHS is projected onto `range(A)`, the solution is
-pinned orthogonal to `null(A)`, the adjoint solve applies the transposed
-projections, and the AMG configuration switches to the singular-system
-defaults. `info["rhs_inconsistency"]` has one entry per rank. With
-`is_symmetric=True` one basis serves both roles. Every rank must declare the
-same bases (column counts included). As in `solve`, gradients with respect to
-matrix values assume perturbations that preserve the declared null spaces.
+These bases are defaults for each solve. Override them with
+`solver(b, A=values, nullspace=..., transpose_nullspace=..., labels=...)`,
+using global arrays sharded like `b`, or `"constant"`.
+
+As in [singular solves](examples.md#singular-systems), the RHS is projected
+and the solution is pinned. Every rank must agree on the basis column counts;
+matrix perturbations must preserve the declared null spaces.
+`info["rhs_inconsistency"]` reports one value per rank.
+
+For [disconnected domains](examples.md#disconnected-domains), use
+`labels=(count, labels)` with `-1 <= label < count`, including under tracing.
+Labels normally use global numbering. Custom linear `label_sum` functions map each
+rank's `count` partial sums to totals in the same global sharded layout.
 
 ## Differentiating Operator Parameters
 
@@ -220,21 +224,12 @@ with jax.set_mesh(A.mesh):
     value, grad_skew = jax.value_and_grad(loss)(skew, b, x_target)
 ```
 
-Per rank this is the MPI interface's own materialization, so memory and
-compute per solve match `solve(..., comm=...)`. Parameters the operator closes
-over must be identical on every rank; their gradients are summed across ranks.
-A closed-over value sharded across ranks is rejected under `jax.jit` — pass
-rank-local matrix values as `A.data` instead.
+Each rank materializes its own rows. Closed-over parameters must be identical
+on every rank; their gradients are summed globally. Pass sharded matrix values
+through `A.data`.
 
-Compilation is entirely the caller's decision: the solver adds no `jax.jit` of
-its own. `jax.value_and_grad(loss)` runs the whole pipeline eagerly, while
-`jax.jit(jax.value_and_grad(loss))` compiles it as one program. Both give the
-same results and both match the MPI interface's speed: a compiled caller runs
-the solver's `shard_map` regions inside its one program, while an untransformed
-call executes the rank-local pipeline directly on this process's shard — the
-same code path as `solve(..., comm=...)` — and reassembles the global arrays,
-instead of paying for JAX's much slower per-primitive eager `shard_map`
-execution.
+Wrap repeated solves in `jax.jit`. An untransformed call runs the rank-local
+pipeline directly on this process's shard.
 
 Run the complete single-node examples with:
 
@@ -254,11 +249,22 @@ by gradient descent through `solver(rhs, A=...)`. The loss is a reduction over
 global arrays, so its gradient is already global and no `comm.allreduce` is
 needed.
 
-Matrix gradients use a sparse all-to-all halo exchange: `jax.lax.all_to_all`
-inside a compiled program, and the MPI interface's mpi4jax exchange for
-untransformed calls — so `MPI4JAX_USE_CUDA_MPI` applies to eager sharded
-gradients exactly as it does to the MPI autodiff path. For a nonsymmetric
-matrix, the transpose structure and a sparse value-exchange plan are cached
-during solver creation. Only off-rank transpose values are exchanged, once per
-backward pass, rather than replicating all matrix values on every GPU. The
-forward and adjoint solves are both performed by AmgX.
+Matrix gradients exchange halo and transpose values with neighbouring ranks
+only. `MPI4JAX_USE_CUDA_MPI=1` passes device buffers to MPI directly.
+
+## Halo-form and global-view operators
+
+`make_sharded_matrix` and `solver(rhs, A=...)` also accept:
+
+- [`jaxamg.halo_operator(...)`](mpi.md#halo-form-operators);
+- `jaxamg.global_operator(fn, indices, indptr, comm=comm, mesh=mesh)`: `fn`
+  acts on global row-sharded vectors and does its own communication;
+  `indices` and `indptr` give this rank's rows (global columns). Row
+  partitions must be equal.
+
+Update parameters with `A=op.with_fn(new_fn)`, keeping the same sparsity.
+See `demo/sharded_global_operator_optimization.py`.
+
+For programs with their own collectives, use `global_operator` or `A.data`
+so ranks compile the same program. With explicit mesh axes, pass traced
+parameters as `shard_map` arguments rather than capturing them in closures.

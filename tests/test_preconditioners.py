@@ -59,6 +59,7 @@ def test_make_preconditioner_forwards_mpi_args(monkeypatch):
         nglobal=None,
         partition_info=None,
         save_stats_file=None,
+        derivative="implicit",
     ):
         calls.append(
             {
@@ -69,6 +70,7 @@ def test_make_preconditioner_forwards_mpi_args(monkeypatch):
                 "nglobal": nglobal,
                 "partition_info": partition_info,
                 "save_stats_file": save_stats_file,
+                "derivative": derivative,
             }
         )
         return b, {"iterations": 1, "residual": 0.0, "status": 0}
@@ -88,6 +90,8 @@ def test_make_preconditioner_forwards_mpi_args(monkeypatch):
     assert calls[0]["nglobal"] == 16
     assert calls[0]["partition_info"] == (4, 8)
     assert calls[0]["save_stats_file"] == "stats.txt"
+    # A one-cycle approximate inverse uses the reverse-only adjoint rule by default.
+    assert calls[0]["derivative"] == "adjoint"
 
 
 def test_make_preconditioner_nested_config_merge(monkeypatch):

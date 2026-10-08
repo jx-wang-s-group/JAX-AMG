@@ -95,10 +95,62 @@ namespace
   );
 
 #ifdef JAXAMG_WITH_MPI
-  // Register MPI handlers
+  // The MPI solve handlers. The ordering token joins every rank's
+  // communicating calls into one program order (mpi4jax's chain in per-rank
+  // programs; a fresh token in SPMD programs, whose common program orders
+  // them). ``sizes`` = (n_local, nnz) marks padded buffers, whose prefixes are
+  // solved and whose solution tail is zeroed; (-1, -1) means exact buffers.
+  template <ffi::DataType DT>
+  using MPISolve = ffi::Error (*)(cudaStream_t, ffi::Buffer<ffi::S32>, ffi::Buffer<ffi::S64>,
+                                  ffi::Buffer<DT>, ffi::Buffer<DT>, ffi::Buffer<DT>,
+                                  ffi::Buffer<ffi::S32>, ffi::Buffer<ffi::S32>,
+                                  ffi::Buffer<ffi::S32>, ffi::ResultBuffer<DT>,
+                                  ffi::ResultBuffer<DT>, std::string_view, int32_t, int32_t,
+                                  int32_t, int32_t, int32_t, int32_t, int, int);
+
+  template <ffi::DataType DT, MPISolve<DT> Solve>
+  ffi::Error AmgxSolveMPIPadded(
+      cudaStream_t stream, ffi::Buffer<ffi::S32> row_ptrs, ffi::Buffer<ffi::S64> col_indices,
+      ffi::Buffer<DT> values, ffi::Buffer<DT> b, ffi::Buffer<DT> x0,
+      ffi::Buffer<ffi::S32> nglobal, ffi::Buffer<ffi::S32> comm_ptr, ffi::Buffer<ffi::S32> lrank,
+      ffi::Buffer<ffi::S32> sizes, ffi::Token, ffi::ResultBuffer<DT> x,
+      ffi::ResultBuffer<DT> stats, ffi::Result<ffi::Token>, std::string_view config,
+      int32_t transpose_solve, int32_t return_stats, int32_t reuse_setup, int32_t use_x0,
+      int32_t block_dim, int32_t device_mpi)
+  {
+    int host_sizes[2] = {-1, -1};
+    if (sizes.element_count() != 2)
+      return ffi::Error::InvalidArgument("local sizes must contain two integers");
+    if (cudaStreamSynchronize(stream) != cudaSuccess)
+      return ffi::Error::Internal("waiting for the solve operands failed");
+    if (cudaMemcpy(host_sizes, sizes.typed_data(), 2 * sizeof(int), cudaMemcpyDeviceToHost) !=
+        cudaSuccess)
+      return ffi::Error::Internal("reading the local sizes failed");
+    const int64_t n_buffer = static_cast<int64_t>(x->element_count());
+    if ((host_sizes[0] < 0 || host_sizes[1] < 0) &&
+        (host_sizes[0] != -1 || host_sizes[1] != -1))
+      return ffi::Error::InvalidArgument("local sizes must be nonnegative or (-1, -1)");
+    const int64_t n = host_sizes[0] < 0 ? n_buffer : host_sizes[0];
+    const int64_t nnz = host_sizes[1] < 0 ? values.element_count() : host_sizes[1];
+    if (n > n_buffer || n > static_cast<int64_t>(b.element_count()) ||
+        n > static_cast<int64_t>(x0.element_count()) ||
+        n + 1 > static_cast<int64_t>(row_ptrs.element_count()) ||
+        nnz > static_cast<int64_t>(values.element_count()) ||
+        nnz > static_cast<int64_t>(col_indices.element_count()))
+      return ffi::Error::InvalidArgument("local sizes exceed the padded buffers");
+    ffi::Error err = Solve(stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank,
+                           x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0,
+                           block_dim, device_mpi, host_sizes[0], host_sizes[1]);
+    if (err.success() && n < n_buffer &&
+        cudaMemsetAsync(x->typed_data() + n, 0,
+                        (n_buffer - n) * sizeof(ffi::NativeType<DT>), stream) != cudaSuccess)
+      return ffi::Error::Internal("zeroing the solution padding failed");
+    return err;
+  }
+
   XLA_FFI_DEFINE_HANDLER(
       AmgxSolveMPI,
-      AmgxSolveMPIImpl,
+      (AmgxSolveMPIPadded<ffi::F32, AmgxSolveMPIImpl>),
       ffi::Ffi::Bind()
           .Ctx<ffi::PlatformStream<cudaStream_t>>() // CUDA stream context
           .Arg<ffi::Buffer<ffi::S32>>()             // row_ptrs
@@ -109,8 +161,11 @@ namespace
           .Arg<ffi::Buffer<ffi::S32>>()             // nglobal
           .Arg<ffi::Buffer<ffi::S32>>()             // comm_ptr (2 x int32)
           .Arg<ffi::Buffer<ffi::S32>>()             // lrank
+          .Arg<ffi::Buffer<ffi::S32>>()             // sizes: (n_local, nnz) or (-1, -1)
+          .Arg<ffi::Token>()                        // ordering token
           .Ret<ffi::Buffer<ffi::F32>>()             // x (local)
           .Ret<ffi::Buffer<ffi::F32>>()             // stats
+          .Ret<ffi::Token>()                        // ordering token out
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
@@ -122,7 +177,7 @@ namespace
 
   XLA_FFI_DEFINE_HANDLER(
       AmgxSolveMPIDouble,
-      AmgxSolveMPIImplDouble,
+      (AmgxSolveMPIPadded<ffi::F64, AmgxSolveMPIImplDouble>),
       ffi::Ffi::Bind()
           .Ctx<ffi::PlatformStream<cudaStream_t>>() // CUDA stream context
           .Arg<ffi::Buffer<ffi::S32>>()             // row_ptrs
@@ -133,8 +188,11 @@ namespace
           .Arg<ffi::Buffer<ffi::S32>>()             // nglobal
           .Arg<ffi::Buffer<ffi::S32>>()             // comm_ptr (2 x int32)
           .Arg<ffi::Buffer<ffi::S32>>()             // lrank
+          .Arg<ffi::Buffer<ffi::S32>>()             // sizes: (n_local, nnz) or (-1, -1)
+          .Arg<ffi::Token>()                        // ordering token
           .Ret<ffi::Buffer<ffi::F64>>()             // x (local)
           .Ret<ffi::Buffer<ffi::F64>>()             // stats
+          .Ret<ffi::Token>()                        // ordering token out
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag

@@ -43,21 +43,6 @@ def temp_enable_x64():
             jax.config.update("jax_enable_x64", False)
 
 
-def ensure_int64_array(data: ArrayLike) -> jax.Array:
-    """Create a JAX array with int64 dtype, temporarily enabling x64 if needed.
-
-    This avoids truncation warnings when running in float32 mode (default JAX).
-
-    Args:
-        data: Data to convert to int64 array
-
-    Returns:
-        Device array with int64 dtype
-    """
-    with temp_enable_x64():
-        return jnp.array(data, dtype=jnp.int64)
-
-
 def to_scipy(A: jsp.BCSR, format: str = "csr") -> sp.spmatrix:
     """Convert a JAX BCSR matrix to Scipy sparse matrix format.
 

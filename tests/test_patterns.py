@@ -133,3 +133,31 @@ def test_pickle_preserves_immutable_declaration():
     with pytest.raises(ValueError):
         p.rows.flags.writeable = True
     np.testing.assert_array_equal(p.rows, _tridiagonal(4).rows)
+
+
+def test_halo_operator_without_ghosts():
+    """A halo operator whose rows reference only owned columns (a block-
+    diagonal operator, or an isolated rank) materializes with its local
+    columns."""
+    pattern = jaxamg.pattern([0, 1], [0, 1], (2, 2))
+    op = jaxamg.halo_operator(
+        lambda x, g: 2 * x, n_local=2, ghost_ids=[], pattern=pattern
+    )
+    matrix = op._local_matrix(4, 8, jnp.float32, traced=False)
+    np.testing.assert_array_equal(np.asarray(matrix.indices), [4, 5])
+    np.testing.assert_array_equal(np.asarray(matrix.data), [2, 2])
+
+
+def test_halo_operator_owns_ghost_ids_and_validates_inputs():
+    ids = np.array([8, 10], np.int64)
+    op = jaxamg.halo_operator(lambda own, ghost: own, n_local=3, ghost_ids=ids)
+    ids[:] = 0
+    np.testing.assert_array_equal(op.ghost_ids, [8, 10])
+    with pytest.raises(ValueError):
+        op.ghost_ids.flags.writeable = True
+    for invalid in ([-1], [1.5], [[1, 2]], [2, 2]):
+        with pytest.raises(ValueError):
+            jaxamg.halo_operator(lambda own, ghost: own, n_local=3, ghost_ids=invalid)
+    for invalid in (-1, 1.5, True):
+        with pytest.raises((ValueError, TypeError)):
+            jaxamg.halo_operator(lambda own, ghost: own, n_local=invalid, ghost_ids=[])

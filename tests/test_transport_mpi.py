@@ -1,5 +1,5 @@
 """Neighbour-only transport (``jaxamg.transport``) under MPI: peer discovery,
-the exchange and its declared transpose, padding, batching and
+the exchange and its declared transpose, halo gathers, padding, batching and
 ordering against mpi4jax collectives. Run with ``mpirun -np N pytest --only-mpi``.
 """
 
@@ -112,6 +112,57 @@ def test_exchange_batching_and_ordering(comm):
     np.testing.assert_allclose(returned, send_buf, rtol=1e-6)
     total = comm.allreduce(float(send_buf.sum()), op=MPI.SUM)
     np.testing.assert_allclose(float(again), total * total, rtol=1e-5)
+
+
+def test_halo_plan_gather_and_gradient(comm):
+    from mpi4py import MPI
+
+    from jaxamg.matrices import poisson_matrix_distributed
+    from jaxamg.mpi_utils import build_halo_plan
+    from jaxamg.transport import halo_gather
+
+    rank, size = comm.Get_rank(), comm.Get_size()
+    grid = 8
+    A_local, row_start, row_end = poisson_matrix_distributed(grid, grid, rank, size)
+    counts = tuple(comm.allgather(row_end - row_start))
+    plan = build_halo_plan(A_local.indices, counts, (row_start, row_end), comm)
+    assert plan.exchange.max_degree <= 2  # a 1D slab partition: at most two peers
+    x_global = np.arange(grid * grid, dtype=np.float32) + 1.0
+    x_local = jnp.asarray(x_global[row_start:row_end])
+    combined = halo_gather(x_local, jnp.asarray(plan.send_ids), plan.exchange)
+    cols = np.asarray(A_local.indices)
+    np.testing.assert_array_equal(
+        np.asarray(combined)[np.asarray(plan.col_to_combined)], x_global[cols]
+    )
+
+    # The gather's transpose returns ghost cotangents to their owners.
+    def objective(v):
+        c = halo_gather(v, jnp.asarray(plan.send_ids), plan.exchange)
+        return jnp.sum(c[jnp.asarray(plan.col_to_combined)])
+
+    grad = jax.grad(objective)(x_local)
+    # d/dx_j of sum over every rank's entries of x[col] = number of entries of
+    # column j globally.
+    local_hits = np.bincount(cols, minlength=grid * grid).astype(np.float64)
+    hits = np.empty_like(local_hits)
+    comm.Allreduce(local_hits, hits, op=MPI.SUM)
+    np.testing.assert_array_equal(grad, hits[row_start:row_end])
+
+    # The same structure reuses its registered plan (no new registration).
+    again = build_halo_plan(A_local.indices, counts, (row_start, row_end), comm)
+    assert again.exchange.plan_id == plan.exchange.plan_id
+
+    # Padded form (sharded layout): shapes at the global maxima.
+    padded = build_halo_plan(
+        A_local.indices, counts, (row_start, row_end), comm, pad=True
+    )
+    maxima = comm.allreduce(plan.n_ghost, op=MPI.MAX)
+    assert padded.max_n_ghost == maxima
+    combined_padded = halo_gather(
+        x_local, jnp.asarray(padded.send_ids), padded.exchange, n_ghost=maxima
+    )
+    np.testing.assert_array_equal(combined_padded[: len(combined)], combined)
+    np.testing.assert_array_equal(combined_padded[len(combined) :], 0)
 
 
 def test_oversized_messages_are_refused_on_every_rank(comm):
@@ -286,3 +337,52 @@ def test_invalid_exchange_plan_is_rejected_collectively(comm, invalid):
 
     with pytest.raises(ValueError, match="invalid on at least one rank"):
         make_plan(comm, invalid if comm.rank == 0 else {}, {})
+
+
+@pytest.mark.parametrize("kind", ["halo", "transpose"])
+@pytest.mark.parametrize("bad", ["negative", "out_of_range", "fractional"])
+def test_bad_plan_columns_are_rejected_collectively(comm, kind, bad):
+    from jaxamg.mpi_utils import build_halo_plan, build_transpose_plan
+
+    columns = np.array([comm.rank])
+    if comm.rank == 0:
+        columns = np.array(
+            [{"negative": -1, "out_of_range": comm.size, "fractional": 0.5}[bad]]
+        )
+    counts = (1,) * comm.size
+    part = (comm.rank, comm.rank + 1)
+    with pytest.raises(ValueError, match="invalid CSR structure"):
+        if kind == "halo":
+            build_halo_plan(columns, counts, part, comm)
+        else:
+            build_transpose_plan(columns, np.array([0, 1]), counts, part, comm)
+
+
+def test_bad_transpose_row_pointers_are_rejected_collectively(comm):
+    from jaxamg.mpi_utils import build_transpose_plan
+
+    pointers = np.array([0, 2] if comm.rank == 0 else [0, 1])
+    with pytest.raises(ValueError, match="invalid CSR structure"):
+        build_transpose_plan(
+            np.array([comm.rank]),
+            pointers,
+            (1,) * comm.size,
+            (comm.rank, comm.rank + 1),
+            comm,
+        )
+
+
+def test_local_label_basis_failure_is_rejected_collectively(comm):
+    from jaxamg.nullspace import validate_basis
+
+    basis = jnp.asarray(np.random.default_rng(6).normal(size=(6, 2)), jnp.float32)
+    if comm.rank == 0:
+        basis = basis.at[:, 1].set(basis[:, 0])
+    with pytest.raises(ValueError, match="dependent columns"):
+        validate_basis(
+            basis,
+            "nullspace",
+            comm=comm,
+            labels=(1, np.zeros(6, np.int32)),
+            label_sum=lambda x: x,
+        )

@@ -150,4 +150,34 @@ A_local = jaxamg.with_cache(A_local, mpi=mpi_cache, nullspace="constant", transp
 x_local, info = jaxamg.solve(A_local, b_local)
 ```
 
-The `Aᵀ·M ≈ 0` check of `transpose_nullspace` is skipped in MPI mode.
+[Labels](examples.md#disconnected-domains) contain each rank's local rows.
+Use the same label for a part on every rank; totals are reduced globally.
+For custom numbering, pass `label_sum`, a linear JAX function mapping local
+per-label sums to totals. Use `jaxamg.nullspace.make_mpi_reduce_sum` for
+differentiable MPI sums. With custom numbering, cross-label coupling checks
+cover only locally owned columns.
+
+## Requirements and limits
+
+- Apply the same differentiation transforms on every rank. Keep zero
+  dependencies where needed (e.g. `b + 0 * theta` and `loss + 0 * x.sum()`)
+  so no rank skips the solve's collectives.
+- Clear solver caches on all ranks together.
+- Use one host thread per communicator. Keep the communicator alive until
+  queued work finishes and all ranks call `jaxamg.finalize()`.
+- Restart the process after a native-call failure.
+- Global row counts and local row/nonzero counts must fit signed 32-bit
+  integers. Each exchange message must be smaller than 2 GiB.
+
+## Halo-form operators
+
+Use `halo_operator` for `apply(x_local, x_ghost)`. Supply sorted global column
+IDs in `ghost_ids`; JAX-AMG fetches those entries. `apply` must not communicate.
+
+```python
+op = jaxamg.halo_operator(apply, n_local=n_local, ghost_ids=ghost_ids)
+x, info = jaxamg.solve(op, b_local, comm=comm, nglobal=n, partition_info=(r0, r1))
+```
+
+Before `jit` or `grad`, solve once eagerly or declare `pattern=`. Reuse the
+structure with `op.with_fn(new_apply)`. See `demo/mpi_halo_operator_optimization.py`.

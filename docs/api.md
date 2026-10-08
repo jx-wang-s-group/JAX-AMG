@@ -24,6 +24,34 @@ This page documents the public API of JAX-AMG.
         show_source: false
         heading_level: 3
 
+## Distributed Operators
+
+::: jaxamg.halo_operator
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
+::: jaxamg.HaloOperator
+    options:
+        show_root_heading: true
+        members: [with_fn]
+        show_source: false
+        heading_level: 3
+
+::: jaxamg.global_operator
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
+::: jaxamg.GlobalOperator
+    options:
+        show_root_heading: true
+        members: [with_fn]
+        show_source: false
+        heading_level: 3
+
 ## Status Codes
 
 ::: jaxamg.AMGXStatus

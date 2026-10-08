@@ -16,19 +16,20 @@ from jax.typing import ArrayLike
 from . import config as amgx_config
 from .mpi_utils import (
     TransposePlan,
-    _mpi4jax_halo_gather,
-    _mpi4jax_transpose_values,
     build_halo_plan,
     build_transpose_plan,
     register_comm,
     resolve_comm,
+    transpose_values,
 )
 from .nullspace import (
     _DENSE_LU_MSG,
     _MISSING_NULLSPACE_MSG,
     _MISSING_TRANSPOSE_MSG,
+    LabelSpec,
     NullSpaceSpec,
     NullSpaceWarning,
+    as_labels,
     as_nullspace_basis,
     make_mpi_reduce_sum,
     project_out,
@@ -38,6 +39,7 @@ from .nullspace import (
     verify_nullspace,
     warn_if_singular,
 )
+from .transport import halo_gather, mpi_ordered_effect
 from .utils import *
 
 if TYPE_CHECKING:
@@ -166,6 +168,93 @@ def _amgx_solve_impl(
     return cast(tuple, results)
 
 
+def _amgx_mpi_abstract_eval(*args, res_history_len, ordered, **params):
+    b = args[3]
+    outs = (
+        b.update(weak_type=False),
+        b.update(shape=(3 + res_history_len,), weak_type=False),
+    )
+    return outs, ({mpi_ordered_effect()} if ordered else set())
+
+
+def _amgx_mpi_lowering(ctx, *operands, res_history_len, ordered, config, **params):
+    # The private builder (as mpi4jax uses): a typed-FFI call with a token.
+    from jax._src.interpreters.mlir import custom_call as _custom_call
+    from jax._src.lib.mlir.dialects import hlo
+    from jax.interpreters import mlir
+
+    b_aval = ctx.avals_in[3]
+    target = (
+        _AMGX_CALL_NAME_MPI_DOUBLE
+        if b_aval.dtype == jnp.float64
+        else _AMGX_CALL_NAME_MPI
+    )
+    effect = mpi_ordered_effect()
+    token = ctx.tokens_in.get(effect) if ordered else hlo.create_token()
+    attrs = {
+        "config": mlir.ir_attribute(config),
+        "device_mpi": mlir.ir_attribute(
+            np.int32(
+                json.loads(config or "{}").get("communicator", "MPI") == "MPI_DIRECT"
+            )
+        ),
+    }
+    attrs.update({k: mlir.ir_attribute(np.int32(v)) for k, v in params.items()})
+    call = _custom_call(
+        target,
+        result_types=[mlir.aval_to_ir_type(a) for a in ctx.avals_out]
+        + [hlo.TokenType.get()],
+        operands=[*operands, token],
+        backend_config=attrs,
+        api_version=4,
+        has_side_effect=True,
+        operand_layouts=[tuple(range(len(a.shape) - 1, -1, -1)) for a in ctx.avals_in]
+        + [()],
+        result_layouts=[tuple(range(len(a.shape) - 1, -1, -1)) for a in ctx.avals_out]
+        + [()],
+    )
+    *outs, token_out = call.results
+    if ordered:
+        ctx.set_tokens_out(mlir.TokenSet({effect: token_out}))
+    return outs
+
+
+def _amgx_mpi_batch(args, dims, **params):
+    """One system at a time (communication has no batched form)."""
+    from jax.interpreters import batching
+
+    moved = [
+        a if d is batching.not_mapped else jnp.moveaxis(a, d, 0)
+        for a, d in zip(args, dims)
+    ]
+    batched = [d is not batching.not_mapped for d in dims]
+
+    def one(sliced):
+        it = iter(sliced)
+        full = [next(it) if bt else a for a, bt in zip(moved, batched)]
+        return tuple(_amgx_mpi_p.bind(*full, **params))
+
+    outs = jax.lax.map(one, tuple(a for a, bt in zip(moved, batched) if bt))
+    return list(outs), [0, 0]
+
+
+def _make_amgx_mpi_primitive():
+    from jax._src import dispatch
+    from jax.extend import core
+    from jax.interpreters import batching, mlir
+
+    prim = core.Primitive("jaxamg_amgx_solve_mpi")
+    prim.multiple_results = True
+    prim.def_impl(lambda *a, **p: dispatch.apply_primitive(prim, *a, **p))
+    prim.def_effectful_abstract_eval(_amgx_mpi_abstract_eval)
+    mlir.register_lowering(prim, _amgx_mpi_lowering, platform="cuda")
+    batching.primitive_batchers[prim] = _amgx_mpi_batch
+    return prim
+
+
+_amgx_mpi_p = _make_amgx_mpi_primitive()
+
+
 def _amgx_solve_mpi_impl(
     row_ptrs: ArrayLike,
     col_indices: ArrayLike,
@@ -182,57 +271,55 @@ def _amgx_solve_mpi_impl(
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
+    ordered: bool = True,
+    local_sizes: ArrayLike | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Low-level FFI call to AmgX MPI solver (non-differentiable)."""
+    """Low-level FFI call to AmgX MPI solver (non-differentiable).
+
+    ``ordered`` (per-rank programs) joins mpi4jax's ordered effect, so every
+    rank issues its AmgX solves, neighbour exchanges and mpi4jax collectives
+    in one program order under every transformation: independent solves in one
+    program can otherwise be scheduled differently on ranks whose programs
+    differ (local sizes), matching one solve's collectives with another's or
+    deadlocking. SPMD programs (``shard_map``) pass ``ordered=False``.
+
+    ``local_sizes`` (int32 ``(n_local, nnz)``, a runtime operand) marks padded
+    buffers: only their prefixes are solved and the solution's tail is zero,
+    so ranks with different local sizes can share one program. The default
+    ``(-1, -1)`` uses the buffers' sizes."""
 
     _ensure_backend()
     b = jnp.asarray(b)
-
-    out_spec = (
-        jax.ShapeDtypeStruct(b.shape, b.dtype),
-        jax.ShapeDtypeStruct((3 + res_history_len,), b.dtype),
-    )
-
-    call_name = _AMGX_CALL_NAME_MPI
-    if b.dtype == jnp.float64:
-        call_name = _AMGX_CALL_NAME_MPI_DOUBLE
-
-    # MPI solves also perform collectives whose ordering must be preserved.
-    call = ffi.ffi_call(
-        call_name,
-        out_spec,
-        has_side_effect=True,
-        input_layouts=[None, None, None, None, None, None, None, None],
-        output_layouts=None,
-        vmap_method="sequential",
-    )
     # The x0 slot is a required input; pass b as a same-shape dummy when
     # unused (ignored by the C++ side when use_x0 is 0).
-    results = call(
-        row_ptrs,
-        col_indices,
-        values,
+    x, stats = _amgx_mpi_p.bind(
+        jnp.asarray(row_ptrs),
+        jnp.asarray(col_indices),
+        jnp.asarray(values),
         b,
-        x0 if x0 is not None else b,
-        nglobal,
-        comm_ptr,
-        lrank,
-        config=config_str,
-        transpose_solve=np.int32(transpose_solve),
-        return_stats=np.int32(return_stats),
-        reuse_setup=np.int32(reuse_setup),
-        use_x0=np.int32(use_x0),
-        block_dim=np.int32(block_dim),
-        device_mpi=np.int32(
-            json.loads(config_str or "{}").get("communicator", "MPI") == "MPI_DIRECT"
+        b if x0 is None else jnp.asarray(x0),
+        jnp.asarray(nglobal),
+        jnp.asarray(comm_ptr),
+        jnp.asarray(lrank),
+        (
+            jnp.array([-1, -1], dtype=jnp.int32)
+            if local_sizes is None
+            else jnp.asarray(local_sizes, dtype=jnp.int32)
         ),
+        config=config_str,
+        transpose_solve=int(transpose_solve),
+        return_stats=int(return_stats),
+        reuse_setup=int(reuse_setup),
+        res_history_len=int(res_history_len),
+        use_x0=int(use_x0),
+        block_dim=int(block_dim),
+        ordered=bool(ordered),
     )
-
-    return cast(tuple, results)
+    return x, stats
 
 
 @functools.lru_cache(maxsize=32)
-def _get_solver_primitive(
+def _get_adjoint_primitive(
     config_str: str,
     is_symmetric: bool = False,
     return_stats: bool = False,
@@ -242,8 +329,8 @@ def _get_solver_primitive(
     block_dim: int = 1,
 ) -> Callable:
     """
-    Returns a JAX custom_vjp primitive for AmgX solve with a specific configuration.
-    Cached to avoid recompilation for identical configurations.
+    The adjoint-rule solve (a ``custom_vjp``, reverse mode only) for one native
+    configuration, cached per configuration.
 
     reuse_setup: Skip warm AMGX resetup and keep the cached hierarchy.
     res_history_len: Residual-history slots appended to the stats output.
@@ -284,7 +371,7 @@ def _get_solver_primitive(
 
         # Solve A^T λ = g_x (always from a zero start: x0 shifts only the
         # forward iteration, never the solution, so the adjoint ignores it).
-        solver = _get_solver_primitive(
+        solver = _get_adjoint_primitive(
             config_str,
             is_symmetric,
             return_stats=False,
@@ -296,7 +383,10 @@ def _get_solver_primitive(
         if is_symmetric:
             adj_b, _ = solver(A, g_x, g_x)
         else:
-            # Use backend transposed solve and keep compatibility fallback.
+            # The native transposed solve. Where it cannot be used (for
+            # example under a higher reverse derivative of this rule: the
+            # opaque native call has no JVP), solve an explicit Aᵀ with this
+            # custom-VJP rule instead.
             try:
                 adj_b, _ = _amgx_solve_impl(
                     A.indptr,
@@ -329,10 +419,106 @@ def _get_solver_primitive(
     return solve
 
 
+def _single_gpu_services(
+    config_str: str,
+    is_symmetric: bool = False,
+    return_stats: bool = False,
+    reuse_setup: bool = False,
+    res_history_len: int = 0,
+    use_x0: bool = False,
+    block_dim: int = 1,
+) -> tuple[Callable, Callable, Callable]:
+    """The single-GPU native services of the implicit core: the primal solve,
+    the zero-start solve and the declared transposed solve. Tangent and adjoint
+    solves use the adjoint rule's native calls (same configuration, zero
+    start, no statistics), so first reverse results match the adjoint rule's."""
+
+    def native(indptr, indices, values, b, x0, aux):
+        return _amgx_solve_impl(
+            indptr,
+            indices,
+            values,
+            b,
+            x0,
+            config_str=config_str,
+            return_stats=return_stats,
+            reuse_setup=reuse_setup,
+            res_history_len=res_history_len,
+            use_x0=use_x0,
+            block_dim=block_dim,
+        )
+
+    def native_zero_start(indptr, indices, values, rhs, aux=()):
+        return _amgx_solve_impl(
+            indptr,
+            indices,
+            values,
+            rhs,
+            None,
+            config_str=config_str,
+            reuse_setup=reuse_setup,
+            block_dim=block_dim,
+        )[0]
+
+    def native_transpose(indptr, indices, values, rhs, aux=()):
+        if is_symmetric:
+            return native_zero_start(indptr, indices, values, rhs)
+        try:
+            return _amgx_solve_impl(
+                indptr,
+                indices,
+                values,
+                rhs,
+                None,
+                config_str=config_str,
+                transpose_solve=True,
+                reuse_setup=reuse_setup,
+                block_dim=block_dim,
+            )[0]
+        except Exception:
+            # An explicit Aᵀ where the native transposed solve cannot be used,
+            # as in the adjoint rule.
+            A = jsp.BCSR((values, indices, indptr), shape=(rhs.shape[0], rhs.shape[0]))
+            A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
+            return native_zero_start(A_T.indptr, A_T.indices, A_T.data, rhs)
+
+    return native, native_zero_start, native_transpose
+
+
+@functools.lru_cache(maxsize=32)
+def _get_implicit_primitive(
+    config_str: str,
+    is_symmetric: bool = False,
+    return_stats: bool = False,
+    reuse_setup: bool = False,
+    res_history_len: int = 0,
+    use_x0: bool = False,
+    block_dim: int = 1,
+) -> Callable:
+    """The implicit-policy single-GPU solve (``jaxamg.core``): ``solve(A, b, x0)
+    -> (x, info)`` with forward, reverse and higher-order derivatives."""
+    from .core import implicit_solver
+
+    native, zero_start, transpose = _single_gpu_services(
+        config_str,
+        is_symmetric,
+        return_stats,
+        reuse_setup,
+        res_history_len,
+        use_x0,
+        block_dim,
+    )
+    return implicit_solver(native, zero_start, transpose, is_symmetric)
+
+
+_DERIVATIVE_POLICIES = ("implicit", "adjoint")
+
+
 def _transpose_plan_operands(
     A: jsp.BCSR, plan: TransposePlan | None
 ) -> tuple[jax.Array, ...]:
-    """Convert transpose metadata to JAX operands."""
+    """Transpose metadata as runtime operands: ``Aᵀ``'s structure, then the
+    routing arrays ``(local_source, local_target, send, recv_target)``."""
     if plan is None:
         empty = jnp.empty(0, dtype=jnp.int32)
         return A.indices, A.indptr, empty, empty, empty, empty
@@ -344,46 +530,43 @@ def _transpose_plan_operands(
         jnp.asarray(plan.indptr),
         jnp.asarray(plan.local_source_ids),
         jnp.asarray(plan.local_target_ids),
-        jnp.asarray(plan.send_ids_2d),
-        jnp.asarray(plan.recv_target_ids_2d),
+        jnp.asarray(plan.send_ids),
+        jnp.asarray(plan.recv_target_ids),
     )
 
 
 @functools.lru_cache(maxsize=32)
-def _get_solver_primitive_mpi(
+def _get_adjoint_primitive_mpi(
     config_str: str,
     nglobal: int,
     comm_ptr: int,
     lrank: int,
     is_symmetric: bool = False,
     transpose_nnz: int | None = None,
-    n_ghost: int = 0,
+    halo_exchange: Any = None,
+    transpose_exchange: Any = None,
+    transpose_reverse: bool = False,
     return_stats: bool = False,
     reuse_setup: bool = False,
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
+    ordered: bool = True,
 ) -> Callable:
     """
-    Create cached JAX custom_vjp primitive for MPI AmgX solve.
-    Supports automatic differentiation in distributed setting.
+    The adjoint-rule pure-MPI solve (a ``custom_vjp``, reverse mode only),
+    cached per configuration.
 
-    Uses mpi4jax for MPI communication (transpose, backward halo exchange).
-    GPU vs CPU MPI is controlled by MPI4JAX_USE_CUDA_MPI environment variable:
-    - MPI4JAX_USE_CUDA_MPI=1: Use GPU-aware MPI (requires CUDA-aware MPI library)
-    - MPI4JAX_USE_CUDA_MPI=0: Use CPU staging (copies GPU<->CPU for MPI)
+    The transpose values and the backward halo travel by neighbour exchanges
+    (``jaxamg.transport``); ``halo_exchange``/``transpose_exchange`` are their
+    plans.
 
     """
 
-    # Backward-pass collectives run on the user's communicator (recovered from
-    # comm_ptr), which may be a subcommunicator -- not MPI.COMM_WORLD.
-    comm = resolve_comm(comm_ptr)
-
     # The backward pass's gradient w.r.t. A needs the solution at the columns
-    # this rank's rows reference. The halo plan (col_to_combined, send_ids,
-    # recv_ghost_slot) is pattern-specific, so it flows as custom_vjp operands
-    # rather than being baked into this memoized factory; only the static ghost
-    # count n_ghost is captured here.
+    # this rank's rows reference. The halo arrays (col_to_combined, send_ids)
+    # are pattern-specific, so they flow as custom_vjp operands; only the
+    # static exchange plans are captured by this memoized factory.
     @jax.custom_vjp
     def solve(
         A: jsp.BCSR,
@@ -420,6 +603,7 @@ def _get_solver_primitive_mpi(
             res_history_len=res_history_len,
             use_x0=use_x0,
             block_dim=block_dim,
+            ordered=ordered,
         )
 
         return x, info
@@ -432,30 +616,26 @@ def _get_solver_primitive_mpi(
     def bwd(residuals, g):
         g_x, _ = g
         A, x, halo, transpose = residuals
-        col_to_combined, send_ids, recv_ghost_slot, row_indices = halo
-        (
-            transpose_indices,
-            transpose_indptr,
-            local_source_ids,
-            local_target_ids,
-            transpose_send_ids,
-            recv_target_ids,
-        ) = transpose
+        col_to_combined, send_ids, row_indices = halo
+        transpose_indices, transpose_indptr, *routing = transpose
 
         # Backward solves always start from zero: x0 shifts only the forward
         # iteration, never the solution, so the adjoint ignores it (and skips
         # the residual-history readback).
-        adj_solver = _get_solver_primitive_mpi(
+        adj_solver = _get_adjoint_primitive_mpi(
             config_str,
             nglobal,
             comm_ptr,
             lrank,
             is_symmetric=is_symmetric,
             transpose_nnz=len(A.data),
-            n_ghost=n_ghost,
+            halo_exchange=halo_exchange,
+            transpose_exchange=transpose_exchange,
+            transpose_reverse=not transpose_reverse,
             return_stats=return_stats,
             reuse_setup=reuse_setup,
             block_dim=block_dim,
+            ordered=ordered,
         )
 
         # Backward solve: A^T @ adj_b = g_x
@@ -463,8 +643,8 @@ def _get_solver_primitive_mpi(
             # Symmetric: skip the distributed transpose.
             adj_b, _ = adj_solver(A, g_x, g_x, halo, transpose)
         else:
-            # Distributed transpose via mpi4jax (JIT-compatible, GPU-direct when
-            # MPI4JAX_USE_CUDA_MPI=1).
+            # Distributed transpose by neighbour exchange (JIT-compatible,
+            # GPU-direct when MPI4JAX_USE_CUDA_MPI=1).
             if transpose_nnz is None:
                 raise ValueError(
                     "a transpose plan is required for nonsymmetric MPI gradients"
@@ -473,14 +653,13 @@ def _get_solver_primitive_mpi(
             # only A); without this XLA may interleave their MPI collectives in
             # a rank-inconsistent order and deadlock.
             a_data, _ = jax.lax.optimization_barrier((A.data, x))
-            at_data = _mpi4jax_transpose_values(
+            at_data = transpose_values(
                 a_data,
-                local_source_ids,
-                local_target_ids,
-                transpose_send_ids,
-                recv_target_ids,
+                tuple(routing),
+                transpose_exchange,
                 transpose_nnz,
-                comm,
+                reverse=transpose_reverse,
+                ordered=ordered,
             )
 
             # Reconstruct BCSR for A^T
@@ -488,24 +667,16 @@ def _get_solver_primitive_mpi(
                 (at_data, transpose_indices, transpose_indptr), shape=A.shape
             )
 
-            reverse_transpose = (
-                A.indices,
-                A.indptr,
-                local_target_ids,
-                local_source_ids,
-                recv_target_ids,
-                transpose_send_ids,
-            )
-            adj_b, _ = adj_solver(A_T, g_x, g_x, halo, reverse_transpose)
+            # The nested Aᵀ solve's own backward (reverse over reverse)
+            # routes Aᵀ's values back to A's: the same plan, reversed.
+            adj_b, _ = adj_solver(A_T, g_x, g_x, halo, (A.indices, A.indptr, *routing))
 
         # Gradient w.r.t. A: ∂L/∂A_ij = -adj_b[i] * x[j]. Fetch only the solution
         # entries this rank's rows reference via the halo exchange, ordered after
         # the backward solve (same as the transpose above) so all ranks issue MPI
         # collectives in a consistent order.
         x_bar, _ = jax.lax.optimization_barrier((x, adj_b))
-        x_combined = _mpi4jax_halo_gather(
-            x_bar, send_ids, recv_ghost_slot, n_ghost, comm
-        )
+        x_combined = halo_gather(x_bar, send_ids, halo_exchange, ordered=ordered)
 
         grad_values = -adj_b[row_indices] * x_combined[col_to_combined]
         grad_A = jsp.BCSR((grad_values, A.indices, A.indptr), shape=A.shape)
@@ -515,11 +686,123 @@ def _get_solver_primitive_mpi(
             grad_A,
             adj_b,
             jnp.zeros_like(adj_b),
-            (None, None, None, None),
+            (None, None, None),
             (None, None, None, None, None, None),
         )
 
     solve.defvjp(fwd, bwd)
+    return solve
+
+
+@functools.lru_cache(maxsize=32)
+def _get_implicit_primitive_mpi(
+    config_str: str,
+    nglobal: int,
+    comm_ptr: int,
+    lrank: int,
+    is_symmetric: bool = False,
+    transpose_nnz: int | None = None,
+    halo_exchange: Any = None,
+    transpose_exchange: Any = None,
+    return_stats: bool = False,
+    reuse_setup: bool = False,
+    res_history_len: int = 0,
+    use_x0: bool = False,
+    block_dim: int = 1,
+    ordered: bool = True,
+) -> Callable:
+    """The implicit-policy pure-MPI solve (``jaxamg.core``), with the adjoint
+    rule's signature ``solve(A, b, x0, halo, transpose)``.
+
+    Services: the native MPI solves (the adjoint rule's configuration for the
+    zero-start and transposed solves), the explicit ``Aᵀ`` from the transpose
+    plan, and a local SpMV whose halo gather is a linear neighbour exchange
+    with a declared transpose (``jaxamg.transport``).
+    """
+    from .core import implicit_solver
+
+    nglobal_arr = np.array([nglobal], dtype=np.int32)
+    low = np.int32(np.uint32(comm_ptr & 0xFFFFFFFF))
+    high = np.int32(np.uint32((comm_ptr >> 32) & 0xFFFFFFFF))
+    comm_ptr_arr = np.array([low, high], dtype=np.int32)
+    lrank_arr = np.array([lrank], dtype=np.int32)
+
+    def call(indptr, indices, values, b, x0, *, stats, history, warm):
+        return _amgx_solve_mpi_impl(
+            indptr,
+            indices,
+            values,
+            b,
+            x0,
+            jnp.asarray(nglobal_arr),
+            jnp.asarray(comm_ptr_arr),
+            jnp.asarray(lrank_arr),
+            config_str=config_str,
+            return_stats=stats,
+            reuse_setup=reuse_setup,
+            res_history_len=history,
+            use_x0=warm,
+            block_dim=block_dim,
+            ordered=ordered,
+        )
+
+    def native(indptr, indices, values, b, x0, aux):
+        return call(
+            indptr,
+            indices,
+            values,
+            b,
+            x0,
+            stats=return_stats,
+            history=res_history_len,
+            warm=use_x0,
+        )
+
+    def native_zero_start(indptr, indices, values, rhs, aux):
+        # The adjoint rule's configuration: zero start, no residual history.
+        return call(
+            indptr, indices, values, rhs, rhs, stats=return_stats, history=0, warm=False
+        )[0]
+
+    def native_transpose(indptr, indices, values, rhs, aux):
+        if is_symmetric:
+            return native_zero_start(indptr, indices, values, rhs, aux)
+        if transpose_nnz is None:
+            raise ValueError(
+                "a transpose plan is required for nonsymmetric MPI gradients"
+            )
+        _, transpose = aux
+        transpose_indices, transpose_indptr, *routing = transpose
+        # Order the value exchange after the cotangent it answers (and so after
+        # the forward solve), keeping every rank's collectives in one order.
+        values, _ = jax.lax.optimization_barrier((values, rhs))
+        at_data = transpose_values(
+            values, tuple(routing), transpose_exchange, transpose_nnz, ordered=ordered
+        )
+        return native_zero_start(transpose_indptr, transpose_indices, at_data, rhs, aux)
+
+    def layout_spmv(values, indices, indptr, aux, x):
+        (col_to_combined, send_ids, row_indices), _ = aux
+        combined = halo_gather(x, send_ids, halo_exchange, ordered=ordered)
+        return jax.ops.segment_sum(
+            values * combined[col_to_combined],
+            row_indices,
+            num_segments=x.shape[0],
+            indices_are_sorted=True,
+        )
+
+    core = implicit_solver(
+        native,
+        native_zero_start,
+        native_transpose,
+        is_symmetric,
+        layout_spmv,
+        collective=True,
+    )
+
+    def solve(A, b, x0, halo, transpose):
+        return core(A, b, x0, (halo, transpose))
+
     return solve
 
 
@@ -546,15 +829,8 @@ def _capture_and_save_stats(
     mpi_cache: dict | None = None,
 ) -> None:
     """Read the captured AmgX statistics from the extension and save them."""
-    try:
-        stats_str = _ensure_backend().get_stats_string()
-    except AttributeError:
-        # Older extension without stats capture; nothing to save.
-        stats_str = None
-    if stats_str is not None:
-        _format_and_save_stats(
-            stats_str, save_stats_file, comm=comm, mpi_cache=mpi_cache
-        )
+    stats_str = _ensure_backend().get_stats_string()
+    _format_and_save_stats(stats_str, save_stats_file, comm=comm, mpi_cache=mpi_cache)
 
 
 def solve(
@@ -570,6 +846,9 @@ def solve(
     reuse_setup: bool = False,
     nullspace: NullSpaceSpec = None,
     transpose_nullspace: NullSpaceSpec = None,
+    labels: LabelSpec = None,
+    label_sum: Callable[[jax.Array], jax.Array] | None = None,
+    derivative: str = "implicit",
     **kwargs: Any,
 ) -> tuple[jax.Array, dict]:
     """Solve `Ax=b` using the AmgX backend. See [Examples](examples.md) for usage.
@@ -587,6 +866,9 @@ def solve(
         reuse_setup: For repeated solves with the same sparsity pattern, skip warm `AMGX_solver_resetup` and keep the cached hierarchy. This is cheaper per solve but may require more iterations if matrix coefficients change significantly.
         nullspace: Basis of `null(A)` for singular systems: `"constant"`, a length-`n` vector, or an `(n, k)` array (local rows in MPI mode). The solution is pinned orthogonal to it, and the transpose of that pin projects the adjoint right-hand side onto `range(Aᵀ)`, which makes the backward solve converge. Gradients w.r.t. `A` assume perturbations that preserve the declared null spaces (`dA·N = 0`, `Mᵀ·dA = 0`), as coefficient changes of a conservative discretization do. Defaults to the basis attached with `with_cache`.
         transpose_nullspace: Basis of `null(Aᵀ)` (same formats). `b` is projected onto `range(A)` (removed fraction in `info["rhs_inconsistency"]`) and, by transposition, the adjoint solution is pinned: the forward returns `A⁺b`, `jax.grad` returns `(Aᵀ)⁺g`. Equals `nullspace` for symmetric `A` (filled in when `A` is marked symmetric); for nonsymmetric `A` it differs, e.g. `A = D⁻¹L` has `nullspace="constant"` but `transpose_nullspace=V` (cell volumes). Defaults to the basis attached with `with_cache`.
+        labels: The pair `(count, labels)`, as `scipy.sparse.csgraph.connected_components` returns it: a static label count and one integer label per row (local rows in MPI mode, possibly traced), -1 for rows in no component, for a disconnected domain: every declared `nullspace`/`transpose_nullspace` column then applies separately on each label's rows (the null space is block diagonal over the labels), e.g. `nullspace="constant"` with labels declares one constant vector per component. A label whose columns vanish on its rows (no rows, or all of them -1 in this solve) is skipped exactly; columns dependent within a label are rejected (concrete values). Without labels the null space is the columns themselves. Defaults to the labels attached with `with_cache`.
+        label_sum: In MPI mode with labels, the reduction of each rank's per-label partial sums (an array of `count` rows) to the labels' totals, a linear function (a `jaxamg.linear_map.LinearMap` where JAX's own transpose would be wrong, as for an MPI all-reduce). By default, the all-reduce over global label numbers (one `count`-row array on every rank); a caller whose labels span ranks in its own numbering supplies the reduction. Defaults to the one attached with `with_cache`.
+        derivative: `"implicit"` (default) differentiates `x = A⁻¹b` implicitly on the fixed pattern, `ẋ = A⁻¹(ḃ − Ȧx)` with each `A⁻¹` a native solve: forward and reverse mode, and higher orders where the operator supports them. `"adjoint"` is the reverse-only rule. Both use the same first reverse rule. Neither differentiates the AmgX iterations: derivatives are those of the exact solution, accurate to the solve tolerance.
         **kwargs: Additional AmgX config parameters. These override values in `config` when both are provided.
 
     Returns:
@@ -594,9 +876,13 @@ def solve(
         info: Dictionary containing `iterations`, `residual`, `status`, and `residual_history` (residual norm per outer iteration, entry 0 being the initial residual; inside `jit` it has fixed length `max_iters + 1` with NaN padding past entry `iterations`). With `transpose_nullspace`, also `rhs_inconsistency` (`‖b − b'‖/‖b‖`).
 
     Warns:
-        NullSpaceWarning: `A·1 = 0` without a declared `nullspace`; `nullspace` without `transpose_nullspace` (or vice versa) for a matrix not marked symmetric; a basis failing `A·N ≈ 0` / `Aᵀ·M ≈ 0` (the latter not checked in MPI mode); or a `DENSE_LU_SOLVER` coarse solve. Checks run only on concrete matrix values.
+        NullSpaceWarning: `A·1 = 0` without a declared `nullspace`; `nullspace` without `transpose_nullspace` (or vice versa) for a matrix not marked symmetric; a basis failing `A·N ≈ 0` / `Aᵀ·M ≈ 0`; or a `DENSE_LU_SOLVER` coarse solve. These checks run only on concrete matrix values.
     """
 
+    if derivative not in _DERIVATIVE_POLICIES:
+        raise ValueError(
+            f"derivative must be one of {_DERIVATIVE_POLICIES}, got {derivative!r}"
+        )
     b = jnp.asarray(b)
 
     # Check for GPU backend
@@ -626,7 +912,16 @@ def solve(
         nullspace = getattr(A, "_nullspace", None)
     if transpose_nullspace is None:
         transpose_nullspace = getattr(A, "_transpose_nullspace", None)
+    if labels is None:
+        labels = getattr(A, "_labels", None)
+    if label_sum is None:
+        label_sum = getattr(A, "_label_sum", None)
     singular = nullspace is not None or transpose_nullspace is not None
+    if labels is not None and not singular:
+        raise ValueError(
+            "labels apply to the declared nullspace/transpose_nullspace columns; "
+            "declare them (e.g. nullspace='constant')"
+        )
 
     # Prepare configuration string/file (skip if using mpi_cache which already has config_str)
     if mpi_cache is not None:
@@ -690,6 +985,11 @@ def solve(
 
     # Check for symmetry attribute on A
     is_symmetric = getattr(A, "_is_symmetric", False)
+    mpi_primitive = (
+        _get_implicit_primitive_mpi
+        if derivative == "implicit"
+        else _get_adjoint_primitive_mpi
+    )
 
     # Branch: MPI mode or single-GPU mode
     if mpi_cache is not None or comm is not None:
@@ -711,7 +1011,28 @@ def solve(
                 )
 
         # Convert A to BCSR with int64 indices (required for MPI)
-        A_csr = to_bcsr_matrix(A, b=b, use_int64_indices=True)
+        from .halo import HaloOperator
+
+        if isinstance(A, HaloOperator):
+            # Rank-local materialization over [x_local | x_ghost].
+            if mpi_cache is not None:
+                cached_comm = resolve_comm(mpi_cache["comm_ptr"])
+                counts = mpi_cache["recvcounts_tuple"]
+                first_row = int(sum(counts[: cached_comm.Get_rank()]))
+                n_all = mpi_cache["nglobal"]
+            else:
+                assert partition_info is not None
+                first_row, n_all = int(partition_info[0]), int(nglobal)
+            A_csr = A._local_matrix(
+                first_row,
+                n_all,
+                get_preferred_dtype(None, b),
+                traced=isinstance(b, jax.core.Tracer),
+            )
+        else:
+            A_csr = to_bcsr_matrix(A, b=b, use_int64_indices=True)
+        # Per-rank programs order their communication on mpi4jax's effect.
+        ordered = True
 
         if mpi_cache is not None:
             # Use pre-cached MPI metadata
@@ -727,19 +1048,23 @@ def solve(
                 )
             transpose_plan = mpi_cache.get("transpose_plan")
             transpose_operands = _transpose_plan_operands(A_csr, transpose_plan)
-            solver = _get_solver_primitive_mpi(
+            solver = mpi_primitive(
                 mpi_cache["config_str"],
                 mpi_cache["nglobal"],
                 mpi_cache["comm_ptr"],
                 mpi_cache["lrank"],
                 is_symmetric=is_symmetric,
                 transpose_nnz=None if transpose_plan is None else transpose_plan.nnz,
-                n_ghost=halo_plan.n_ghost,
+                halo_exchange=halo_plan.exchange,
+                transpose_exchange=(
+                    None if transpose_plan is None else transpose_plan.exchange
+                ),
                 return_stats=1 if save_stats_file else 0,
                 reuse_setup=reuse_setup,
                 res_history_len=res_history_len,
                 use_x0=use_x0,
                 block_dim=block_dim,
+                ordered=ordered,
             )
 
         elif comm is not None:
@@ -815,25 +1140,28 @@ def solve(
                 np.diff(np.asarray(A_csr.indptr)),
             ).astype(np.int32)
 
-            solver = _get_solver_primitive_mpi(
+            solver = mpi_primitive(
                 config_str,
                 nglobal,
                 comm_ptr,
                 lrank,
                 is_symmetric=is_symmetric,
                 transpose_nnz=None if transpose_plan is None else transpose_plan.nnz,
-                n_ghost=halo_plan.n_ghost,
+                halo_exchange=halo_plan.exchange,
+                transpose_exchange=(
+                    None if transpose_plan is None else transpose_plan.exchange
+                ),
                 return_stats=1 if save_stats_file else 0,
                 reuse_setup=reuse_setup,
                 res_history_len=res_history_len,
                 use_x0=use_x0,
                 block_dim=block_dim,
+                ordered=ordered,
             )
 
         halo_args = (
             jnp.asarray(halo_plan.col_to_combined),
-            jnp.asarray(halo_plan.send_ids_2d),
-            jnp.asarray(halo_plan.recv_ghost_slot_2d),
+            jnp.asarray(halo_plan.send_ids),
         )
         if mpi_cache is not None:
             # AmgX runs on the cached communicator; so must everything else.
@@ -847,11 +1175,8 @@ def solve(
         else:
             assert comm is not None
             comm_obj = comm
-        # Global reductions for the null-space projections; the sharding
-        # interface supplies its own through the cache (psum inside shard_map).
-        reduce_sum = None if mpi_cache is None else mpi_cache.get("reduce_sum")
-        if reduce_sum is None:
-            reduce_sum = make_mpi_reduce_sum(comm_obj)
+        # Global reductions for the null-space projections.
+        reduce_sum = make_mpi_reduce_sum(comm_obj)
 
         def run(b_: jax.Array, x0_: jax.Array) -> tuple[jax.Array, jax.Array]:
             return solver(
@@ -862,33 +1187,54 @@ def solve(
                 transpose_operands,
             )
 
-        n_ghost = halo_plan.n_ghost
+        def local_spmv(v: jax.Array, data: jax.Array) -> jax.Array:
+            # This rank's rows of A v, through the halo exchange.
+            combined = halo_gather(v, halo_args[1], halo_plan.exchange, ordered=ordered)
+            return jax.ops.segment_sum(
+                data * combined[halo_args[0]],
+                row_index(A_csr),
+                num_segments=A_csr.shape[0],
+            )
 
         def matvec(basis: jax.Array) -> jax.Array:
-            # Local rows of A @ basis via halo exchange (eager check only).
-            rows = row_index(A_csr)
-            columns = []
-            for j in range(basis.shape[1]):
-                combined = _mpi4jax_halo_gather(
-                    basis[:, j], halo_args[1], halo_args[2], n_ghost, comm_obj
-                )
-                columns.append(
-                    jax.ops.segment_sum(
-                        A_csr.data * combined[halo_args[0]],
-                        rows,
-                        num_segments=A_csr.shape[0],
-                    )
-                )
-            return jnp.stack(columns, axis=1)
+            return jnp.stack(
+                [local_spmv(basis[:, j], A_csr.data) for j in range(basis.shape[1])],
+                axis=1,
+            )
 
-        # Aᵀ·M is not checked in MPI mode (needs a reverse halo exchange).
-        matvec_T = None
+        column_labels: Callable[[jax.Array], jax.Array] | None
+
+        def column_labels(rows: jax.Array) -> jax.Array:
+            # Each stored entry's column label through the halo exchange; a
+            # caller's own numbering compares only on this rank's columns.
+            combined = halo_gather(
+                rows, halo_args[1], halo_plan.exchange, ordered=ordered
+            )
+            columns = combined[halo_args[0]]
+            if label_sum is None:
+                return columns
+            return jnp.where(halo_args[0] < A_csr.shape[0], columns, -2)
+
+        def matvec_T(basis: jax.Array) -> jax.Array:
+            # Aᵀ as the transpose of the halo SpMV (the reverse exchange).
+            transpose = jax.linear_transpose(
+                lambda v: local_spmv(v, A_csr.data),
+                jnp.zeros(A_csr.shape[0], basis.dtype),
+            )
+            return jnp.stack(
+                [transpose(basis[:, j])[0] for j in range(basis.shape[1])], axis=1
+            )
 
     else:
         # Single-GPU mode: use int32 indices
         A_csr = to_bcsr_matrix(A, b)
-        # Get cached primitive for this configuration
-        solver = _get_solver_primitive(
+        # Get cached primitive for this configuration and derivative policy
+        primitive = (
+            _get_implicit_primitive
+            if derivative == "implicit"
+            else _get_adjoint_primitive
+        )
+        solver = primitive(
             config_str,
             is_symmetric=is_symmetric,
             return_stats=1 if save_stats_file else 0,
@@ -909,6 +1255,8 @@ def solve(
         def matvec_T(basis: jax.Array) -> jax.Array:
             return A_csr.to_bcoo().T @ basis
 
+        column_labels = None
+
     # Null-space projections as JAX ops around the primitive; their
     # transposes are the adjoint projections (see nullspace.py).
     n_local = A_csr.shape[0]
@@ -920,13 +1268,11 @@ def solve(
     M = as_nullspace_basis(
         transpose_nullspace, n_local, target_dtype, "transpose_nullspace", n_columns
     )
-    # The sharding interface validates its bases collectively when the solver
-    # is created and flags the cache, so no host collective runs in its traces.
-    validated = mpi_cache is not None and mpi_cache.get("nullspaces_validated", False)
-    if N is not None and not validated:
-        validate_basis(N, "nullspace", comm_obj)
-    if M is not None and not validated:
-        validate_basis(M, "transpose_nullspace", comm_obj)
+    labels = as_labels(labels, n_local, comm=comm_obj)
+    if N is not None:
+        validate_basis(N, "nullspace", comm_obj, labels, label_sum)
+    if M is not None:
+        validate_basis(M, "transpose_nullspace", comm_obj, labels, label_sum)
     if M is None and N is not None:
         if is_symmetric:
             M = N
@@ -937,31 +1283,50 @@ def solve(
             N = M
         else:
             warnings.warn(_MISSING_NULLSPACE_MSG, NullSpaceWarning, stacklevel=2)
+    # Unlabelled bases share one column scale across ranks. Labelled bases
+    # are scaled per component by validation and projection, before products
+    # are formed; a whole-column scale could erase smaller components.
+    if labels is None and (N is not None or M is not None):
+        from .nullspace import unit_bases
+
+        basis_max: Callable[[jax.Array], jax.Array] | None = None
+        if comm_obj is not None:
+            import mpi4jax
+            from mpi4py import MPI
+
+            def basis_max(value):
+                return mpi4jax.allreduce(value, op=MPI.MAX, comm=comm_obj)
+
+        N, M = unit_bases((N, M), basis_max)
     if N is None and M is None:
         warn_if_singular(A_csr, comm=comm_obj, stacklevel=3)
     else:
+        checks: dict[str, Any] = dict(comm=comm_obj, stacklevel=3, labels=labels)
+        if labels is not None:
+            checks["column_labels"] = column_labels
         if N is not None:
-            verify_nullspace(A_csr, N, matvec, "nullspace", comm=comm_obj, stacklevel=3)
-        if M is not None and matvec_T is not None:
-            verify_nullspace(
-                A_csr, M, matvec_T, "transpose_nullspace", comm=comm_obj, stacklevel=3
-            )
+            verify_nullspace(A_csr, N, matvec, "nullspace", **checks)
+        if M is not None:
+            verify_nullspace(A_csr, M, matvec_T, "transpose_nullspace", **checks)
 
+    # The labels' sums across ranks: the caller's, or the all-reduce.
+    project_sum = reduce_sum if labels is None or label_sum is None else label_sum
     rhs_inconsistency = None
     if M is not None:
-        b_proj = project_out(b, M, reduce_sum)
+        b_proj = project_out(b, M, project_sum, labels)
         rhs_inconsistency = relative_norm(b - b_proj, b, reduce_sum)
         b = b_proj
-        if not use_x0:
-            x0_arg = b
+    if M is not None and not use_x0:
+        x0_arg = b
 
     x, info = run(b, x0_arg)
 
     if N is not None:
-        x = project_out(x, N, reduce_sum)
+        x = project_out(x, N, project_sum, labels)
 
-    if isinstance(info, jax.core.Tracer):
-        # Inside JIT (or another trace): info elements are tracers; return as-is.
+    if any(isinstance(v, jax.core.Tracer) for v in (x, info, rhs_inconsistency)):
+        # Inside JIT or another trace (e.g. a gradient, where info can come back
+        # concrete while x and the projection are traced): return as-is.
         # The history keeps its fixed trace-time length (outer max_iters + 1),
         # NaN-padded past entry `iterations`.
         traced_info = {
@@ -995,6 +1360,9 @@ def clear_solver_cache() -> None:
     """
     Clear the internal C++ AmgX solver cache.
     This releases all cached AmgX resources (matrices, solvers, vectors).
+    In MPI mode call it on every rank at the same point: the ranks' caches
+    must agree, and a distributed solve refuses (on every rank) when they
+    do not.
     """
     _ensure_backend().clear_solver_cache()
 

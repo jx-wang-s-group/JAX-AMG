@@ -664,7 +664,9 @@ namespace
                                          int32_t reuse_setup,
                                          int32_t use_x0,
                                          int32_t block_dim,
-                                         int32_t device_mpi)
+                                         int32_t device_mpi,
+                                         int n_override = -1,
+                                         int nnz_override = -1)
   {
     if (transpose_solve != 0)
     {
@@ -708,8 +710,12 @@ namespace
     T *x_data = x->typed_data();
     T *stats_data = stats->typed_data();
 
-    const int n_local = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
-    const int nnz = static_cast<int>(values.element_count());
+    // Padded (rank-identical) callers pass the true local sizes; the buffers'
+    // prefixes are used and the solution's tail is zeroed by the caller.
+    const int n_local = n_override >= 0
+                            ? n_override
+                            : static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
+    const int nnz = nnz_override >= 0 ? nnz_override : static_cast<int>(values.element_count());
 
     // Block mode (block_dim > 1): local scalar CSR (with global columns) is
     // converted to BSR. Both the local partition and the global size must be
@@ -1101,10 +1107,12 @@ namespace
                                      int32_t reuse_setup,
                                      int32_t use_x0,
                                      int32_t block_dim,
-                                     int32_t device_mpi)
+                                     int32_t device_mpi,
+                                     int n_override = -1,
+                                     int nnz_override = -1)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim, device_mpi);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim, device_mpi, n_override, nnz_override);
   }
 
   // MPI Double implementation
@@ -1125,10 +1133,12 @@ namespace
                                            int32_t reuse_setup,
                                            int32_t use_x0,
                                            int32_t block_dim,
-                                           int32_t device_mpi)
+                                           int32_t device_mpi,
+                                     int n_override = -1,
+                                     int nnz_override = -1)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim, device_mpi);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim, device_mpi, n_override, nnz_override);
   }
 
 #endif // JAXAMG_WITH_MPI

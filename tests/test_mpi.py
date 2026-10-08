@@ -195,8 +195,10 @@ def test_mpi_autodiff_jit(mpi_context, enable_x64):
 
     grad_nojit = jax.grad(loss_nojit)(diag_val)
 
-    # Gradients should match
-    np.testing.assert_allclose(grad, grad_nojit)
+    # Gradients should match. Distributed float32 AmgX solves are not bitwise
+    # reproducible from run to run on four ranks (an ulp), so float32 allows
+    # two ulps.
+    np.testing.assert_allclose(grad, grad_nojit, rtol=1e-7 if enable_x64 else 2.5e-7)
 
     # Reset to default precision
     jax.config.update("jax_enable_x64", False)
@@ -270,10 +272,7 @@ def test_mpi_allgatherv(mpi_context):
 def test_mpi_transpose(mpi_context):
     """Test distributed transpose on a non-symmetric matri."""
     comm, rank, nranks = mpi_context
-    from jaxamg.mpi_utils import (
-        _mpi4jax_transpose_values,
-        build_transpose_plan,
-    )
+    from jaxamg.mpi_utils import build_transpose_plan, transpose_values
 
     grid_size = 4
     n_global = grid_size**2
@@ -315,15 +314,16 @@ def test_mpi_transpose(mpi_context):
     )
 
     # 3. Compute A^T
-    data_T = _mpi4jax_transpose_values(
-        new_data,
-        jnp.asarray(plan.local_source_ids),
-        jnp.asarray(plan.local_target_ids),
-        jnp.asarray(plan.send_ids_2d),
-        jnp.asarray(plan.recv_target_ids_2d),
-        plan.nnz,
-        comm,
+    routing = tuple(
+        jnp.asarray(a)
+        for a in (
+            plan.local_source_ids,
+            plan.local_target_ids,
+            plan.send_ids,
+            plan.recv_target_ids,
+        )
     )
+    data_T = transpose_values(new_data, routing, plan.exchange, plan.nnz)
     indices_T = plan.indices
     indptr_T = plan.indptr
 
@@ -331,14 +331,8 @@ def test_mpi_transpose(mpi_context):
     assert not np.allclose(data_T, new_data)
 
     # 4. Compute (A^T)^T -> should be A
-    data_TT = _mpi4jax_transpose_values(
-        data_T,
-        jnp.asarray(plan.local_target_ids),
-        jnp.asarray(plan.local_source_ids),
-        jnp.asarray(plan.recv_target_ids_2d),
-        jnp.asarray(plan.send_ids_2d),
-        len(A_local.data),
-        comm,
+    data_TT = transpose_values(
+        data_T, routing, plan.exchange, len(A_local.data), reverse=True
     )
     indices_TT = A_local.indices
     indptr_TT = A_local.indptr
@@ -351,15 +345,7 @@ def test_mpi_transpose(mpi_context):
     # 6. Verify JIT compatibility
     @jax.jit
     def transpose_jit_fn(data):
-        return _mpi4jax_transpose_values(
-            data,
-            jnp.asarray(plan.local_source_ids),
-            jnp.asarray(plan.local_target_ids),
-            jnp.asarray(plan.send_ids_2d),
-            jnp.asarray(plan.recv_target_ids_2d),
-            plan.nnz,
-            comm,
-        )
+        return transpose_values(data, routing, plan.exchange, plan.nnz)
 
     # Run JIT-compiled transpose
     data_T_jit = transpose_jit_fn(new_data)
@@ -383,7 +369,7 @@ def test_mpi_transpose_nonsymmetric_nnz(mpi_context):
     import scipy.sparse as sp
     from mpi4py import MPI
 
-    from jaxamg.mpi_utils import _mpi4jax_transpose_values, build_transpose_plan
+    from jaxamg.mpi_utils import build_transpose_plan, transpose_values
 
     n = 4 * nranks
     rows, cols, vals = [], [], []
@@ -408,14 +394,19 @@ def test_mpi_transpose_nonsymmetric_nnz(mpi_context):
         (row_start, row_end),
         comm,
     )
-    data_T = _mpi4jax_transpose_values(
+    data_T = transpose_values(
         A_local.data,
-        jnp.asarray(plan.local_source_ids),
-        jnp.asarray(plan.local_target_ids),
-        jnp.asarray(plan.send_ids_2d),
-        jnp.asarray(plan.recv_target_ids_2d),
+        tuple(
+            jnp.asarray(a)
+            for a in (
+                plan.local_source_ids,
+                plan.local_target_ids,
+                plan.send_ids,
+                plan.recv_target_ids,
+            )
+        ),
+        plan.exchange,
         plan.nnz,
-        comm,
     )
     data_T = np.asarray(data_T)
     indices_T = plan.indices
@@ -431,8 +422,7 @@ def test_mpi_transpose_nonsymmetric_nnz(mpi_context):
 
     np.testing.assert_allclose(got, at_true, atol=1e-6)
 
-    # The scenario must actually exercise unequal local counts on some rank
-    # (otherwise it would not distinguish the fix from the old nnz(A) sizing).
+    # The scenario must exercise unequal local counts on some rank.
     grew = comm.allreduce(int(plan.nnz != int(A_local.data.shape[0])), op=MPI.SUM)
     assert grew > 0, "test matrix should give unequal local nnz across transpose"
 
@@ -503,6 +493,147 @@ def test_mpi_autodiff_nonsymmetric(mpi_context):
         eps = 1e-5
         g_fd = (total_loss(theta + eps) - total_loss(theta - eps)) / (2 * eps)
         np.testing.assert_allclose(g_total, g_fd, rtol=1e-4, atol=1e-8)
+    finally:
+        jax.config.update("jax_enable_x64", False)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_cache_decisions_agree(mpi_context):
+    """The native cache takes the same branch on every rank. With ``(1, 0)``
+    removed from a tridiagonal matrix, ``A`` and ``Aᵀ`` differ only in rank 0's
+    rows, so a per-rank structure key hits on the other ranks and misses on
+    rank 0 (its setup and resetup collectives then mismatch and hang).
+    Alternating ``A`` and ``Aᵀ`` also exercises returning to an evicted entry."""
+    import scipy.sparse as sp
+
+    comm, rank, nranks = mpi_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        n = 8 * nranks
+        lo, hi, _ = get_partition_info(n, rank, nranks)
+        A = sp.diags(
+            [-0.2 * np.ones(n - 1), 2 * np.ones(n), -0.2 * np.ones(n - 1)],
+            [-1, 0, 1],
+            format="lil",
+        )
+        A[1, 0] = 0.0
+        A = A.tocsr()
+        A.eliminate_zeros()
+        rows = A[lo:hi]
+        A_local = jsp.BCSR(
+            (
+                jnp.asarray(rows.data),
+                jnp.asarray(rows.indices, jnp.int64),
+                jnp.asarray(rows.indptr, jnp.int32),
+            ),
+            shape=(hi - lo, n),
+        )
+        b = jnp.arange(lo + 1, hi + 1, dtype=jnp.float64)
+        kwargs = dict(
+            comm=comm,
+            nglobal=n,
+            partition_info=(lo, hi),
+            solver="PBICGSTAB",
+            preconditioner="JACOBI_L1",
+            tolerance=1e-12,
+            max_iters=200,
+        )
+        grad = jax.jit(
+            jax.grad(lambda rhs: jnp.sum(jaxamg.solve(A_local, rhs, **kwargs)[0]))
+        )
+        dense = A.toarray()
+        expected_x = np.linalg.solve(dense, np.arange(1, n + 1, dtype=float))[lo:hi]
+        expected_grad = np.linalg.solve(dense.T, np.ones(n))[lo:hi]
+        for _ in range(2):
+            x = jaxamg.solve(A_local, b, **kwargs)[0]
+            np.testing.assert_allclose(np.asarray(x), expected_x, rtol=1e-9)
+            np.testing.assert_allclose(np.asarray(grad(b)), expected_grad, rtol=1e-9)
+    finally:
+        jax.config.update("jax_enable_x64", False)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_diverged_caches_are_refused_on_every_rank(mpi_context):
+    """A cache cleared on one rank only (so one rank misses where the others
+    hit) makes every rank refuse the solve alike, instead of some ranks
+    resetting up while others set up; clearing on every rank recovers the
+    caches."""
+    comm, rank, nranks = mpi_context
+    grid = 16
+    n = grid * grid
+    A, lo, hi = poisson_matrix_distributed(grid, grid, rank, nranks)
+    b = jnp.ones(hi - lo)
+    kwargs = dict(comm=comm, nglobal=n, partition_info=(lo, hi), solver="PCG")
+    jaxamg.solve(A, b, **kwargs)[0].block_until_ready()
+    if rank == 0:
+        jaxamg.clear_solver_cache()
+    with pytest.raises(Exception, match="caches differ across ranks"):
+        jaxamg.solve(A, b, **kwargs)[0].block_until_ready()
+    comm.Barrier()
+    jaxamg.clear_solver_cache()
+    # The failed execution's ordered-effect token re-raises in every later
+    # ordered call of this process (JAX's behaviour for any failed ordered
+    # execution); reset it so the remaining tests start clean. Private API,
+    # test only.
+    from jax._src import dispatch
+
+    dispatch.runtime_tokens.clear()
+    x = jaxamg.solve(A, b, **kwargs)[0]
+    assert np.all(np.isfinite(np.asarray(x)))
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_mixed_derivative_activity(mpi_context):
+    """A parameter entering ``A`` on rank 0 and ``b`` on the other ranks: every
+    rank differentiates the solve, with a symbolic-zero tangent for a
+    different operand. The rule must not skip the SpMV (and its halo
+    exchange) on the ranks where it is locally zero."""
+    import scipy.sparse as sp
+
+    comm, rank, nranks = mpi_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        n = 8 * nranks
+        lo, hi, _ = get_partition_info(n, rank, nranks)
+        A = sp.diags(
+            [-0.2 * np.ones(n - 1), 2 * np.ones(n), -0.2 * np.ones(n - 1)],
+            [-1, 0, 1],
+            format="csr",
+        )
+        rows = A[lo:hi]
+        values = jnp.asarray(rows.data)
+        indices = jnp.asarray(rows.indices, jnp.int64)
+        indptr = jnp.asarray(rows.indptr, jnp.int32)
+        b = jnp.arange(lo + 1, hi + 1, dtype=jnp.float64)
+        kwargs = dict(
+            comm=comm,
+            nglobal=n,
+            partition_info=(lo, hi),
+            solver="PBICGSTAB",
+            preconditioner="JACOBI_L1",
+            tolerance=1e-12,
+            max_iters=200,
+        )
+
+        def solve(t):
+            vals = values * t if rank == 0 else values
+            rhs = b if rank == 0 else b * t
+            A_local = jsp.BCSR((vals, indices, indptr), shape=(hi - lo, n))
+            return jaxamg.solve(A_local, rhs, **kwargs)[0]
+
+        dense = A.toarray()
+        b_global = np.arange(1, n + 1, dtype=float)
+        x = np.linalg.solve(dense, b_global)
+        owner0 = np.arange(n) < get_partition_info(n, 0, nranks)[1]
+        dA = np.where(owner0[:, None], dense, 0.0)
+        db = np.where(owner0, 0.0, b_global)
+        dx = np.linalg.solve(dense, db - dA @ x)
+        _, tangent = jax.jit(lambda t: jax.jvp(solve, (t,), (jnp.ones_like(t),)))(
+            jnp.array(1.0)
+        )
+        np.testing.assert_allclose(np.asarray(tangent), dx[lo:hi], rtol=1e-9)
+        grad = jax.jit(jax.grad(lambda t: jnp.sum(solve(t))))(jnp.array(1.0))
+        np.testing.assert_allclose(comm.allreduce(float(grad)), np.sum(dx), rtol=1e-9)
     finally:
         jax.config.update("jax_enable_x64", False)
 
@@ -613,11 +744,9 @@ def test_mpi_subcommunicator(mpi_context):
     """The differentiable solve must run its backward collectives on the user's
     communicator, not MPI.COMM_WORLD.
 
-    The solve runs on a subcommunicator that is a proper subset of COMM_WORLD
-    (the last rank stays idle and only rejoins at the fixture's COMM_WORLD
-    barrier). If the backward pass used COMM_WORLD it would deadlock waiting on
-    the idle rank; with the fix it uses the subcommunicator and completes, and
-    the gradient (summed over the subcommunicator) matches finite difference.
+    The solve runs on a subcommunicator without the last rank, which stays
+    idle: a backward pass on COMM_WORLD would deadlock. The gradient matches
+    finite differences.
     """
     from mpi4py import MPI
 
@@ -1078,6 +1207,110 @@ def test_mpi_nullspace(mpi_context):
         jax.config.update("jax_enable_x64", False)
 
 
+def _disconnected_system(normalize):
+    """Three stretched grids of unequal size as one singular matrix (the
+    first spans both ranks of a two-rank row partition): its labels, and the
+    volume vectors V (null(Aᵀ) of the normalized form) per part."""
+    import scipy.sparse as sp
+
+    from jaxamg.matrices import poisson_matrix_stretched
+    from jaxamg.utils import to_scipy
+
+    parts = [
+        poisson_matrix_stretched(nx, ny, r, normalize=normalize, dtype=jnp.float64)
+        for nx, ny, r in ((14, 10, 1.06), (10, 8, 1.10), (6, 5, 1.0))
+    ]
+    A = sp.block_diag([to_scipy(a) for a, _ in parts], format="csr")
+    labels = np.concatenate([np.full(v.shape[0], i) for i, (_, v) in enumerate(parts)])
+    V = np.concatenate([np.asarray(v) for _, v in parts])
+    return A, labels, V
+
+
+@pytest.mark.mpi(min_size=2)
+@pytest.mark.parametrize("reduction", ["all-reduce", "caller"])
+def test_mpi_labels(mpi_context, reduction):
+    """Constants and V per component (nonsymmetric A = D⁻¹L) on a domain
+    whose components span ranks: global labels with the all-reduce, or each
+    rank's own numbering with the caller's reduction, against the
+    pseudoinverse (the forward, and the gradient eager and jitted)."""
+    from jaxamg.nullspace import make_mpi_reduce_sum
+
+    comm, rank, nranks = mpi_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        A_global, labels_global, V_global = _disconnected_system(normalize=True)
+        n, count = A_global.shape[0], 3
+        rng = np.random.default_rng(0)
+        b_global = rng.standard_normal(n)
+        w_global = rng.standard_normal(n) + 0.5
+        A_local, row_start, row_end = partition_csr_matrix(A_global, rank, nranks)
+        rows = slice(row_start, row_end)
+        labels = labels_global[rows]
+        declared = dict(
+            nullspace="constant", transpose_nullspace=jnp.asarray(V_global[rows])
+        )
+        if reduction == "all-reduce":
+            declared["labels"] = (count, labels)
+        else:
+            # This rank numbers the components its own way (a rotation by its
+            # rank); the caller's reduction maps them to the global ones, sums
+            # over the ranks (a LinearMap), and maps the totals back.
+            local_of = (np.arange(count) + rank) % count  # global label -> slot
+            global_of = np.argsort(local_of)  # slot -> global label
+            reduce_sum = make_mpi_reduce_sum(comm)
+
+            def label_sum(sums):
+                return reduce_sum(sums[local_of])[global_of]
+
+            declared["labels"] = (count, local_of[labels])
+            declared["label_sum"] = label_sum
+        b_local = jnp.asarray(b_global[rows])
+        w_local = jnp.asarray(w_global[rows])
+        cfg = {"tolerance": 1e-10, "max_iters": 300}
+
+        def solve_local(b_):
+            return jaxamg.solve(
+                A_local,
+                b_,
+                comm=comm,
+                nglobal=n,
+                partition_info=(row_start, row_end),
+                **declared,
+                **cfg,
+            )
+
+        x_local, info = solve_local(b_local)
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+        g_local = jax.grad(lambda b_: jnp.dot(w_local, solve_local(b_)[0]))(b_local)
+        mpi_cache = jaxamg.cache_mpi_metadata(
+            cfg, comm, n, (row_start, row_end), A_local, singular=True
+        )
+        A_cached = jaxamg.with_cache(A_local, mpi=mpi_cache, **declared)
+        g_jit = jax.jit(
+            jax.grad(lambda b_: jnp.dot(w_local, jaxamg.solve(A_cached, b_)[0]))
+        )(b_local)
+
+        x = np.asarray(gather_vector(x_local, comm))
+        g = np.asarray(gather_vector(g_local, comm))
+        g2 = np.asarray(gather_vector(g_jit, comm))
+        if rank == 0:
+            pinv = np.linalg.pinv(A_global.toarray())
+            consistent = b_global.copy()
+            for label in range(count):
+                on = labels_global == label
+                V = V_global[on]
+                consistent[on] -= V * (V @ b_global[on]) / (V @ V)
+            np.testing.assert_allclose(
+                x, pinv @ consistent, rtol=1e-6, atol=1e-8 * np.linalg.norm(x)
+            )
+            g_ref = pinv.T @ w_global
+            atol = 1e-8 * np.linalg.norm(g_ref)
+            np.testing.assert_allclose(g, g_ref, rtol=1e-6, atol=atol)
+            np.testing.assert_allclose(g2, g_ref, rtol=1e-6, atol=atol)
+    finally:
+        jax.config.update("jax_enable_x64", False)
+
+
 def _variable_coefficient_operator(grid, seed=0):
     """A float64-sensitive 2D diffusion operator whose arithmetic follows its
     input dtype, and its dense float64 matrix."""
@@ -1149,78 +1382,266 @@ def test_mpi_operator_float64_precision(mpi_context):
 
 
 @pytest.mark.mpi(min_size=2)
-def test_mpi_cache_decisions_agree(mpi_context):
-    """The native cache takes the same branch on every rank. With ``(1, 0)``
-    removed from a tridiagonal matrix, ``A`` and ``Aᵀ`` differ only in rank 0's
-    rows, so a per-rank structure key hits on the other ranks and misses on
-    rank 0 (its setup and resetup collectives then mismatch and hang).
-    Alternating ``A`` and ``Aᵀ`` also exercises returning to an evicted entry."""
-    import scipy.sparse as sp
+def test_mpi_implicit_derivatives_all_orders(mpi_context):
+    """Pure MPI on the implicit core: forward, reverse and second-order
+    derivatives match a dense float64 reference. The objective is the sum of the
+    ranks' local terms, so a replicated scalar's derivative is the sum over ranks
+    of each rank's result (the pure-MPI ownership convention)."""
+    import jax.experimental.sparse as jsp
+    import scipy.sparse
+    from mpi4py import MPI
 
     comm, rank, nranks = mpi_context
     jax.config.update("jax_enable_x64", True)
     try:
-        n = 8 * nranks
-        lo, hi, _ = get_partition_info(n, rank, nranks)
-        A = sp.diags(
-            [-0.2 * np.ones(n - 1), 2 * np.ones(n), -0.2 * np.ones(n - 1)],
-            [-1, 0, 1],
-            format="lil",
+        grid = 10
+        n = grid * grid
+        A_global = scipy.sparse.csr_matrix(
+            np.asarray(poisson_matrix(grid, skew=2.0).todense(), dtype=np.float64)
         )
-        A[1, 0] = 0.0
-        A = A.tocsr()
-        A.eliminate_zeros()
-        rows = A[lo:hi]
-        A_local = jsp.BCSR(
-            (
-                jnp.asarray(rows.data),
-                jnp.asarray(rows.indices, jnp.int64),
-                jnp.asarray(rows.indptr, jnp.int32),
-            ),
-            shape=(hi - lo, n),
-        )
-        b = jnp.arange(lo + 1, hi + 1, dtype=jnp.float64)
-        kwargs = dict(
-            comm=comm,
-            nglobal=n,
-            partition_info=(lo, hi),
-            solver="PBICGSTAB",
-            preconditioner="JACOBI_L1",
-            tolerance=1e-12,
-            max_iters=200,
-        )
-        grad = jax.jit(
-            jax.grad(lambda rhs: jnp.sum(jaxamg.solve(A_local, rhs, **kwargs)[0]))
-        )
-        dense = A.toarray()
-        expected_x = np.linalg.solve(dense, np.arange(1, n + 1, dtype=float))[lo:hi]
-        expected_grad = np.linalg.solve(dense.T, np.ones(n))[lo:hi]
-        for _ in range(2):
-            x = jaxamg.solve(A_local, b, **kwargs)[0]
-            np.testing.assert_allclose(np.asarray(x), expected_x, rtol=1e-9)
-            np.testing.assert_allclose(np.asarray(grad(b)), expected_grad, rtol=1e-9)
+        start, end, _ = get_partition_info(n, rank, nranks)
+        rows = A_global[start:end]
+        rows.sort_indices()
+        indices = jnp.asarray(rows.indices, jnp.int64)
+        indptr = jnp.asarray(rows.indptr, jnp.int32)
+        data = jnp.asarray(rows.data)
+        g = np.random.default_rng(3).standard_normal(rows.nnz)
+        b_local = jnp.asarray(np.random.default_rng(1).standard_normal(n)[start:end])
+        w_local = jnp.asarray(np.random.default_rng(2).standard_normal(n)[start:end])
+        config = {
+            # A tiny distributed system: an AMG hierarchy here fails inside
+            # AmgX ("CUDA kernel launch error"), so a Jacobi-preconditioned
+            # BiCGSTAB, as in the other sharded tests.
+            "solver": "PBICGSTAB",
+            "preconditioner": {"solver": "JACOBI_L1"},
+            "tolerance": 1e-14,
+            "max_iters": 1000,
+            "communicator": "MPI_DIRECT",
+        }
+
+        def local(t):
+            values = data * (1 + 0.1 * t * jnp.asarray(g))
+            A = jsp.BCSR((values, indices, indptr), shape=rows.shape)
+            x, _ = jaxamg.solve(
+                A,
+                b_local * (1 + t),
+                comm=comm,
+                nglobal=n,
+                partition_info=(start, end),
+                config=config,
+            )
+            return w_local @ x
+
+        # Dense reference: the same perturbation on every rank's rows.
+        all_g = comm.allgather(g)
+        g_global = np.concatenate(all_g)
+        b_global = np.concatenate(comm.allgather(np.asarray(b_local)))
+        w_global = np.concatenate(comm.allgather(np.asarray(w_local)))
+
+        def dense(t):
+            A = A_global.copy()
+            A.data = A.data * (1 + 0.1 * t * g_global)
+            return w_global @ np.linalg.solve(A.toarray(), b_global * (1 + t))
+
+        t0, h = 0.3, 1e-4
+        reference = {
+            "first": (dense(t0 + h) - dense(t0 - h)) / (2 * h),
+            "second": (dense(t0 + h) - 2 * dense(t0) + dense(t0 - h)) / h**2,
+        }
+        total = lambda value: comm.allreduce(float(value), op=MPI.SUM)
+        results = {
+            "reverse": total(jax.grad(local)(t0)),
+            "forward": total(jax.jacfwd(local)(t0)),
+            "RR": total(jax.grad(jax.grad(local))(t0)),
+            "FR": total(jax.jacfwd(jax.grad(local))(t0)),
+            "jit reverse": total(jax.jit(jax.grad(local))(t0)),
+        }
+        for name, value in results.items():
+            key = "second" if name in ("RR", "FR") else "first"
+            np.testing.assert_allclose(value, reference[key], rtol=1e-5, err_msg=name)
     finally:
         jax.config.update("jax_enable_x64", False)
 
 
 @pytest.mark.mpi(min_size=2)
-def test_mpi_diverged_caches_are_refused_on_every_rank(mpi_context):
-    """A cache cleared on one rank only (so one rank misses where the others
-    hit) makes every rank refuse the solve alike, instead of some ranks
-    resetting up while others set up; clearing on every rank recovers the
-    caches."""
+def test_mpi_singular_solve_forward_mode(mpi_context):
+    """Forward mode (and its composition with reverse) through a singular MPI
+    solve with a declared null space: the projections' global sums are linear
+    maps with summed transposes, not reverse-only rules."""
+    import scipy.sparse as sp
+    from mpi4py import MPI
+
+    comm, rank, nranks = mpi_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        n = 8 * nranks
+        lo, hi, n_local = get_partition_info(n, rank, nranks)
+        L = sp.diags(
+            [-np.ones(n - 1), 2 * np.ones(n), -np.ones(n - 1)], [-1, 0, 1], format="lil"
+        )
+        L[0, n - 1] = L[n - 1, 0] = -1.0
+        rows = L.tocsr()[lo:hi]
+        values = jnp.asarray(rows.data)
+        structure = (
+            jnp.asarray(rows.indices, jnp.int64),
+            jnp.asarray(rows.indptr, jnp.int32),
+        )
+        b0 = jnp.asarray(np.cos(2 * np.pi * np.arange(lo, hi) / n))
+        kwargs = dict(
+            comm=comm,
+            nglobal=n,
+            partition_info=(lo, hi),
+            nullspace="constant",
+            transpose_nullspace="constant",
+            solver="PCG",
+            preconditioner="JACOBI_L1",
+            tolerance=1e-13,
+            max_iters=500,
+        )
+
+        def local_loss(t):
+            A = jsp.BCSR((values * (1 + t), *structure), shape=(n_local, n))
+            x = jaxamg.solve(A, b0 * (1 + t**2), **kwargs)[0]
+            return jnp.sum(x * jnp.arange(lo, hi))
+
+        def total(t):
+            return comm.allreduce(float(local_loss(t)), op=MPI.SUM)
+
+        t = 0.3
+        forward = comm.allreduce(
+            float(jax.jvp(local_loss, (t,), (1.0,))[1]), op=MPI.SUM
+        )
+        reverse = comm.allreduce(float(jax.grad(local_loss)(t)), op=MPI.SUM)
+        eps = 1e-5
+        fd = (total(t + eps) - total(t - eps)) / (2 * eps)
+        np.testing.assert_allclose(forward, fd, rtol=1e-6)
+        np.testing.assert_allclose(reverse, forward, rtol=1e-9)
+        second = comm.allreduce(float(jax.jacfwd(jax.grad(local_loss))(t)), op=MPI.SUM)
+        fd2 = (total(t + 1e-3) - 2 * total(t) + total(t - 1e-3)) / 1e-6
+        np.testing.assert_allclose(second, fd2, rtol=1e-4)
+    finally:
+        jax.config.update("jax_enable_x64", False)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_basis_aliasing_differs_across_ranks(mpi_context):
+    """Rank 0 passes one array as both null spaces, the others a copy: the
+    ranks make the same collective calls (eagerly and jitted)."""
     comm, rank, nranks = mpi_context
     grid = 16
     n = grid * grid
-    A, lo, hi = poisson_matrix_distributed(grid, grid, rank, nranks)
-    b = jnp.ones(hi - lo)
-    kwargs = dict(comm=comm, nglobal=n, partition_info=(lo, hi), solver="PCG")
-    jaxamg.solve(A, b, **kwargs)[0].block_until_ready()
-    if rank == 0:
-        jaxamg.clear_solver_cache()
-    with pytest.raises(Exception, match="caches differ across ranks"):
-        jaxamg.solve(A, b, **kwargs)[0].block_until_ready()
-    comm.Barrier()
-    jaxamg.clear_solver_cache()
-    x = jaxamg.solve(A, b, **kwargs)[0]
-    assert np.all(np.isfinite(np.asarray(x)))
+    L, lo, hi = poisson_matrix_distributed(grid, grid, rank, nranks)
+    b = jnp.asarray(np.cos(np.arange(lo, hi)))
+    ones = jnp.ones(hi - lo)
+    left = ones if rank == 0 else jnp.array(ones)
+    kwargs = dict(
+        comm=comm,
+        nglobal=n,
+        partition_info=(lo, hi),
+        solver="PCG",
+        nullspace=ones,
+        transpose_nullspace=left,
+    )
+    x = jaxamg.solve(L, b, **kwargs)[0]
+    # Inside jit a pure-MPI solve takes its metadata from the cache.
+    cached = jaxamg.with_cache(
+        L,
+        mpi=jaxamg.cache_mpi_metadata({"solver": "PCG"}, comm, n, (lo, hi), L),
+    )
+    bases = dict(nullspace=ones, transpose_nullspace=left)
+    y = jax.jit(lambda r: jaxamg.solve(cached, r, **bases)[0])(b)
+    assert np.all(np.isfinite(np.asarray(x))) and np.all(np.isfinite(np.asarray(y)))
+    # The two call paths agree to the solver's tolerance.
+    np.testing.assert_allclose(np.asarray(y), np.asarray(x), rtol=1e-3, atol=1e-5)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_halo_operator(mpi_context):
+    """A halo-form operator fn(x_local, x_ghost), materialized per rank over
+    its owned plus ghost columns, gives the solution and parameter gradient of
+    the same local matrix assembled directly."""
+    comm, rank, nranks = mpi_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        g = 12
+        n = g * g
+        r0, r1, n_local = get_partition_info(n, rank, nranks)
+        lo, hi = max(0, r0 - g), min(n, r1 + g)
+        ghost_ids = np.array(
+            [c for c in range(lo, hi) if c < r0 or c >= r1], dtype=np.int64
+        )
+        n_below = int(np.sum(ghost_ids < r0))
+        cells = np.arange(r0, r1)
+        config = {
+            "solver": "PBICGSTAB",
+            "preconditioner": {"solver": "JACOBI_L1"},
+            "tolerance": 1e-13,
+            "max_iters": 1000,
+        }
+
+        def fn(theta):
+            def apply(x_local, x_ghost):
+                ext = jnp.concatenate(
+                    [x_ghost[:n_below], x_local, x_ghost[n_below:]]
+                )  # global cells lo .. hi-1
+                at = lambda c: ext[c - lo]  # noqa: E731
+                y = (4.0 + theta) * x_local
+                col = cells % g
+                y = y - jnp.where(col > 0, at(np.maximum(cells - 1, lo)), 0.0)
+                y = y - jnp.where(col < g - 1, at(np.minimum(cells + 1, hi - 1)), 0.0)
+                y = y - jnp.where(cells >= g, at(np.maximum(cells - g, lo)), 0.0)
+                y = y - jnp.where(cells < n - g, at(np.minimum(cells + g, hi - 1)), 0.0)
+                return y
+
+            return apply
+
+        def direct(theta):
+            rows, cols, vals = [], [], []
+            for k, c in enumerate(cells):
+                entries = [(c, None)]
+                if c % g > 0:
+                    entries.append((c - 1, -1.0))
+                if c % g < g - 1:
+                    entries.append((c + 1, -1.0))
+                if c >= g:
+                    entries.append((c - g, -1.0))
+                if c < n - g:
+                    entries.append((c + g, -1.0))
+                for col, v in sorted(entries):
+                    rows.append(k)
+                    cols.append(col)
+                    vals.append(v)
+            rows, cols = np.asarray(rows), np.asarray(cols)
+            is_diag = cols == cells[rows]
+            data = jnp.where(
+                jnp.asarray(is_diag),
+                4.0 + theta[rows],
+                jnp.asarray([0.0 if v is None else v for v in vals]),
+            )
+            indptr = np.concatenate(
+                ([0], np.cumsum(np.bincount(rows, minlength=n_local)))
+            )
+            return jsp.BCSR(
+                (data, jnp.asarray(cols, jnp.int64), jnp.asarray(indptr, jnp.int32)),
+                shape=(n_local, n),
+            )
+
+        b = jnp.asarray(np.random.default_rng(rank).standard_normal(n_local))
+        theta0 = jnp.asarray(0.1 + 0.01 * np.arange(r0, r1, dtype=np.float64))
+        kw = dict(comm=comm, nglobal=n, partition_info=(r0, r1), config=config)
+
+        def loss(theta, make):
+            A = make(theta)
+            return jnp.sum(jaxamg.solve(A, b, **kw)[0] ** 2)
+
+        # Discovered once, eagerly; per-step operators reuse the colouring.
+        base = jaxamg.halo_operator(fn(theta0), n_local=n_local, ghost_ids=ghost_ids)
+        x_halo = jaxamg.solve(base, b, **kw)[0]
+        halo = lambda t: base.with_fn(fn(t))  # noqa: E731
+        x_direct = jaxamg.solve(direct(theta0), b, **kw)[0]
+        np.testing.assert_allclose(x_halo, x_direct, rtol=1e-12, atol=1e-14)
+        g_halo = jax.grad(loss)(theta0, halo)
+        g_direct = jax.grad(loss)(theta0, direct)
+        np.testing.assert_allclose(g_halo, g_direct, rtol=1e-10, atol=1e-14)
+    finally:
+        jax.config.update("jax_enable_x64", False)

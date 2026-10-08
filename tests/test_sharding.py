@@ -12,11 +12,7 @@ import pytest
 import jaxamg
 import jaxamg.sharding as sharding_module
 from jaxamg.mpi_utils import TransposePlan
-
-pytestmark = pytest.mark.skipif(
-    not sharding_module.has_supported_jax(),
-    reason="the sharding interface requires JAX 0.9 or newer",
-)
+from jaxamg.transport import NeighbourPlan
 
 
 def test_sharding_comm_defaults_to_world(monkeypatch):
@@ -36,6 +32,10 @@ def _single_device_array(values):
     return mesh, jax.device_put(jnp.asarray(values), sharding)
 
 
+# One rank: nothing travels, so the exchange is never called.
+_EMPTY_EXCHANGE = NeighbourPlan(0, (), (), (), ())
+
+
 def _single_rank_transpose_plan(A):
     nnz = len(A.data)
     return TransposePlan(
@@ -43,8 +43,9 @@ def _single_rank_transpose_plan(A):
         np.asarray(A.indptr),
         np.arange(nnz, dtype=np.int32),
         np.arange(nnz, dtype=np.int32),
-        np.full((1, 1), nnz, dtype=np.int32),
-        np.full((1, 1), nnz, dtype=np.int32),
+        np.zeros(0, dtype=np.int32),
+        np.zeros(0, dtype=np.int32),
+        _EMPTY_EXCHANGE,
         nnz,
     )
 
@@ -53,6 +54,8 @@ def test_make_sharded_vector_constructs_default_mesh():
     comm = SimpleNamespace(
         Get_size=lambda: 1,
         allgather=lambda value: [value],
+        allreduce=lambda value, op=None: value,
+        Allreduce=lambda *args, **kwargs: None,
     )
     values = np.arange(4, dtype=np.float32)
 
@@ -72,6 +75,8 @@ def test_make_sharded_vector_rejects_batched_rhs():
     comm = SimpleNamespace(
         Get_size=lambda: 1,
         allgather=lambda value: [value],
+        allreduce=lambda value, op=None: value,
+        Allreduce=lambda *args, **kwargs: None,
     )
 
     with pytest.raises(ValueError, match="one-dimensional"):
@@ -87,6 +92,8 @@ def test_sharded_inputs_preserve_device_arrays(monkeypatch):
         Get_size=lambda: 1,
         Get_rank=lambda: 0,
         allgather=lambda value: [value],
+        allreduce=lambda value, op=None: value,
+        Allreduce=lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
 
@@ -102,7 +109,8 @@ def test_sharded_inputs_preserve_device_arrays(monkeypatch):
     )
 
 
-def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
+@pytest.fixture
+def mock_sharded_solver(monkeypatch):
     mesh, b = _single_device_array(np.arange(4, dtype=np.float32))
     A_local = jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32))
     allgather_calls = []
@@ -115,13 +123,15 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
         Get_size=lambda: 1,
         Get_rank=lambda: 0,
         allgather=allgather,
+        allreduce=lambda value, op=None: value,
+        Allreduce=lambda *args, **kwargs: None,
     )
     halo_plan = SimpleNamespace(
         n_ghost=0,
         max_n_ghost=0,
         col_to_combined=np.arange(4, dtype=np.int32),
-        send_ids_2d=np.zeros((1, 1), dtype=np.int32),
-        recv_ghost_slot_2d=np.zeros((1, 1), dtype=np.int32),
+        send_ids=np.zeros(1, dtype=np.int32),  # plans keep one entry
+        exchange=_EMPTY_EXCHANGE,
     )
     halo_plan_calls = []
 
@@ -135,24 +145,12 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
         "build_halo_plan",
         fake_build_halo_plan,
     )
+    monkeypatch.setattr(sharding_module, "register_comm", lambda comm: 0)
+    # max_iters matching fake_native's three residual-history entries.
     monkeypatch.setattr(
-        sharding_module,
-        "_build_mpi_cache",
-        lambda config, comm, nglobal, row_counts, max_nnz, nnz_out, plan, **kwargs: {
-            "lrank": 99,
-            "recvcounts_tuple": row_counts,
-            "max_nnz": max_nnz,
-            "nnz_out": nnz_out,
-            "halo_plan": plan,
-            "row_indices": kwargs.get("row_indices"),
-            # max_iters matching fake_solve's three residual-history entries.
-            "config_str": '{"solver": {"max_iters": 2}}',
-        },
-    )
-    monkeypatch.setattr(
-        sharding_module,
-        "with_cache",
-        lambda A, **kwargs: A,
+        sharding_module.amgx_config,
+        "prepare_config",
+        lambda *args, **kwargs: '{"solver": {"max_iters": 2}}',
     )
     normalization_calls = []
 
@@ -163,31 +161,66 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     monkeypatch.setattr(sharding_module, "to_bcsr_matrix", fake_to_bcsr)
     transpose_calls = []
 
-    def fake_transpose(*args):
+    def fake_transpose(*args, **kwargs):
         transpose_calls.append(A_local)
         return _single_rank_transpose_plan(A_local)
 
     monkeypatch.setattr(sharding_module, "build_transpose_plan", fake_transpose)
 
-    def fake_solve(A, rhs, x0=None, **kwargs):
-        x = A.data * rhs
-        if x0 is not None:
-            x = x + x0
-        info = {
-            "iterations": jnp.asarray(2.0),
-            "residual": jnp.asarray(1e-6, dtype=rhs.dtype),
-            "status": jnp.asarray(0.0),
-            "residual_history": jnp.asarray([1.0, 0.1, 1e-6], dtype=rhs.dtype),
-        }
-        return x, info
+    # The services' native layer: rank-local arrays held in memory, and a
+    # native solve returning x = values * rhs (+ x0) for this diagonal matrix
+    # with a three-entry residual history.
+    import jaxamg.jaxamg as jaxamg_module
+    import jaxamg.local_arrays as local_arrays_module
 
-    monkeypatch.setattr(sharding_module, "solve", fake_solve)
+    def fake_register(comm, array, device=None):
+        return SimpleNamespace(value=np.asarray(array))
+
+    def fake_load(handle, varying_axis=None):
+        value = jnp.asarray(handle.value)
+        if varying_axis is not None:
+            value = jax.lax.pcast(value, varying_axis, to="varying")
+        return value
+
+    def fake_native(indptr, indices, values, rhs, x0, *args, use_x0=False, **kwargs):
+        x = values * rhs
+        if use_x0:
+            x = x + x0
+        stats = jnp.asarray([2.0, 1e-6, 0.0, 1.0, 0.1, 1e-6], dtype=rhs.dtype)
+        return x, stats
+
+    monkeypatch.setattr(local_arrays_module, "register_local", fake_register)
+    monkeypatch.setattr(local_arrays_module, "load_local", fake_load)
+    monkeypatch.setattr(jaxamg_module, "_amgx_solve_mpi_impl", fake_native)
 
     matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm)
     # Omit mesh to exercise inference from b.sharding.
     solver = jaxamg.make_sharded_solver(matrix, b)
-    # Row counts, nonzero counts, and the null-space schema.
-    assert len(allgather_calls) == 3
+    return SimpleNamespace(
+        mesh=mesh,
+        b=b,
+        A_local=A_local,
+        comm=comm,
+        matrix=matrix,
+        solver=solver,
+        allgather_calls=allgather_calls,
+        normalization_calls=normalization_calls,
+        halo_plan_calls=halo_plan_calls,
+        transpose_calls=transpose_calls,
+    )
+
+
+def test_make_sharded_solver_preserves_global_array_contract(
+    monkeypatch, mock_sharded_solver
+):
+    ctx = mock_sharded_solver
+    mesh, b, A_local, comm = ctx.mesh, ctx.b, ctx.A_local, ctx.comm
+    matrix, solver = ctx.matrix, ctx.solver
+    allgather_calls, normalization_calls = ctx.allgather_calls, ctx.normalization_calls
+    halo_plan_calls, transpose_calls = ctx.halo_plan_calls, ctx.transpose_calls
+    # Only the row counts (the partition offsets) are gathered; nonzero counts
+    # and the null-space schema are agreed by O(1) reductions.
+    assert len(allgather_calls) == 1
     assert len(normalization_calls) == 1
     assert len(halo_plan_calls) == 1
     x, info = solver(b)
@@ -303,6 +336,60 @@ def test_make_sharded_solver_preserves_global_array_contract(monkeypatch):
     assert stats_calls == ["stats.txt", "warned.txt"]
 
 
+@pytest.mark.parametrize("bad", [-2, 2, 99, 2**32])
+def test_sharded_labels_reject_invalid_values(mock_sharded_solver, bad):
+    ctx = mock_sharded_solver
+    # Host inputs must be checked before JAX can narrow int64 to int32.
+    with pytest.raises(ValueError, match=r"\[-1, 2\)"):
+        ctx.solver(
+            ctx.b,
+            nullspace="constant",
+            labels=(2, np.array([0, 0, bad, bad], np.int64)),
+        )
+    with jax.enable_x64(True):
+        rows = jax.device_put(jnp.array([0, 0, bad, bad], jnp.int64), ctx.b.sharding)
+        with pytest.raises(ValueError, match=r"\[-1, 2\)"):
+            ctx.solver(
+                ctx.b,
+                nullspace="constant",
+                transpose_nullspace="constant",
+                labels=(2, rows),
+            )
+
+
+@pytest.mark.parametrize("custom_sum", [False, True])
+def test_sharded_label_scaling_eager_jit_and_grad(mock_sharded_solver, custom_sum):
+    ctx = mock_sharded_solver
+    rows = jax.device_put(jnp.array([0, 0, 1, 1]), ctx.b.sharding)
+    basis = jax.device_put(jnp.array([1e30, 1e30, 1e-30, 1e-30]), ctx.b.sharding)
+    declared = {"label_sum": lambda sums: sums} if custom_sum else {}
+
+    def solve(rhs, data, B, labels):
+        return ctx.solver(
+            rhs,
+            A=data,
+            nullspace=B,
+            transpose_nullspace=B,
+            labels=(3, labels),
+            **declared,
+        )[0]
+
+    expected = np.array([-0.5, 0.5, -0.5, 0.5])
+    with jax.set_mesh(ctx.mesh):
+        args = (ctx.b, ctx.matrix.data, basis, rows)
+        np.testing.assert_allclose(solve(*args), expected, atol=1e-6)
+        np.testing.assert_allclose(jax.jit(solve)(*args), expected, atol=1e-6)
+        gradient = jax.jit(
+            jax.grad(lambda rhs, data, B, r, w: jnp.sum(w * solve(rhs, data, B, r)))
+        )(*args, ctx.b)
+        np.testing.assert_allclose(gradient, expected, atol=1e-6)
+        # Excluded rows and an empty label still retain their exact semantics.
+        excluded = jax.device_put(jnp.array([0, 0, -1, -1]), ctx.b.sharding)
+        np.testing.assert_allclose(
+            solve(ctx.b, ctx.matrix.data, basis, excluded), [-0.5, 0.5, 2, 3], atol=1e-6
+        )
+
+
 def test_sharded_matrix_validates_partition(monkeypatch):
     mesh, b = _single_device_array(np.ones(4, dtype=np.float32))
     monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
@@ -310,6 +397,8 @@ def test_sharded_matrix_validates_partition(monkeypatch):
         Get_size=lambda: 1,
         Get_rank=lambda: 0,
         allgather=lambda value: [value],
+        allreduce=lambda value, op=None: value,
+        Allreduce=lambda *args, **kwargs: None,
     )
 
     with pytest.raises(ValueError, match="row counts"):
@@ -361,7 +450,12 @@ def test_shard_autotuning_warning(monkeypatch):
 
 
 def test_make_sharded_vector_normalizes_dtype_and_rejects_empty_ranks():
-    comm = SimpleNamespace(Get_size=lambda: 1, allgather=lambda value: [value])
+    comm = SimpleNamespace(
+        Get_size=lambda: 1,
+        allgather=lambda value: [value],
+        allreduce=lambda value, op=None: value,
+        Allreduce=lambda *args, **kwargs: None,
+    )
 
     b = jaxamg.make_sharded_vector(np.arange(4), comm=comm)
     assert b.dtype == jnp.float32
@@ -374,7 +468,10 @@ def test_sharded_matrix_keeps_nullspace_bases(monkeypatch):
     mesh, b = _single_device_array(np.ones(4, dtype=np.float32))
     monkeypatch.setattr(sharding_module, "_validate_runtime", lambda *args: None)
     comm = SimpleNamespace(
-        Get_size=lambda: 1, Get_rank=lambda: 0, allgather=lambda value: [value]
+        Get_size=lambda: 1,
+        Get_rank=lambda: 0,
+        allgather=lambda value: [value],
+        allreduce=lambda value, op=None: value,
     )
     A_local = jaxamg.with_cache(
         jsp.BCSR.fromdense(jnp.eye(4, dtype=jnp.float32)), nullspace="constant"
@@ -396,3 +493,19 @@ def test_distributed_basis_allows_more_columns_than_local_rows():
         as_nullspace_basis(basis, 1, jnp.float32, "nullspace")
     with pytest.raises(ValueError, match="k ≤ 1"):
         as_nullspace_basis(basis, 1, jnp.float32, "nullspace", 1)
+
+
+def test_row_axes_of_a_multi_axis_mesh():
+    """Rows may be partitioned over axes of an application's mesh, in mesh
+    order; every other axis has size one; one-name tuples normalize."""
+    from jaxamg.sharding import _axis_spec, _row_axes, _row_count
+
+    mesh = jax.make_mesh((1, 1, 1), ("x", "y", "z"))
+    assert _row_axes(mesh, ("x", "y")) == ("x", "y") and _row_count(mesh, "y") == 1
+    assert _axis_spec(("x",)) == "x" and _axis_spec(("x", "y")) == ("x", "y")
+    with pytest.raises(ValueError, match="mesh axis order"):
+        _row_axes(mesh, ("y", "x"))
+    with pytest.raises(ValueError, match="distinct axes"):
+        _row_axes(mesh, ("x", "w"))
+    with pytest.raises(ValueError, match="axis name"):
+        _axis_spec(())
