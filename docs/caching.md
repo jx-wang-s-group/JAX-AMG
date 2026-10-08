@@ -71,6 +71,25 @@ When to use each option:
       [Singular systems](examples.md#singular-systems).
     - In MPI mode also prepare the cached config with `cache_mpi_metadata(..., singular=True)`.
 
+### Reusing a declared pattern
+
+Create a pattern once outside JIT and reuse it as coefficients change:
+
+```python
+p = jaxamg.pattern(rows, cols, shape)
+
+@jax.jit
+def solve_at(coefficients, b):
+    op = jaxamg.with_cache(lambda x: apply_operator(coefficients, x), pattern=p)
+    return jaxamg.solve(op, b)[0]
+```
+
+Single-process solves reuse the pattern's layout while recomputing matrix values.
+Reuse the same `Pattern` object; a new equivalent pattern has its own cache.
+
+If your transpose callback materializes an operator, reuse a separate pattern for
+it. MPI, sharded solves, and colouring tuples do not use this layout cache.
+
 ## Native AmgX resource cache
 
 Set with environment variable:

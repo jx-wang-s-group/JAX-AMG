@@ -1041,3 +1041,73 @@ def test_mpi_nullspace(mpi_context):
             np.testing.assert_allclose(np.asarray(g2), g_ref, rtol=1e-6, atol=atol)
     finally:
         jax.config.update("jax_enable_x64", False)
+
+
+def _variable_coefficient_operator(grid, seed=0):
+    """A float64-sensitive 2D diffusion operator whose arithmetic follows its
+    input dtype, and its dense float64 matrix."""
+    import jax.numpy as jnp
+
+    rng = np.random.default_rng(seed)
+    k = jnp.asarray(np.exp(0.3 * rng.standard_normal((grid, grid))))
+    kx, ky = 0.5 * (k[1:, :] + k[:-1, :]), 0.5 * (k[:, 1:] + k[:, :-1])
+
+    def op(x):
+        u = x.reshape(grid, grid)
+        fx = kx.astype(x.dtype) * (u[1:, :] - u[:-1, :])
+        fy = ky.astype(x.dtype) * (u[:, 1:] - u[:, :-1])
+        y = jnp.zeros((grid, grid), x.dtype)
+        y = (
+            y.at[1:, :]
+            .add(-fx)
+            .at[:-1, :]
+            .add(fx)
+            .at[:, 1:]
+            .add(-fy)
+            .at[:, :-1]
+            .add(fy)
+        )
+        return (0.37 * u - y).reshape(-1)
+
+    n = grid * grid
+    dense = np.asarray(
+        jax.vmap(op, in_axes=1, out_axes=1)(jnp.eye(n, dtype=jnp.float64))
+    )
+    return op, dense
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_operator_float64_precision(mpi_context):
+    """A float64 MPI solve through a rank-local operator is as accurate as the
+    float64 matrix."""
+    comm, rank, nranks = mpi_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        grid = 16
+        n = grid * grid
+        op, dense = _variable_coefficient_operator(grid)
+        local_op, start, end = partition_operator(op, n, rank, nranks)
+        shape = (end - start, n)
+        local_op = jaxamg.with_cache(
+            local_op, coloring=jaxamg.cache_coloring(local_op, shape)
+        )
+        b = np.random.default_rng(1).standard_normal(n)
+        reference = np.linalg.solve(dense, b)
+        config = {
+            "solver": "PCG",
+            "preconditioner": {"solver": "AMG", "max_iters": 1},
+            "tolerance": 1e-13,
+            "max_iters": 400,
+        }
+        x_local, _ = jaxamg.solve(
+            local_op,
+            jnp.asarray(b[start:end]),
+            comm=comm,
+            nglobal=n,
+            partition_info=(start, end),
+            config=config,
+        )
+        x = np.concatenate(comm.allgather(np.asarray(x_local)))
+        assert np.linalg.norm(x - reference) / np.linalg.norm(reference) < 1e-10
+    finally:
+        jax.config.update("jax_enable_x64", False)

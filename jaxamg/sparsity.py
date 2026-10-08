@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.experimental.sparse as jsp
@@ -269,6 +269,16 @@ def csr_structure(
     return rows_sorted, cols_sorted, indptr
 
 
+class _MaterializationLayout(NamedTuple):
+    """Concrete structural operands shared by materializations of one Pattern."""
+
+    rows: jax.Array
+    cols: jax.Array
+    entry_colors: jax.Array
+    indptr: jax.Array
+    column_colors: jax.Array
+
+
 def materialize_sparse_matrix(
     A_callable: Callable,
     shape: tuple[int, int],
@@ -277,6 +287,8 @@ def materialize_sparse_matrix(
     column_colors: ArrayLike,
     n_colors: int,
     dtype: Any = None,
+    *,
+    _layout: _MaterializationLayout | None = None,
 ) -> jsp.BCSR:
     """
     Materialize the values of a sparse matrix inside JIT using graph coloring.
@@ -306,15 +318,18 @@ def materialize_sparse_matrix(
     # lexsort inside JIT (which dominates compile time at scale). Only the values
     # (the operator evaluations) stay traced. Falls back to the JAX path if the
     # indices arrive as tracers (not the normal case).
-    try:
-        rows_np = np.asarray(rows).astype(np.int32)
-        cols_np = np.asarray(cols).astype(np.int32)
-        colors_np = np.asarray(column_colors).astype(np.int32)
-        static = True
-    except Exception:
-        static = False
-
-    column_colors = jnp.array(column_colors, dtype=jnp.int32)
+    static = False
+    if _layout is None:
+        try:
+            rows_np = np.asarray(rows).astype(np.int32)
+            cols_np = np.asarray(cols).astype(np.int32)
+            colors_np = np.asarray(column_colors).astype(np.int32)
+            static = True
+        except Exception:
+            pass
+        column_colors = jnp.array(column_colors, dtype=jnp.int32)
+    else:
+        column_colors = _layout.column_colors
     probe_dtype = _probe_dtype(dtype)
 
     def evaluate_color(color_id: ArrayLike) -> jax.Array:
@@ -327,6 +342,10 @@ def materialize_sparse_matrix(
     # Map over all colors: (n_colors, n)
     # Use lax.map instead of vmap to support primitives without batching rules (e.g. CSR matvec)
     w_matrix = jax.lax.map(evaluate_color, jnp.arange(n_colors))
+
+    if _layout is not None:
+        values = w_matrix[_layout.entry_colors, _layout.rows]
+        return jsp.BCSR((values, _layout.cols, _layout.indptr), shape=shape)
 
     if static:
         # Host-side static CSR construction; only `values_sorted` is traced.

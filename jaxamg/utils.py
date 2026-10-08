@@ -255,6 +255,11 @@ def to_bcsr_matrix(
 
         rows, cols, column_colors, n_colors, _ = cached_info
 
+        # MPI uses int64 global columns and its own routing/layout conventions.
+        # Only the single-device int32 path captures Pattern-owned JAX arrays.
+        declared = None if use_int64_indices else getattr(A, "_pattern", None)
+        layout = None if declared is None else declared._materialization_layout()
+
         # Materialize using graph coloring (works efficiently inside JIT)
         # Note: materialize_sparse_matrix already returns a BCSR
         # Probe in the solve's precision (float64 for a float64 RHS), so the
@@ -267,6 +272,7 @@ def to_bcsr_matrix(
             column_colors,
             n_colors,
             dtype=probe_dtype,
+            _layout=layout,
         )
 
     # 2. Convert to BCSR from other formats

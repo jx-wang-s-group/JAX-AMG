@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import operator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
-from .sparsity import get_column_coloring
+from .sparsity import _MaterializationLayout, csr_structure, get_column_coloring
 
 
 def _integers(values: Any, name: str) -> np.ndarray:
@@ -70,6 +73,8 @@ class Pattern:
     shape: tuple[int, int]
     colors: np.ndarray
     n_colors: int
+    _layout: _MaterializationLayout | None = field(default=None, init=False, repr=False)
+    _layout_lock: Any = field(default_factory=Lock, init=False, repr=False)
 
     def __post_init__(self):
         rows, cols, shape = _coordinates(self.rows, self.cols, self.shape)
@@ -97,8 +102,33 @@ class Pattern:
         """The dtype-independent 5-tuple accepted by ``with_cache``."""
         return self.rows, self.cols, self.colors, self.n_colors, self.shape
 
+    def _materialization_layout(self) -> _MaterializationLayout:
+        """Create structural arrays once, including when first used in a trace.
+
+        Do not retain tracers, probes, operator values or a floating dtype. Arrays
+        are uncommitted so other JIT/device contexts can capture this declaration.
+        The lock prevents concurrent first traces from capturing different copies.
+        """
+        if self._layout is None:
+            with self._layout_lock:
+                if self._layout is None:
+                    with jax.ensure_compile_time_eval():
+                        rows, cols, indptr = csr_structure(
+                            self.rows, self.cols, self.shape[0]
+                        )
+                        layout = _MaterializationLayout(
+                            jnp.asarray(rows),
+                            jnp.asarray(cols),
+                            jnp.asarray(self.colors[cols]),
+                            jnp.asarray(indptr),
+                            jnp.asarray(self.colors),
+                        )
+                    object.__setattr__(self, "_layout", layout)
+        assert self._layout is not None
+        return self._layout
+
     def __reduce__(self):
-        # Reconstruct through validation, preserving immutability after unpickling.
+        # Serialize the declaration, not device arrays or synchronization state.
         return type(self), (
             self.rows,
             self.cols,
