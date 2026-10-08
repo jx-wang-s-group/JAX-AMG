@@ -320,7 +320,9 @@ class BuildExt(build_ext):
 
     def build_extensions(self) -> None:
         cfg = get_build_config()
+        kernels = self._compile_cuda(cfg)
         for ext in self.extensions:
+            ext.extra_objects = list(ext.extra_objects or []) + kernels
             ext.include_dirs = cfg["include_dirs"] + list(ext.include_dirs)
             ext.library_dirs = cfg["library_dirs"] + list(ext.library_dirs)
             ext.runtime_library_dirs = cfg["runtime_library_dirs"] + list(
@@ -329,6 +331,41 @@ class BuildExt(build_ext):
             ext.libraries = cfg["libraries"] + list(ext.libraries)
             ext.define_macros = list(ext.define_macros or []) + cfg["define_macros"]
         super().build_extensions()
+
+    def _compile_cuda(self, cfg) -> list[str]:
+        """Compile the CUDA kernel sources with nvcc into position-independent
+        objects linked into the extension (the host code is plain C++)."""
+        nvcc = str(Path(find_cuda()) / "bin" / "nvcc")
+        build_dir = Path(self.build_temp)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        # Real code for the supported architectures, plus PTX for newer GPUs.
+        archs = os.environ.get("JAXAMG_CUDA_ARCHS", "75;80;86;89;90").split(";")
+        gencode = [f"-gencode=arch=compute_{a},code=sm_{a}" for a in archs]
+        gencode.append(f"-gencode=arch=compute_{archs[-1]},code=compute_{archs[-1]}")
+        objects = []
+        for source in CUDA_SOURCES:
+            target = build_dir / (Path(source).stem + ".o")
+            command = [
+                nvcc,
+                "-O3",
+                "-std=c++17",
+                "-Xcompiler",
+                "-fPIC",
+                *gencode,
+                *(f"-I{d}" for d in cfg["include_dirs"]),
+                "-c",
+                source,
+                "-o",
+                str(target),
+            ]
+            print(f"\033[1;34m[setup.py] {' '.join(command)}\033[0m")
+            subprocess.check_call(command)
+            objects.append(str(target))
+        return objects
+
+
+# CUDA kernels of the extension (compiled by nvcc, see BuildExt._compile_cuda).
+CUDA_SOURCES = ["jaxamg/_pattern_hash.cu"]
 
 
 # C++ extension module. The native dependency paths (CUDA/AmgX/MPI) are filled

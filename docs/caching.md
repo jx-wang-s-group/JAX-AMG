@@ -109,6 +109,9 @@ Behavior (two modes):
     structures/configs, including cases where the forward pass uses `A` and the
     gradient/backward pass uses a structurally different `A^T`.
 
+MPI cache capacity applies per communicator. Call `clear_solver_cache()` on
+every rank together; inconsistent caches cause the solve to fail on all ranks.
+
 ### Solver setup reuse
 
 When the cache hits (same sparsity structure and config as a previous solve), the

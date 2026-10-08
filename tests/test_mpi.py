@@ -1,4 +1,5 @@
 import jax
+import jax.experimental.sparse as jsp
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -667,20 +668,16 @@ def test_mpi_multiple_communicators(mpi_context):
 
 
 @pytest.mark.mpi(min_size=2)
-def test_mpi_amg_preconditioner(mpi_context):
+@pytest.mark.parametrize("grid_size", [16, 17])
+def test_mpi_amg_preconditioner(mpi_context, grid_size):
     """Distributed solve with the classical-AMG preconditioner.
 
-    Covers the distributed classical-AMG upload path (an explicit contiguous
-    partition vector plus the 32-bit global-index upload,
-    ``AMGX_matrix_upload_all_global_32``) that a correct multi-rank classical-AMG
-    hierarchy requires. The other MPI tests use DILU/Jacobi/plain-CG, which do not
-    build the AMG halo this path sets up, so this is the only coverage of it.
-    A single AMG solve, so it does not depend on any AmgX-internal repeated-solve
-    behavior.
+    Exercises contiguous partition offsets, 32-bit global columns and the
+    two-ring halo needed by classical AMG, with equal (16) and unequal (17)
+    row partitions. Each case is one cold solve.
     """
     comm, rank, nranks = mpi_context
 
-    grid_size = 16
     n = grid_size**2
 
     A_local, row_start, row_end = poisson_matrix_distributed(
@@ -1111,3 +1108,81 @@ def test_mpi_operator_float64_precision(mpi_context):
         assert np.linalg.norm(x - reference) / np.linalg.norm(reference) < 1e-10
     finally:
         jax.config.update("jax_enable_x64", False)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_cache_decisions_agree(mpi_context):
+    """The native cache takes the same branch on every rank. With ``(1, 0)``
+    removed from a tridiagonal matrix, ``A`` and ``Aᵀ`` differ only in rank 0's
+    rows, so a per-rank structure key hits on the other ranks and misses on
+    rank 0 (its setup and resetup collectives then mismatch and hang).
+    Alternating ``A`` and ``Aᵀ`` also exercises returning to an evicted entry."""
+    import scipy.sparse as sp
+
+    comm, rank, nranks = mpi_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        n = 8 * nranks
+        lo, hi, _ = get_partition_info(n, rank, nranks)
+        A = sp.diags(
+            [-0.2 * np.ones(n - 1), 2 * np.ones(n), -0.2 * np.ones(n - 1)],
+            [-1, 0, 1],
+            format="lil",
+        )
+        A[1, 0] = 0.0
+        A = A.tocsr()
+        A.eliminate_zeros()
+        rows = A[lo:hi]
+        A_local = jsp.BCSR(
+            (
+                jnp.asarray(rows.data),
+                jnp.asarray(rows.indices, jnp.int64),
+                jnp.asarray(rows.indptr, jnp.int32),
+            ),
+            shape=(hi - lo, n),
+        )
+        b = jnp.arange(lo + 1, hi + 1, dtype=jnp.float64)
+        kwargs = dict(
+            comm=comm,
+            nglobal=n,
+            partition_info=(lo, hi),
+            solver="PBICGSTAB",
+            preconditioner="JACOBI_L1",
+            tolerance=1e-12,
+            max_iters=200,
+        )
+        grad = jax.jit(
+            jax.grad(lambda rhs: jnp.sum(jaxamg.solve(A_local, rhs, **kwargs)[0]))
+        )
+        dense = A.toarray()
+        expected_x = np.linalg.solve(dense, np.arange(1, n + 1, dtype=float))[lo:hi]
+        expected_grad = np.linalg.solve(dense.T, np.ones(n))[lo:hi]
+        for _ in range(2):
+            x = jaxamg.solve(A_local, b, **kwargs)[0]
+            np.testing.assert_allclose(np.asarray(x), expected_x, rtol=1e-9)
+            np.testing.assert_allclose(np.asarray(grad(b)), expected_grad, rtol=1e-9)
+    finally:
+        jax.config.update("jax_enable_x64", False)
+
+
+@pytest.mark.mpi(min_size=2)
+def test_mpi_diverged_caches_are_refused_on_every_rank(mpi_context):
+    """A cache cleared on one rank only (so one rank misses where the others
+    hit) makes every rank refuse the solve alike, instead of some ranks
+    resetting up while others set up; clearing on every rank recovers the
+    caches."""
+    comm, rank, nranks = mpi_context
+    grid = 16
+    n = grid * grid
+    A, lo, hi = poisson_matrix_distributed(grid, grid, rank, nranks)
+    b = jnp.ones(hi - lo)
+    kwargs = dict(comm=comm, nglobal=n, partition_info=(lo, hi), solver="PCG")
+    jaxamg.solve(A, b, **kwargs)[0].block_until_ready()
+    if rank == 0:
+        jaxamg.clear_solver_cache()
+    with pytest.raises(Exception, match="caches differ across ranks"):
+        jaxamg.solve(A, b, **kwargs)[0].block_until_ready()
+    comm.Barrier()
+    jaxamg.clear_solver_cache()
+    x = jaxamg.solve(A, b, **kwargs)[0]
+    assert np.all(np.isfinite(np.asarray(x)))
