@@ -20,6 +20,8 @@
 #include <vector>
 #include <list>
 #include <unordered_map>
+#include <map>
+#include <tuple>
 #include <functional>
 #include <utility>
 #include <string_view>
@@ -355,6 +357,7 @@ namespace
     void *bsr_scatter_map = nullptr;       // block mode: scalar-entry -> BSR value slot map (device int32)
     int bsr_nnzb = 0;                      // block mode: number of BSR blocks
     bool owns_resources = false;           // true if isolated (JAXAMG_CACHE_SIZE=0)
+    bool owns_config = true;               // false only for a shared resource's founding config
   };
 
   // Parse JAXAMG_CACHE_SIZE env var (default: 1).
@@ -418,11 +421,10 @@ namespace
 
       if (res.owns_resources) {
           if (res.rsrc) AMGX_resources_destroy(res.rsrc);
-          if (res.cfg) AMGX_config_destroy(res.cfg);
       }
-      // In shared mode (owns_resources == false), the founding config is
-      // owned by Global{MPI}Resources and destroyed in its Destroy().
-      // Non-founding configs are tiny and cleaned up at process exit.
+      // Shared resources retain their founding config; every other config
+      // belongs to its solver entry and is released on eviction.
+      if (res.owns_config && res.cfg) AMGX_config_destroy(res.cfg);
       if (res.values_buf) cudaFree(res.values_buf);
       if (res.row_ptrs_buf) cudaFree(res.row_ptrs_buf);
       if (res.col_indices_buf) cudaFree(res.col_indices_buf);
@@ -466,11 +468,12 @@ namespace
           return *instance;
       }
 
-      AMGX_resources_handle GetHandle(AMGX_config_handle cfg) {
+      AMGX_resources_handle GetHandle(AMGX_config_handle cfg, bool &owns_config) {
           std::lock_guard<std::mutex> lock(mutex_);
           if (!handle_) {
               AMGX_SAFE_CALL_VOID(AMGX_resources_create_simple(&handle_, cfg));
               cfg_ = cfg;
+              owns_config = false;
           }
           return handle_;
       }
@@ -498,7 +501,7 @@ namespace
 
 #ifdef JAXAMG_WITH_MPI
   // Singleton for global MPI AmgX resource management. Keeps one
-  // AMGX_resources_handle per communicator: solves on the same communicator
+  // AMGX_resources_handle per communicator, device and transport: compatible solves
   // share it, distinct communicators each get their own (one handle reused
   // across communicators would run AmgX's collectives on the wrong one). Owns
   // the founding config handle per communicator (as GlobalResources does).
@@ -510,18 +513,20 @@ namespace
       }
 
       AMGX_resources_handle GetHandle(AMGX_config_handle cfg,
-                                       MPI_Comm *comm, int ndevs, int *devs) {
+                                       MPI_Comm *comm, int device, bool device_mpi,
+                                       bool &owns_config) {
           std::lock_guard<std::mutex> lock(mutex_);
           // Key on the communicator's identity (the same pointer Python passes as
           // comm_ptr), so each communicator gets its own resources handle.
-          uint64_t key = reinterpret_cast<uint64_t>(comm);
+          auto key = std::make_tuple(reinterpret_cast<uint64_t>(comm), device, device_mpi);
           auto it = handles_.find(key);
           if (it != handles_.end()) {
               return it->second.handle;
           }
           AMGX_resources_handle handle = nullptr;
-          AMGX_SAFE_CALL_VOID(AMGX_resources_create(&handle, cfg, comm, ndevs, devs));
+          AMGX_SAFE_CALL_VOID(AMGX_resources_create(&handle, cfg, comm, 1, &device));
           handles_[key] = {handle, cfg};
+          owns_config = false;
           return handle;
       }
 
@@ -542,7 +547,7 @@ namespace
       GlobalMPIResources() {}
       ~GlobalMPIResources() { Destroy(); }
 
-      std::unordered_map<uint64_t, Entry> handles_;
+      std::map<std::tuple<uint64_t, int, bool>, Entry> handles_;
       std::mutex mutex_;
   };
 #endif // JAXAMG_WITH_MPI

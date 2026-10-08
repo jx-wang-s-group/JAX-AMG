@@ -130,6 +130,9 @@ with a null space emits a `NullSpaceWarning`. For cached MPI metadata pass
 
 The `communicator` key can be set to `MPI` for standard CPU-based MPI or `MPI_DIRECT` for GPU-aware MPI. The default is `MPI`. To use GPU-aware MPI, ensure that your MPI installation supports it. For more details, see the [MPI Guide](mpi.md).
 
+In nested configs, put `communicator` beside `solver`. Flat configs and the
+`communicator=` keyword work too; the older `solver.communicator` form is accepted.
+
 ```python hl_lines="4"
 config = {
     "solver": "PBICGSTAB",

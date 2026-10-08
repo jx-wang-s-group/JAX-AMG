@@ -1,3 +1,5 @@
+import os
+
 import jax
 import jax.experimental.sparse as jsp
 import jax.numpy as jnp
@@ -36,6 +38,42 @@ def mpi_context():
 
     comm.Barrier()
     jaxamg.finalize()
+
+
+@pytest.mark.mpi(min_size=2)
+@pytest.mark.parametrize("communicator", ["MPI", "MPI_DIRECT"])
+def test_mpi_communicator_selection(mpi_context, communicator):
+    """Check the transport AmgX actually constructs, not just its JSON input."""
+    from jaxamg.jaxamg import _ensure_backend
+
+    comm, rank, nranks = mpi_context
+    grid_size = 8
+    A, start, end = poisson_matrix_distributed(grid_size, grid_size, rank, nranks)
+    b = jnp.ones(end - start)
+    other = "MPI" if communicator == "MPI_DIRECT" else "MPI_DIRECT"
+    for i, mode in enumerate((communicator, other, communicator)):
+        x, info = jaxamg.solve(
+            A,
+            b,
+            comm=comm,
+            nglobal=grid_size**2,
+            partition_info=(start, end),
+            communicator=mode,
+            max_iters=100 + i,  # a new solver, sharing the resource cache
+            save_stats_file=os.devnull,
+        )
+        jax.block_until_ready(x)
+        assert info["status"] == jaxamg.AMGXStatus.SUCCESS
+        if rank == 0:
+            transport = (
+                "CUDA-Aware MPI (GPU Direct)"
+                if mode == "MPI_DIRECT"
+                else "Normal MPI (Hostbuffer)"
+            )
+            assert (
+                f"Using {transport} communicator"
+                in _ensure_backend().get_stats_string()
+            )
 
 
 @pytest.mark.mpi(min_size=2)

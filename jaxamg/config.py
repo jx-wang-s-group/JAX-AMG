@@ -83,14 +83,37 @@ def _prepare_solver_config_dict(
         if not isinstance(solver_block, dict):
             raise TypeError("Nested config must contain a dictionary at key 'solver'.")
         merged_solver = solver_merger(solver_block, solver_defaults)
-        merged_solver = deep_merge(merged_solver, kwargs)
         merged_config["config_version"] = merged_config.get("config_version", 2)
-        merged_config["solver"] = merged_solver
-        return merged_config
+    else:
+        merged_solver = solver_merger(user_config or {}, solver_defaults)
+        merged_config = {"config_version": 2}
 
-    merged_solver = solver_merger(user_config or {}, solver_defaults)
-    merged_solver = deep_merge(merged_solver, kwargs)
-    return {"config_version": 2, "solver": merged_solver}
+    # AmgX reads communicator from its resource (top-level) scope. Accept the
+    # documented flat form and older solver-scoped form, but never silently
+    # ignore conflicting declarations. Keywords retain their usual precedence.
+    modes = [
+        scope.pop("communicator")
+        for scope in (merged_config, merged_solver)
+        if "communicator" in scope
+    ]
+    modes = [_communicator_mode(mode) for mode in modes]
+    if len(set(modes)) > 1:
+        raise ValueError("Conflicting communicator and solver.communicator settings")
+    solver_kwargs = kwargs.copy()
+    if "communicator" in solver_kwargs:
+        modes = [_communicator_mode(solver_kwargs.pop("communicator"))]
+    if modes:
+        merged_config["communicator"] = modes[0]
+    merged_config["solver"] = deep_merge(merged_solver, solver_kwargs)
+    return merged_config
+
+
+def _communicator_mode(value: Any) -> str:
+    if not isinstance(value, str) or value.upper() not in {"MPI", "MPI_DIRECT"}:
+        raise ValueError(
+            "Invalid AmgX config: communicator must be 'MPI' or 'MPI_DIRECT'."
+        )
+    return value.upper()
 
 
 def _merge_solver_with_defaults(
@@ -258,14 +281,8 @@ def validate_config(config: dict, *, mpi: bool = False, block_dim: int = 1) -> N
                     '"max_iters": 50} (the MPI block default).'
                 )
 
-    communicator = solver_block.get("communicator")
-    if communicator is not None and _as_upper(communicator) not in {
-        "MPI",
-        "MPI_DIRECT",
-    }:
-        raise ValueError(
-            "Invalid AmgX config: solver.communicator must be 'MPI' or 'MPI_DIRECT'."
-        )
+    if "communicator" in config:
+        _communicator_mode(config["communicator"])
 
     _require_positive(solver_block, "max_iters", "solver")
     _require_positive(solver_block, "tolerance", "solver")

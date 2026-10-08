@@ -111,6 +111,8 @@ Behavior (two modes):
 
 MPI cache capacity applies per communicator. Call `clear_solver_cache()` on
 every rank together; inconsistent caches cause the solve to fail on all ranks.
+Shared MPI resources are separate for each communicator, device, and transport
+mode; `finalize()` releases them.
 
 ### Solver setup reuse
 

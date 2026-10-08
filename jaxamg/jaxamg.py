@@ -223,6 +223,9 @@ def _amgx_solve_mpi_impl(
         reuse_setup=np.int32(reuse_setup),
         use_x0=np.int32(use_x0),
         block_dim=np.int32(block_dim),
+        device_mpi=np.int32(
+            json.loads(config_str or "{}").get("communicator", "MPI") == "MPI_DIRECT"
+        ),
     )
 
     return cast(tuple, results)

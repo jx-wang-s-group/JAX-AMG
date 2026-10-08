@@ -112,6 +112,7 @@ namespace
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
           .Attr<int32_t>("use_x0")                  // honor x0 initial guess
           .Attr<int32_t>("block_dim")               // BSR block size (1 = scalar CSR)
+          .Attr<int32_t>("device_mpi")              // resource transport identity
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -135,6 +136,7 @@ namespace
           .Attr<int32_t>("reuse_setup")             // skip warm resetup
           .Attr<int32_t>("use_x0")                  // honor x0 initial guess
           .Attr<int32_t>("block_dim")               // BSR block size (1 = scalar CSR)
+          .Attr<int32_t>("device_mpi")              // resource transport identity
   );
 
 #endif // JAXAMG_WITH_MPI

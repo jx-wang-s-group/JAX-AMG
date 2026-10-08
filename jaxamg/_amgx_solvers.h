@@ -467,7 +467,7 @@ namespace
       else
       {
         res.owns_resources = false;
-        res.rsrc = GlobalResources::Get().GetHandle(res.cfg);
+        res.rsrc = GlobalResources::Get().GetHandle(res.cfg, res.owns_config);
       }
 
       AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
@@ -663,7 +663,8 @@ namespace
                                          int32_t return_stats,
                                          int32_t reuse_setup,
                                          int32_t use_x0,
-                                         int32_t block_dim)
+                                         int32_t block_dim,
+                                         int32_t device_mpi)
   {
     if (transpose_solve != 0)
     {
@@ -859,7 +860,8 @@ namespace
       else
       {
         res.owns_resources = false;
-        res.rsrc = GlobalMPIResources::Get().GetHandle(res.cfg, mpi_comm, 1, &lrank_host);
+        res.rsrc = GlobalMPIResources::Get().GetHandle(
+            res.cfg, mpi_comm, lrank_host, device_mpi != 0, res.owns_config);
       }
       AMGX_SAFE_CALL(AMGX_matrix_create(&res.A, res.rsrc, Mode));
       AMGX_SAFE_CALL(AMGX_solver_create(&res.solver, res.rsrc, Mode, res.cfg));
@@ -1098,10 +1100,11 @@ namespace
                                      int32_t return_stats,
                                      int32_t reuse_setup,
                                      int32_t use_x0,
-                                     int32_t block_dim)
+                                     int32_t block_dim,
+                                     int32_t device_mpi)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim, device_mpi);
   }
 
   // MPI Double implementation
@@ -1121,10 +1124,11 @@ namespace
                                            int32_t return_stats,
                                            int32_t reuse_setup,
                                            int32_t use_x0,
-                                           int32_t block_dim)
+                                           int32_t block_dim,
+                                           int32_t device_mpi)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim, device_mpi);
   }
 
 #endif // JAXAMG_WITH_MPI
