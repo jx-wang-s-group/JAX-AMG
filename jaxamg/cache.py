@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from mpi4py.MPI import Comm
 
     from .mpi_utils import HaloPlan, TransposePlan
+    from .patterns import Pattern
 
 
 def _build_mpi_cache(
@@ -109,6 +110,7 @@ def with_cache(
     is_symmetric: bool = False,
     nullspace: ArrayLike | str | None = None,
     transpose_nullspace: ArrayLike | str | None = None,
+    pattern: "Pattern | None" = None,
 ) -> MatrixOrOperator:
     """
     Attach cached metadata (coloring, MPI info, symmetry, null spaces) to a matrix or operator.
@@ -125,13 +127,30 @@ def with_cache(
         nullspace: Default for `jaxamg.solve`'s `nullspace` (`"constant"`, a
                    vector, or an `(n, k)` array; local rows in MPI mode).
         transpose_nullspace: Default for `jaxamg.solve`'s `transpose_nullspace`.
+        pattern: A declared `jaxamg.Pattern`; exclusive with `coloring`.
 
     Returns:
         The same matrix/operator with requested cache attached.
     """
+    if pattern is not None:
+        if coloring is not None:
+            raise ValueError("pass either coloring or pattern, not both")
+        from .patterns import Pattern
+
+        if not isinstance(pattern, Pattern):
+            raise TypeError("pattern must be a jaxamg.Pattern")
+        coloring = pattern._coloring()
     if coloring is not None:
         try:
             object.__setattr__(A, "_coloring_info", coloring)
+            object.__setattr__(A, "_pattern", pattern)
+            # Explicit colouring replaces discovery at every precision.
+            discovered = getattr(coloring, "dtype", None)
+            object.__setattr__(
+                A,
+                "_coloring_by_dtype",
+                {} if discovered is None else {discovered: coloring},
+            )
         except Exception as e:
             raise TypeError(
                 f"Cannot attach coloring cache to object of type {type(A).__name__}. "

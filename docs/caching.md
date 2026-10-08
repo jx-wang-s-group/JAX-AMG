@@ -25,6 +25,9 @@ the library. It usually does not require user tuning, so it is not a focus here.
   metadata outside traced solve code.
 - This is object-level metadata attachment, not native AmgX-handle caching.
 
+Before JIT, call `cache_coloring(..., dtype=...)` for each solve precision.
+Recompute the colouring if new nonzero entries appear.
+
 When to use each option:
 
 - `coloring=...`
@@ -40,6 +43,15 @@ When to use each option:
       (opaque calls, data-dependent indexing). The tracing method follows
       [Hill & Dalle (2025)](https://arxiv.org/abs/2501.17737); their Julia package
       is [SparseConnectivityTracer.jl](https://github.com/adrhill/SparseConnectivityTracer.jl).
+
+- `pattern=...`
+    - Declare all possible couplings with `jaxamg.pattern(rows, cols, shape)`,
+      including entries that are zero initially but may appear later.
+    - Pass the same declaration to new callable instances as parameters change.
+      It covers all precisions used with those operators.
+    - The declaration copies its inputs into immutable arrays.
+      `pattern=` and `coloring=` are mutually exclusive. Attaching new colouring
+      replaces the old declaration and any discovered colourings.
 
 - `mpi=...`
     - This reuses MPI metadata such as counts, displacements, communicator pointer,
@@ -58,6 +70,25 @@ When to use each option:
     - Defaults for the arguments of the same name in `jaxamg.solve(...)`; see
       [Singular systems](examples.md#singular-systems).
     - In MPI mode also prepare the cached config with `cache_mpi_metadata(..., singular=True)`.
+
+### Reusing a declared pattern
+
+Create a pattern once outside JIT and reuse it as coefficients change:
+
+```python
+p = jaxamg.pattern(rows, cols, shape)
+
+@jax.jit
+def solve_at(coefficients, b):
+    op = jaxamg.with_cache(lambda x: apply_operator(coefficients, x), pattern=p)
+    return jaxamg.solve(op, b)[0]
+```
+
+Single-process solves reuse the pattern's layout while recomputing matrix values.
+Reuse the same `Pattern` object; a new equivalent pattern has its own cache.
+
+If your transpose callback materializes an operator, reuse a separate pattern for
+it. MPI, sharded solves, and colouring tuples do not use this layout cache.
 
 ## Native AmgX resource cache
 

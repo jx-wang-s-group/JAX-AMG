@@ -10,6 +10,20 @@ This page documents the public API of JAX-AMG.
         show_source: false
         heading_level: 3
 
+## Sparsity Patterns
+
+::: jaxamg.pattern
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
+::: jaxamg.Pattern
+    options:
+        show_root_heading: true
+        show_source: false
+        heading_level: 3
+
 ## Status Codes
 
 ::: jaxamg.AMGXStatus

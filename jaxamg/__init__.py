@@ -11,6 +11,7 @@ from .jaxamg import (
     solve,
 )
 from .nullspace import NullSpaceWarning
+from .patterns import Pattern, pattern
 from .preconditioners import make_lineax_preconditioner, make_preconditioner
 from .sharding import (
     ShardedMatrix,
@@ -26,6 +27,8 @@ __all__ = [
     "solve",
     "with_cache",
     "cache_coloring",
+    "Pattern",
+    "pattern",
     "cache_mpi_metadata",
     "ShardedMatrix",
     "ShardedSolve",

@@ -694,3 +694,42 @@ def test_sharded_nullspace(sharding_context, symmetric, monkeypatch):
             np.testing.assert_allclose(g2, g_ref, rtol=1e-6, atol=atol)
     finally:
         jax.config.update("jax_enable_x64", False)
+
+
+def test_sharded_operator_float64_precision(sharding_context):
+    """A float64 sharded solve through a rank-local operator is as accurate as
+    the float64 matrix."""
+    from test_mpi import _variable_coefficient_operator
+
+    comm, rank, nranks, mesh = sharding_context
+    jax.config.update("jax_enable_x64", True)
+    try:
+        grid = 16
+        n = grid * grid
+        op, dense = _variable_coefficient_operator(grid)
+        local_op, start, end = partition_operator(op, n, rank, nranks)
+        shape = (end - start, n)
+        local_op = jaxamg.with_cache(
+            local_op, coloring=jaxamg.cache_coloring(local_op, shape)
+        )
+        b_global = np.random.default_rng(1).standard_normal(n)
+        reference = np.linalg.solve(dense, b_global)
+        b = jaxamg.make_sharded_vector(
+            b_global[start:end], comm=comm, mesh=mesh, global_size=n
+        )
+        matrix = jaxamg.make_sharded_matrix(local_op, b, comm=comm, mesh=mesh)
+        config = {
+            "solver": "PCG",
+            "preconditioner": {"solver": "AMG", "max_iters": 1},
+            "tolerance": 1e-13,
+            "max_iters": 400,
+            "communicator": "MPI_DIRECT",
+        }
+        solver = jaxamg.make_sharded_solver(matrix, b, config=config)
+        for current_operator in (None, local_op):
+            with jax.set_mesh(mesh):
+                x, _ = solver(b, A=current_operator)
+            x = _gather_unpadded(x, solver, comm)
+            assert np.linalg.norm(x - reference) / np.linalg.norm(reference) < 1e-10
+    finally:
+        jax.config.update("jax_enable_x64", False)

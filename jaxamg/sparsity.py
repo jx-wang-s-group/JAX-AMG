@@ -1,22 +1,17 @@
 """Sparsity detection and assembly for matrix-free operators.
 
-Turns a callable operator ``A(x)`` into its sparse matrix: (1) detect the sparsity
-pattern, (2) colour the columns, (3) materialise the values with one operator
-evaluation per colour. ``cache_coloring`` orchestrates it, tries the two detection
-methods in order, and verifies the result -- so it is correct for ANY operator:
-
-- **Tracing** (``trace_sparsity_pattern``, in ``sparsity_tracing``): interpret the
-  operator's jaxpr to recover the exact global pattern in a single trace. Returns
-  ``None`` for operators that cannot be traced structurally.
-- **Probing** (``probe_sparsity_pattern``): exhaustive one-hot basis-vector
-  probing; the always-correct fallback when tracing is unavailable.
+``cache_coloring`` detects an operator's pattern at its current values (by
+tracing its jaxpr, else by one-hot probing), colours the columns, and
+materializes the values with one operator evaluation per colour. Entries that
+are zero at those values are dropped. Reuse a discovered pattern only while it
+covers every parameter value in use.
 """
 
 from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.experimental.sparse as jsp
@@ -34,21 +29,48 @@ from .sparsity_tracing import trace_sparsity_pattern
 _PROBE_BATCH_BYTES = 256 * 2**20
 
 
-def _probe_batch_size(m: int, n: int, out_itemsize: int) -> int:
+def _probe_dtype(dtype: Any = None) -> Any:
+    """The floating dtype of probe vectors: ``dtype``, else the default float."""
+    dtype = jnp.result_type(float) if dtype is None else jnp.dtype(dtype)
+    if not jnp.issubdtype(dtype, jnp.floating):
+        raise TypeError(f"probe dtype must be floating, got {dtype}")
+    return dtype
+
+
+class ColoringInfo(tuple):
+    """``(rows, cols, colors, n_colors, shape)`` from :func:`cache_coloring`,
+    remembering the input dtype the pattern was discovered at (``.dtype``).
+
+    It unpacks as the plain 5-tuple. A dtype-dependent operator can have a
+    different pattern at another dtype, so a solve at another dtype re-discovers
+    it (or, inside a trace, refuses). A plain tuple attached by the caller carries
+    no dtype and is used as given.
+    """
+
+    def __new__(cls, items: Any, dtype: Any):
+        info = super().__new__(cls, tuple(items))
+        info.dtype = jnp.dtype(dtype)
+        return info
+
+    def __reduce__(self):
+        return (ColoringInfo, (tuple(self), self.dtype))
+
+
+def _probe_batch_size(m: int, n: int, out_itemsize: int, in_itemsize: int = 4) -> int:
     """Initial batch size for one-hot probing from the device-memory budget.
 
-    Per-probe footprint estimate: the float32 one-hot input, the output, and up to
+    Per-probe footprint estimate: the one-hot input, the output, and up to
     two full-input-size intermediates at the output precision -- an operator
     partitioned from a global one (``global_op(x)[row_start:row_end]``) applies
     the global operator to the whole vector before slicing its rows. The batch
     size only sets the work per step: the (rows, cols) result is independent of it.
     """
-    per_probe = 4 * m + out_itemsize * (2 * m + n)
+    per_probe = in_itemsize * m + out_itemsize * (2 * m + n)
     return max(1, min(m, _PROBE_BATCH_BYTES // per_probe))
 
 
 def _probe_columns(
-    A_callable: Callable, shape: tuple[int, int], tol: float
+    A_callable: Callable, shape: tuple[int, int], tol: float | None, dtype: Any = None
 ) -> tuple[np.ndarray, np.ndarray]:
     """Exhaustive probing with one-hot basis vectors (correct for any operator).
 
@@ -57,13 +79,16 @@ def _probe_columns(
     budget, then halved on OOM. O(m) probes.
     """
     n, m = shape
+    # Probe at the intended input dtype (default: the default float), so a
+    # dtype-dependent operator is detected at the precision it will be solved at.
+    probe_dtype = _probe_dtype(dtype)
 
     # Batch the probes with vmap when the operator supports it; fall back to a
     # sequential lax.map for operators that have no vmap rule (e.g. pure_callback
     # / FFI), matching materialize_sparse_matrix. Decide once via a cheap
     # eval_shape, which trips the missing-vmap-rule error without executing.
     try:
-        jax.eval_shape(jax.vmap(A_callable), jax.ShapeDtypeStruct((1, m), jnp.float32))
+        jax.eval_shape(jax.vmap(A_callable), jax.ShapeDtypeStruct((1, m), probe_dtype))
         batched_A = jax.vmap(A_callable)
     except Exception:
 
@@ -72,21 +97,25 @@ def _probe_columns(
 
     # Output precision, for sizing the probe batches (worst case if unknown).
     try:
-        out_sds = jax.eval_shape(A_callable, jax.ShapeDtypeStruct((m,), jnp.float32))
+        out_sds = jax.eval_shape(A_callable, jax.ShapeDtypeStruct((m,), probe_dtype))
         out_itemsize = int(np.dtype(out_sds.dtype).itemsize)
     except Exception:
         out_itemsize = 8
 
     def _eval_batch(start: int, size: int) -> tuple[np.ndarray, np.ndarray]:
         indices = jnp.arange(start, start + size)
-        basis = jax.nn.one_hot(indices, m, dtype=jnp.float32)  # (size, m)
+        basis = jax.nn.one_hot(indices, m, dtype=probe_dtype)  # (size, m)
         out = batched_A(basis)  # (size, n)
         if out.shape != (size, n):
             raise ValueError(
                 f"Operator returned shape {out.shape}, expected ({size}, {n})."
             )
         # out[c, i] = A(e_{start+c})[i] = A[i, start + c].
-        col_local, row = np.where(np.abs(np.array(out)) > tol)
+        # Every exact nonzero is kept by default: a scale-free test, since an
+        # absolute threshold drops all entries of an operator whose coefficients
+        # are small (physical units, dt*nu). Extra entries only cost colours.
+        values = np.abs(np.array(out))
+        col_local, row = np.where(values != 0 if tol is None else values > tol)
         return row.astype(np.int32), (start + col_local).astype(np.int32)
 
     def _run(batch_size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -102,7 +131,7 @@ def _probe_columns(
         s = str(e).lower()
         return "resource exhausted" in s or "out of memory" in s or "oom" in s
 
-    batch_size = _probe_batch_size(m, n, out_itemsize)
+    batch_size = _probe_batch_size(m, n, out_itemsize, np.dtype(probe_dtype).itemsize)
     result: tuple[np.ndarray, np.ndarray] | None = None
     while result is None and batch_size >= 1:
         try:
@@ -126,7 +155,8 @@ def _probe_columns(
 def probe_sparsity_pattern(
     A_callable: Callable,
     shape: tuple[int, int],
-    tol: float = 1e-10,
+    tol: float | None = None,
+    dtype: Any = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Determine the sparsity pattern of a linear operator by one-hot probing.
 
@@ -137,12 +167,15 @@ def probe_sparsity_pattern(
     for any operator; this is the fallback used when jaxpr tracing is unavailable
     (opaque or data-dependent operators).
 
+    Probes use ``dtype`` (default: the default float dtype). ``tol=None`` keeps every exact
+    nonzero; a number keeps ``|a| > tol`` (absolute, so scale-dependent).
+
     Must be run outside of JIT compilation. Returns (rows, cols).
     """
     n, m = shape
     if n == 0 or m == 0:
         return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
-    return _probe_columns(A_callable, shape, tol)
+    return _probe_columns(A_callable, shape, tol, dtype)
 
 
 # --- Column coloring and value materialization ---
@@ -216,6 +249,36 @@ def get_column_coloring(
     return colors, color_id
 
 
+def csr_structure(
+    rows: np.ndarray, cols: np.ndarray, n_rows: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Host-side CSR order of a (rows, cols) pattern: ``(rows_sorted,
+    cols_sorted, indptr)``, the structure `materialize_sparse_matrix` returns."""
+    # A pattern already in CSR order (row, then column, nondecreasing) is its own
+    # stable sort: checking is O(nnz), the sort O(nnz log nnz). Only the
+    # permutation is skipped; the gathers below return new arrays as before.
+    r, c = np.asarray(rows), np.asarray(cols)
+    ordered = r.size < 2 or bool(
+        np.all((r[1:] > r[:-1]) | ((r[1:] == r[:-1]) & (c[1:] >= c[:-1])))
+    )
+    order = np.arange(r.size) if ordered else np.lexsort((cols, rows))
+    rows_sorted = rows[order]
+    cols_sorted = cols[order]
+    indptr = np.zeros(int(n_rows) + 1, dtype=np.int32)
+    indptr[1:] = np.cumsum(np.bincount(rows_sorted, minlength=int(n_rows)))
+    return rows_sorted, cols_sorted, indptr
+
+
+class _MaterializationLayout(NamedTuple):
+    """Concrete structural operands shared by materializations of one Pattern."""
+
+    rows: jax.Array
+    cols: jax.Array
+    entry_colors: jax.Array
+    indptr: jax.Array
+    column_colors: jax.Array
+
+
 def materialize_sparse_matrix(
     A_callable: Callable,
     shape: tuple[int, int],
@@ -223,6 +286,9 @@ def materialize_sparse_matrix(
     cols: ArrayLike,
     column_colors: ArrayLike,
     n_colors: int,
+    dtype: Any = None,
+    *,
+    _layout: _MaterializationLayout | None = None,
 ) -> jsp.BCSR:
     """
     Materialize the values of a sparse matrix inside JIT using graph coloring.
@@ -235,6 +301,11 @@ def materialize_sparse_matrix(
         rows, cols: Fixed sparsity pattern indices (JAX or Numpy arrays).
         column_colors: Array mapping column index to color ID.
         n_colors: Number of colors.
+        dtype: Floating dtype of the probe vectors, i.e. of the unknowns the
+            operator is applied to (the solvers pass the RHS dtype). Defaults to
+            the default float dtype (float64 under ``jax_enable_x64``). An
+            operator whose arithmetic follows its input dtype is materialized at
+            this precision.
 
     Returns:
         A_bcsr: jax.experimental.sparse.BCSR matrix containing the values from A_callable.
@@ -247,20 +318,24 @@ def materialize_sparse_matrix(
     # lexsort inside JIT (which dominates compile time at scale). Only the values
     # (the operator evaluations) stay traced. Falls back to the JAX path if the
     # indices arrive as tracers (not the normal case).
-    try:
-        rows_np = np.asarray(rows).astype(np.int32)
-        cols_np = np.asarray(cols).astype(np.int32)
-        colors_np = np.asarray(column_colors).astype(np.int32)
-        static = True
-    except Exception:
-        static = False
-
-    column_colors = jnp.array(column_colors, dtype=jnp.int32)
+    static = False
+    if _layout is None:
+        try:
+            rows_np = np.asarray(rows).astype(np.int32)
+            cols_np = np.asarray(cols).astype(np.int32)
+            colors_np = np.asarray(column_colors).astype(np.int32)
+            static = True
+        except Exception:
+            pass
+        column_colors = jnp.array(column_colors, dtype=jnp.int32)
+    else:
+        column_colors = _layout.column_colors
+    probe_dtype = _probe_dtype(dtype)
 
     def evaluate_color(color_id: ArrayLike) -> jax.Array:
         # Create probe vector v_c such that v_c[j] = 1 if color[j] == c, else 0
         mask = column_colors == color_id
-        v = mask.astype(jnp.float32)
+        v = mask.astype(probe_dtype)
         w = A_callable(v)
         return w
 
@@ -268,14 +343,14 @@ def materialize_sparse_matrix(
     # Use lax.map instead of vmap to support primitives without batching rules (e.g. CSR matvec)
     w_matrix = jax.lax.map(evaluate_color, jnp.arange(n_colors))
 
+    if _layout is not None:
+        values = w_matrix[_layout.entry_colors, _layout.rows]
+        return jsp.BCSR((values, _layout.cols, _layout.indptr), shape=shape)
+
     if static:
         # Host-side static CSR construction; only `values_sorted` is traced.
-        order = np.lexsort((cols_np, rows_np))
-        rows_sorted = rows_np[order]
-        cols_sorted_np = cols_np[order]
+        rows_sorted, cols_sorted_np, indptr_np = csr_structure(rows_np, cols_np, int(n))
         colors_for_cols_sorted = colors_np[cols_sorted_np]
-        indptr_np = np.zeros(int(n) + 1, dtype=np.int32)
-        indptr_np[1:] = np.cumsum(np.bincount(rows_sorted, minlength=int(n)))
         values_sorted = w_matrix[
             jnp.asarray(colors_for_cols_sorted), jnp.asarray(rows_sorted)
         ]
@@ -300,14 +375,18 @@ def materialize_sparse_matrix(
 
 # --- Verification and orchestration (cache_coloring) ---
 def _drop_zeros(
-    A_bcsr: jsp.BCSR, tol: float = 1e-9
+    A_bcsr: jsp.BCSR, tol: float | None = None
 ) -> tuple[jsp.BCSR, np.ndarray, np.ndarray]:
-    """Return (BCSR, rows, cols) with near-zero entries removed."""
+    """Return (BCSR, rows, cols) without the numerically zero entries.
+
+    ``tol=None`` removes exact zeros only (a vanishing coefficient); an absolute
+    threshold would also remove every entry of a small-scale operator.
+    """
     data = np.asarray(A_bcsr.data)
     indices = np.asarray(A_bcsr.indices)
     indptr = np.asarray(A_bcsr.indptr)
     n_rows = A_bcsr.shape[0]
-    keep = np.abs(data) > tol
+    keep = data != 0 if tol is None else np.abs(data) > tol
     row_of = np.repeat(np.arange(n_rows, dtype=np.int32), np.diff(indptr))
     new_indptr = np.zeros(n_rows + 1, dtype=np.int32)
     new_indptr[1:] = np.cumsum(np.bincount(row_of[keep], minlength=n_rows))
@@ -323,7 +402,11 @@ def _drop_zeros(
 
 
 def _verify_recovery(
-    operator: Callable, A_bcsr: jsp.BCSR, n_global: int, n_check: int = 5
+    operator: Callable,
+    A_bcsr: jsp.BCSR,
+    n_global: int,
+    n_check: int = 5,
+    dtype: Any = None,
 ) -> bool:
     """Check the recovered matrix reproduces the operator on random vectors.
 
@@ -331,14 +414,11 @@ def _verify_recovery(
     translation-invariant, or boundary couplings were not captured) then
     (A_bcsr - A) v != 0 for almost every v, so a few random probes catch it.
 
-    Probes follow the configured precision -- float64 when x64 is enabled (as in
-    the distributed solvers), float32 otherwise -- with the tolerance loosened to
-    match, so it neither warns about an unavailable dtype nor false-rejects a
-    correct float32 recovery.
+    Test vectors use the discovery dtype (default: the default float), with the
+    tolerance loosened for float32 so a correct float32 recovery is not rejected.
     """
-    x64 = jax.config.jax_enable_x64
-    dtype = jnp.float64 if x64 else jnp.float32
-    tol = 1e-6 if x64 else 1e-4
+    dtype = _probe_dtype(dtype)
+    tol = 1e-6 if dtype == jnp.float64 else 1e-4
     key = jax.random.PRNGKey(0)
     for _ in range(n_check):
         key, sub = jax.random.split(key)
@@ -351,15 +431,13 @@ def _verify_recovery(
 
 
 def _try_trace_coloring(
-    operator: Callable, n_local: int, n_global: int
+    operator: Callable, n_local: int, n_global: int, dtype: Any = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, tuple[int, int]] | None:
-    """Exact sparsity from the operator's jaxpr (no probing), VERIFIED against the
-    operator. Works for any JAX-expressed operator; returns None for operators
-    that can't be traced structurally (opaque calls, data-dependent indexing),
-    so the caller falls back to the probing detector.
-    """
+    """Sparsity from the operator's jaxpr (no probing), zero-dropped at its
+    current values and checked numerically; None when the operator cannot be
+    traced (opaque calls, data-dependent indexing), so the caller probes."""
     try:
-        pattern = trace_sparsity_pattern(operator, (n_local, n_global))
+        pattern = trace_sparsity_pattern(operator, (n_local, n_global), dtype=dtype)
         if pattern is None:
             return None
         rows, cols = pattern
@@ -367,70 +445,128 @@ def _try_trace_coloring(
             return None
         column_colors, n_colors = get_column_coloring(rows, cols, (n_local, n_global))
         A = materialize_sparse_matrix(
-            operator, (n_local, n_global), rows, cols, column_colors, n_colors
+            operator,
+            (n_local, n_global),
+            rows,
+            cols,
+            column_colors,
+            n_colors,
+            dtype=dtype,
         )
-        # The pattern is exact; drop_zeros only removes structurally-present but
-        # numerically-zero entries (e.g. a vanishing variable coefficient), and
-        # verify is the safety net in case a transfer rule is wrong.
+        # Entries zero at these values are dropped; the recovery check catches
+        # a wrong transfer rule.
         A, final_rows, final_cols = _drop_zeros(A)
-        if not _verify_recovery(operator, A, n_global):
+        if not _verify_recovery(operator, A, n_global, dtype=dtype):
             return None
         return (final_rows, final_cols, column_colors, n_colors, (n_local, n_global))
     except Exception:
         return None  # any failure -> probing fallback (correctness preserved)
 
 
+def _dtype_matches(info: Any, dtype: Any) -> bool:
+    """Whether a colouring may be used at ``dtype``: it carries no dtype (a plain
+    tuple from the caller) or the same one. An explicit ``is None`` test: NumPy
+    compares ``np.dtype('float64') == None`` as True."""
+    discovered = getattr(info, "dtype", None)
+    return discovered is None or jnp.dtype(discovered) == jnp.dtype(dtype)
+
+
 def cache_coloring(
     operator: Any,
     shape: tuple[int, int] | int,
+    dtype: Any = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, tuple[int, int]]:
     """
     Compute and cache coloring information for a callable operator.
 
-    Detection uses two methods, so the result is correct for ANY operator:
-
-    1. Tracing: interpret the operator's jaxpr to recover the EXACT sparsity in
-       a single trace (no probing), then colour and materialise it. Works for any
-       JAX-expressed operator; skipped for operators that can't be traced
-       structurally (opaque calls, data-dependent indexing).
-    2. Probing (``probe_sparsity_pattern`` + ``get_column_coloring``): exhaustive
-       one-hot basis-vector probing, correct for any operator -- the fallback when
-       tracing is unavailable.
+    The pattern is discovered for the operator's current values at ``dtype``:
+    by tracing its jaxpr, else by one-hot probing (opaque calls, data-dependent
+    indexing). Entries that are zero at these values are dropped, so reuse the
+    colouring only while that pattern covers every parameter value used;
+    declare it with ``with_cache(..., pattern=...)`` when couplings can appear
+    later.
 
     Args:
         operator: A callable operator A(x) that returns ``A @ x``.
         shape: Shape of the operator (n, m) or int size (for an n×n matrix). For a
             distributed operator this is the local block ``(n_local, n_global)``.
+        dtype: Floating dtype of the unknowns the operator will be applied to
+            (default: the default float dtype). Discovery runs at this dtype, so a
+            dtype-dependent operator gets the pattern it has at that precision.
 
     Returns:
-        Cached coloring information for reattachment with ``with_cache(..., coloring=...)``.
+        A :class:`ColoringInfo`: the 5-tuple ``(rows, cols, colors, n_colors,
+        shape)`` for reattachment with ``with_cache(..., coloring=...)``, carrying
+        the discovery ``dtype``. Results are cached on the operator per dtype.
     """
-    if isinstance(shape, int):
-        shape = (shape, shape)
+    dimensions: Any = (shape, shape) if np.ndim(shape) == 0 else shape
+    # Static integers (a size computed with jnp, e.g. jnp.prod(grid.shape), must
+    # not reach jitted comparisons as an array).
+    n_local, n_global = (int(s) for s in dimensions)
+    shape = (n_local, n_global)
+    dtype = _probe_dtype(dtype)
 
     existing_cache = getattr(operator, "_coloring_info", None)
-    if existing_cache is not None:
-        cached_shape = existing_cache[4]
-        if cached_shape == shape:
-            return existing_cache
+    if existing_cache is not None and existing_cache[4] != shape:
         raise ValueError(
-            f"Operator already has cached coloring for shape {cached_shape}, "
+            f"Operator already has cached coloring for shape {existing_cache[4]}, "
             f"but requested shape {shape}. Create a new operator instance."
         )
+    by_dtype = dict(getattr(operator, "_coloring_by_dtype", None) or {})
+    if dtype in by_dtype:
+        return by_dtype[dtype]
+    # A colouring attached without a dtype (a plain tuple) is used as given.
+    if existing_cache is not None and _dtype_matches(existing_cache, dtype):
+        return existing_cache
 
     n_local, n_global = shape
 
     # 1. Tracing (exact, any JAX operator). 2. Probing (any operator). Tracing
     # verifies before being accepted; probing is exact by construction.
-    cache = _try_trace_coloring(operator, n_local, n_global)
+    cache = _try_trace_coloring(operator, n_local, n_global, dtype)
     if cache is None:
-        rows, cols = probe_sparsity_pattern(operator, shape)
+        rows, cols = probe_sparsity_pattern(operator, shape, dtype=dtype)
         column_colors, n_colors = get_column_coloring(rows, cols, shape)
         cache = (rows, cols, column_colors, n_colors, shape)
+    cache = ColoringInfo(cache, dtype)
 
+    by_dtype[dtype] = cache
     try:
         setattr(operator, "_coloring_info", cache)
+        setattr(operator, "_coloring_by_dtype", by_dtype)
     except Exception:
         pass
 
     return cache
+
+
+def coloring_for(
+    operator: Any, shape: tuple[int, int], dtype: Any, traced: bool
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, tuple[int, int]]:
+    """The colouring to materialize ``operator`` at ``dtype``.
+
+    Uses the operator's cached colouring when it was discovered at ``dtype`` (or
+    carries no dtype). Otherwise discovers it at ``dtype``, which needs concrete
+    execution: inside a trace a missing or mismatched colouring is refused, since
+    a dtype-dependent operator can have a different pattern at another dtype.
+    """
+    dtype = _probe_dtype(dtype)
+    by_dtype = getattr(operator, "_coloring_by_dtype", None) or {}
+    if dtype in by_dtype:
+        return by_dtype[dtype]
+    info = getattr(operator, "_coloring_info", None)
+    if info is not None and _dtype_matches(info, dtype):
+        return info
+    if traced:
+        if info is None:
+            raise ValueError(
+                "Callable operators must be pre-scanned before JIT compilation to "
+                "determine sparsity.\nCall solve(A, b) once outside of JIT to "
+                "compute and cache the sparsity pattern."
+            )
+        raise ValueError(
+            f"the operator's cached colouring was discovered at {info.dtype}, but "
+            f"this solve applies it to {dtype} unknowns; call "
+            f"jaxamg.cache_coloring(op, shape, dtype={dtype}) outside of JIT first"
+        )
+    return cache_coloring(operator, shape, dtype=dtype)

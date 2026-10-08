@@ -219,7 +219,7 @@ def to_bcsr_matrix(
     # 1. Handle Callables (materialize via graph coloring)
     if callable(A):
         A = cast(Callable, A)
-        from .sparsity import cache_coloring, materialize_sparse_matrix
+        from .sparsity import coloring_for, materialize_sparse_matrix
 
         # Check for cached coloring info attached to the callable
         cached_info = getattr(A, "_coloring_info", None)
@@ -245,27 +245,34 @@ def to_bcsr_matrix(
             shape = (n_rows, n_rows)
 
         is_jit = isinstance(b, core.Tracer)
+        probe_dtype = get_preferred_dtype(None, b)
 
-        if cached_info is None:
-            if is_jit:
-                # Inside JIT without cache: Impossible to determine sparsity dynamically.
-                raise ValueError(
-                    "Callable operators must be pre-scanned before JIT compilation to determine sparsity.\n"
-                    "Call solve(A, b) once outside of JIT to compute and cache the sparsity pattern."
-                )
-
-            # Outside JIT: detect the sparsity + colouring via cache_coloring,
-            # which traces the operator's jaxpr (exact, in one trace) and falls
-            # back to one-hot probing only when tracing is unavailable. It also
-            # attaches `_coloring_info` to A for reuse.
-            cached_info = cache_coloring(A, shape)
+        # The colouring discovered at the solve's precision: cached, or (outside
+        # JIT) detected via cache_coloring -- the operator's jaxpr traced
+        # (exact, in one trace), with one-hot probing as the fallback -- at that
+        # dtype. Inside JIT a missing or other-dtype colouring is refused.
+        cached_info = coloring_for(A, shape, probe_dtype, traced=is_jit)
 
         rows, cols, column_colors, n_colors, _ = cached_info
 
+        # MPI uses int64 global columns and its own routing/layout conventions.
+        # Only the single-device int32 path captures Pattern-owned JAX arrays.
+        declared = None if use_int64_indices else getattr(A, "_pattern", None)
+        layout = None if declared is None else declared._materialization_layout()
+
         # Materialize using graph coloring (works efficiently inside JIT)
         # Note: materialize_sparse_matrix already returns a BCSR
+        # Probe in the solve's precision (float64 for a float64 RHS), so the
+        # matrix is not rounded to float32 before the solve promotes it.
         A_bcsr = materialize_sparse_matrix(
-            A, shape, rows, cols, column_colors, n_colors
+            A,
+            shape,
+            rows,
+            cols,
+            column_colors,
+            n_colors,
+            dtype=probe_dtype,
+            _layout=layout,
         )
 
     # 2. Convert to BCSR from other formats

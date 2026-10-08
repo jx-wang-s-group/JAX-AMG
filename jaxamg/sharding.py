@@ -1269,6 +1269,17 @@ def make_sharded_solver(
         """This rank's padded values of ``A_local`` in the packed layout."""
         if callable(A_local):
             info = getattr(A_local, "_coloring_info", None) or coloring
+            discovered = getattr(info, "dtype", None)
+            if discovered is not None and discovered != A_data.dtype:
+                by_dtype = getattr(A_local, "_coloring_by_dtype", None) or {}
+                info = by_dtype.get(jnp.dtype(A_data.dtype))
+                if info is None:
+                    raise ValueError(
+                        f"A's colouring was discovered at {discovered}, but this "
+                        f"solver's values are {A_data.dtype}; attach "
+                        "jaxamg.cache_coloring(op, shape=(n_local, n_global), "
+                        f"dtype={A_data.dtype})"
+                    )
             if info is None:
                 raise ValueError(
                     "A is a matrix-free operator without coloring information; "
@@ -1285,7 +1296,7 @@ def make_sharded_solver(
             from .sparsity import materialize_sparse_matrix
 
             values = materialize_sparse_matrix(
-                A_local, shape, rows, cols, column_colors, n_colors
+                A_local, shape, rows, cols, column_colors, n_colors, dtype=A_data.dtype
             ).data
         else:
             matrix = to_bcsr_matrix(
