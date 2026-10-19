@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 
 import jax
 import jax.experimental.sparse as jsp
@@ -23,6 +24,70 @@ from jaxamg.mpi_utils import (
     partition_vector,
     validate_partition,
 )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_mpi_lowerings_construct_typed_results(dtype, monkeypatch):
+    import importlib
+
+    from jax.interpreters import mlir
+
+    from jaxamg.transport import _lowering
+    from jaxamg.utils import temp_enable_x64
+
+    solver = importlib.import_module("jaxamg.jaxamg")
+    monkeypatch.setattr(solver, "mpi_ordered_effect", lambda: None)
+    arrays = (
+        np.array([0, 2, 3], np.int32),
+        np.array([0, 1, 1], np.int32),
+        np.ones(3, dtype),
+        np.ones(2, dtype),
+        np.zeros(2, dtype),
+    )
+    output_avals = (
+        jax.core.ShapedArray((2,), dtype),
+        jax.core.ShapedArray((5,), dtype),
+    )
+    with temp_enable_x64(), mlir.make_ir_context(), mlir.ir.Location.unknown():
+        module = mlir.ir.Module.create()
+        with mlir.ir.InsertionPoint(module.body):
+            context = SimpleNamespace(
+                avals_in=[
+                    jax.core.ShapedArray(value.shape, value.dtype) for value in arrays
+                ],
+                avals_out=output_avals,
+            )
+            outputs = solver._amgx_mpi_lowering(
+                context,
+                *(mlir.ir_constant(value) for value in arrays),
+                res_history_len=2,
+                ordered=False,
+                config="{}",
+            )
+            element = "f32" if dtype == np.float32 else "f64"
+            assert [str(output.type) for output in outputs] == [
+                f"tensor<2x{element}>",
+                f"tensor<5x{element}>",
+            ]
+
+            keepalive = []
+            plan = SimpleNamespace(plan_id=1)
+            context = SimpleNamespace(
+                avals_out=[jax.core.ShapedArray((4,), np.int64)],
+                module_context=SimpleNamespace(add_keepalive=keepalive.append),
+            )
+            (output,) = _lowering(
+                context,
+                mlir.ir_constant(np.ones(3, np.int64)),
+                plan=plan,
+                reverse=False,
+                out_size=4,
+                ordered=False,
+                device_buffers=False,
+            )
+            assert str(output.type) == "tensor<4xi64>"
+            assert keepalive == [plan]
+        assert module.operation.verify()
 
 
 @pytest.fixture

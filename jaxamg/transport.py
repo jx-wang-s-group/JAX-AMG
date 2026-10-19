@@ -228,6 +228,13 @@ def owners_of(ids: np.ndarray, offsets: np.ndarray) -> np.ndarray:
 exchange_p = core.Primitive("jaxamg_neighbour_exchange")
 
 
+def tensor_type(aval):
+    """The MLIR tensor type of a shaped value, built from its shape and dtype
+    (the same in every supported JAX: aval_to_ir_type takes a module context
+    from JAX 0.10)."""
+    return mlir.ir.RankedTensorType.get(aval.shape, mlir.dtype_to_ir_type(aval.dtype))
+
+
 def mpi_ordered_effect():
     """mpi4jax's ordered effect. Communicating primitives in per-rank programs
     carry it, so their calls and mpi4jax's collectives run in one program
@@ -259,7 +266,7 @@ def _lowering(ctx, x, *, plan, reverse, out_size, ordered, device_buffers):
     token = ctx.tokens_in.get(mpi_ordered_effect()) if ordered else hlo.create_token()
     call = _custom_call(
         _TARGET,
-        result_types=[mlir.aval_to_ir_type(ctx.avals_out[0]), hlo.TokenType.get()],
+        result_types=[tensor_type(ctx.avals_out[0]), hlo.TokenType.get()],
         operands=[x, token],
         backend_config={
             "plan_id": mlir.ir_attribute(np.int64(plan.plan_id)),

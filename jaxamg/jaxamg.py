@@ -39,7 +39,7 @@ from .nullspace import (
     verify_nullspace,
     warn_if_singular,
 )
-from .transport import halo_gather, mpi_ordered_effect
+from .transport import halo_gather, mpi_ordered_effect, tensor_type
 from .utils import *
 
 if TYPE_CHECKING:
@@ -202,8 +202,7 @@ def _amgx_mpi_lowering(ctx, *operands, res_history_len, ordered, config, **param
     attrs.update({k: mlir.ir_attribute(np.int32(v)) for k, v in params.items()})
     call = _custom_call(
         target,
-        result_types=[mlir.aval_to_ir_type(a) for a in ctx.avals_out]
-        + [hlo.TokenType.get()],
+        result_types=[tensor_type(a) for a in ctx.avals_out] + [hlo.TokenType.get()],
         operands=[*operands, token],
         backend_config=attrs,
         api_version=4,
