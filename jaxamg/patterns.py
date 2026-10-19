@@ -89,9 +89,9 @@ class Pattern:
         entry_colors = colors[cols]
         if np.any(entry_colors < 0):
             raise ValueError("every used column must have a nonnegative color")
-        order = np.lexsort((entry_colors, rows))
-        r, c = rows[order], entry_colors[order]
-        if np.any((r[1:] == r[:-1]) & (c[1:] == c[:-1])):
+        # One (row, color) key per entry: a repeated key is two columns of one color in a row.
+        keys = np.sort(rows.astype(np.int64) * n_colors + entry_colors)
+        if np.any(keys[1:] == keys[:-1]):
             raise ValueError("columns sharing a row must have different colors")
         for name, value in (("rows", rows), ("cols", cols), ("colors", colors)):
             object.__setattr__(self, name, _immutable(value))

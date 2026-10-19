@@ -1296,6 +1296,8 @@ def solve(
             def basis_max(value):
                 return mpi4jax.allreduce(value, op=MPI.MAX, comm=comm_obj)
 
+        # Keeps XLA from constant-folding reductions of a concrete basis (slow for large n).
+        N, M = jax.lax.optimization_barrier((N, M))
         N, M = unit_bases((N, M), basis_max)
     if N is None and M is None:
         warn_if_singular(A_csr, comm=comm_obj, stacklevel=3)

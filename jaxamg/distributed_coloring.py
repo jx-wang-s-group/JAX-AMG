@@ -234,11 +234,15 @@ def _validate_coloring(indptr, colors):
     for a, b in _row_batches(indptr):
         lo, hi = indptr[a], indptr[b]
         # Caller supplies colours corresponding to canonical indices.
-        rows = np.repeat(np.arange(b - a), np.diff(indptr[a : b + 1]))
-        cs = colors[lo:hi]
-        order = np.lexsort((cs, rows))
-        r, c = rows[order], cs[order]
-        if np.any(c < 0) or np.any((r[1:] == r[:-1]) & (c[1:] == c[:-1])):
+        cs = colors[lo:hi].astype(np.int64)
+        if np.any(cs < 0):
+            return False
+        if not cs.size:
+            continue
+        rows = np.repeat(np.arange(b - a, dtype=np.int64), np.diff(indptr[a : b + 1]))
+        # One (row, colour) key per entry: a repeated key is two columns of one colour in a row.
+        keys = np.sort(rows * (int(cs.max()) + 1) + cs)
+        if np.any(keys[1:] == keys[:-1]):
             return False
     return True
 
