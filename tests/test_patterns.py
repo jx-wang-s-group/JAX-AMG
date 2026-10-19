@@ -213,6 +213,45 @@ def test_halo_operator_without_ghosts():
     np.testing.assert_array_equal(np.asarray(matrix.data), [2, 2])
 
 
+@pytest.mark.parametrize("shape", [(1, 3), (2, 2), (2, 4)])
+def test_halo_operator_rejects_mismatched_pattern(shape):
+    declaration = jaxamg.pattern([], [], shape)
+    with pytest.raises(ValueError, match="pattern shape"):
+        jaxamg.halo_operator(
+            lambda own, ghost: own,
+            n_local=2,
+            ghost_ids=[0],
+            pattern=declaration,
+        )
+
+
+def test_halo_operator_reuses_declared_pattern(monkeypatch):
+    import jaxamg.sparsity as sparsity
+
+    declaration = jaxamg.pattern(
+        [0, 0, 1], [0, 2, 1], (2, 3), colors=[0, 0, 1], n_colors=2
+    )
+
+    def fn(scale):
+        return lambda own, ghost: own + scale * jnp.array([ghost[0], 0])
+
+    op = jaxamg.halo_operator(fn(0.0), n_local=2, ghost_ids=[0], pattern=declaration)
+    assert op.with_fn(fn(1.0)).combined._pattern is declaration
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("a declared pattern must not be rediscovered")
+
+    monkeypatch.setattr(sparsity, "cache_coloring", unexpected)
+
+    def values(scale):
+        matrix = op.with_fn(fn(scale))._local_matrix(2, 5, jnp.float32, traced=True)
+        return matrix.data.sum(), matrix.data
+
+    (total, data), gradient = jax.jit(jax.value_and_grad(values, has_aux=True))(2.0)
+    np.testing.assert_array_equal(data, [2, 1, 1])
+    assert total == 4 and gradient == 1
+
+
 def test_halo_operator_owns_ghost_ids_and_validates_inputs():
     ids = np.array([8, 10], np.int64)
     op = jaxamg.halo_operator(lambda own, ghost: own, n_local=3, ghost_ids=ids)

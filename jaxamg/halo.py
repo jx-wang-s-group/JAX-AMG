@@ -56,13 +56,18 @@ class HaloOperator:
 
             # A declared pattern in the combined slot space.
             self.combined = with_cache(combined, pattern=pattern)
+            if pattern.shape != self.combined_shape:
+                raise ValueError(
+                    f"pattern shape {pattern.shape} must match halo operator shape "
+                    f"{self.combined_shape}"
+                )
 
     def with_fn(self, fn: Callable[[jax.Array, jax.Array], jax.Array]) -> HaloOperator:
         """The same structure with another function (new parameters): the
         colouring discovered or declared for this operator carries over, so it
         is found once, eagerly, and reused inside traced solves."""
         other = HaloOperator(fn, self.n_local, self.ghost_ids)
-        for attr in ("_coloring_info", "_coloring_by_dtype"):
+        for attr in ("_pattern", "_coloring_info", "_coloring_by_dtype"):
             if hasattr(self.combined, attr):
                 setattr(other.combined, attr, getattr(self.combined, attr))
         return other
