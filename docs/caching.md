@@ -132,6 +132,16 @@ new values; if coefficients change enough, convergence may require more
 iterations or become less robust. If that happens, call
 `jaxamg.clear_solver_cache()` to force the next solve to build a fresh hierarchy.
 
+### Checkpointing (`jax.checkpoint`)
+
+Checkpointing single-GPU solves requires JAX 0.11.1 or later. Older versions
+reject their cache side effect (`FfiEffect`). The sharded MPI solver
+(`make_sharded_solver`) declares no such effect and supports checkpointing on
+older JAX versions too.
+
+With `reuse_setup=True`, recomputed solves use the currently cached hierarchy,
+which may differ from the one used in the forward pass.
+
 ## Cache inspection
 
 Use `jaxamg.get_solver_cache_info()` for inspecting current solver cache state, which includes:
