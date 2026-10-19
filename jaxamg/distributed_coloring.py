@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from .patterns import _column_colors, _validate_row_colors
+
 if TYPE_CHECKING:
     from mpi4py.MPI import Comm
 
@@ -235,14 +237,12 @@ def _validate_coloring(indptr, colors):
         lo, hi = indptr[a], indptr[b]
         # Caller supplies colours corresponding to canonical indices.
         cs = colors[lo:hi].astype(np.int64)
-        if np.any(cs < 0):
-            return False
         if not cs.size:
             continue
         rows = np.repeat(np.arange(b - a, dtype=np.int64), np.diff(indptr[a : b + 1]))
-        # One (row, colour) key per entry: a repeated key is two columns of one colour in a row.
-        keys = np.sort(rows * (int(cs.max()) + 1) + cs)
-        if np.any(keys[1:] == keys[:-1]):
+        try:
+            _validate_row_colors(rows, cs, int(cs.max()) + 1)
+        except ValueError:
             return False
     return True
 
@@ -289,12 +289,17 @@ def distributed_coloring(
     comm: Comm,
     *,
     seed: int = 0,
+    colors: np.ndarray | None = None,
+    n_colors: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Collectively colour CSR columns, returning owned and per-entry colours.
 
     Priorities depend only on global column IDs and seed. Only row incidences
     and ghost columns are stored; no global or expanded column-conflict graph
     is built. New boundary colours travel only to ranks that requested them.
+    Alternatively, every rank supplies ``colors`` for its owned columns and
+    the same ``n_colors``. These are checked collectively, with remote colours
+    obtained from their owners; automatic assignment is then skipped.
     """
     from mpi4py import MPI
 
@@ -304,14 +309,30 @@ def distributed_coloring(
     rank = comm.Get_rank()
     original, ptr, offsets = _validated_csr(indices, indptr, row_counts, tcomm)
     first, last = int(offsets[rank]), int(offsets[rank + 1])
-    indices, indptr = _canonical_rows(original, ptr)
-    edges, edge_ptr = _exchange_rows(indices, indptr, offsets, comm)
-    remote = np.concatenate(
-        (
-            edges[(edges < first) | (edges >= last)],
-            indices[(indices < first) | (indices >= last)],
+    try:
+        if colors is None and n_colors is None:
+            count = -1
+        elif colors is None or n_colors is None:
+            raise ValueError
+        else:
+            colors, n_colors = _column_colors(colors, n_colors, last - first)
+            count = n_colors
+    except (TypeError, ValueError, OverflowError):
+        count = -2
+    bounds = np.array([count, -count], dtype=np.int64)
+    tcomm.Allreduce(MPI.IN_PLACE, bounds, op=MPI.MIN)
+    if bounds[0] == -2:
+        raise ValueError("invalid supplied colors or n_colors on at least one rank")
+    if bounds[0] != -bounds[1]:
+        raise ValueError(
+            "all ranks must supply colors with the same n_colors, or neither"
         )
-    )
+
+    indices, indptr = _canonical_rows(original, ptr)
+    remote = indices[(indices < first) | (indices >= last)]
+    if colors is None:
+        edges, edge_ptr = _exchange_rows(indices, indptr, offsets, comm)
+        remote = np.concatenate((edges[(edges < first) | (edges >= last)], remote))
     ghosts = np.unique(remote)
     del remote
     owners = owners_of(ghosts, offsets)
@@ -319,6 +340,23 @@ def distributed_coloring(
     asked = sparse_exchange(comm, requests)
     send_to = {q: ids - first for q, ids in asked.items()}
     recv_at = {q: last - first + np.flatnonzero(owners == q) for q in requests}
+    if colors is not None:
+        received = sparse_exchange(
+            comm, {q: colors[slots] for q, slots in send_to.items()}, dtype=np.int32
+        )
+        all_colors = np.concatenate((colors, np.empty(ghosts.size, dtype=np.int32)))
+        for peer, slots in recv_at.items():
+            all_colors[slots] = received[peer]
+        canonical_colors = all_colors[_slots(indices, first, last, ghosts)]
+        if tcomm.allreduce(
+            not _validate_coloring(indptr, canonical_colors), op=MPI.LOR
+        ):
+            raise ValueError(
+                "supplied colors leave used columns uncoloured or conflict in a row"
+            )
+        entries = all_colors[_slots(original, first, last, ghosts)]
+        return colors, entries, count
+
     state = _Coloring(edges, edge_ptr, last - first, ghosts, first, seed)
     del edges
     announced = {q: np.zeros(ids.size, dtype=bool) for q, ids in send_to.items()}

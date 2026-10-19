@@ -265,6 +265,27 @@ only. `MPI4JAX_USE_CUDA_MPI=1` passes device buffers to MPI directly.
 Update parameters with `A=op.with_fn(new_fn)`, keeping the same sparsity.
 See `demo/sharded_global_operator_optimization.py`.
 
+To use an existing colouring, pass both `colors` and `n_colors` on every rank:
+
+```python
+op = jaxamg.global_operator(
+    fn, indices, indptr,
+    comm=comm, mesh=mesh,
+    colors=owned_colors, n_colors=n_colors,
+)
+```
+
+`owned_colors` has one integer per owned column, in partition order. All ranks
+must use the same `n_colors` and global colour numbering. Used columns need
+colours in `[0, n_colors)`; globally unused columns may use `-1`. Each rank
+receives only the remote colours it needs, supplied by their owners.
+
+Invalid input, including row conflicts or mixing automatic and supplied
+colouring, is rejected on all ranks. Colours are not renumbered. Structure and
+colours are copied into immutable arrays; `with_fn` reuses them and the prepared
+layout without repeating setup. The structure must cover all parameter values
+and precisions in use.
+
 For programs with their own collectives, use `global_operator` or `A.data`
 so ranks compile the same program. With explicit mesh axes, pass traced
 parameters as `shard_map` arguments rather than capturing them in closures.

@@ -85,6 +85,26 @@ Reuse the same `Pattern` object; a new equivalent pattern has its own cache.
 If your transpose callback materializes an operator, reuse a separate pattern for
 it. MPI, sharded solves, and colouring tuples do not use this layout cache.
 
+### Supplying column colours
+
+Pass both `colors` and `n_colors` to use an existing colouring:
+
+```python
+p = jaxamg.pattern(rows, cols, shape, colors=colors, n_colors=n_colors)
+```
+
+`colors` has one integer per input column. Used columns need colours in
+`[0, n_colors)`; unused columns may use `-1`. Columns sharing a row must have
+different colours. Duplicate entries are merged before validation; invalid
+colours are rejected, not repaired or renumbered.
+
+`Pattern` describes the operator's input space, regardless of GPU count:
+`(n_rows, n_columns)` locally, `(n_local, n_global)` for an MPI row block, or
+`(n_local, n_local + n_ghost)` for a halo operator. Halo colours only need to
+be valid within each rank. For operators that communicate on global vectors,
+supply owned-column colours to
+[`global_operator`](sharding.md#halo-form-and-global-view-operators) instead.
+
 ## Native AmgX resource cache
 
 Set with environment variable:

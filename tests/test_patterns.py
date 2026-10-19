@@ -106,6 +106,71 @@ def test_direct_constructor_rejects_conflicting_colors():
         jaxamg.Pattern([0, 0], [0, 1], (2, 2), [0, 0], 1)
 
 
+def test_supplied_colours_skip_assignment_and_materialize(monkeypatch):
+    import jaxamg.patterns as patterns
+
+    def unexpected(*args):
+        raise AssertionError("supplied colours must not be recomputed")
+
+    monkeypatch.setattr(patterns, "get_column_coloring", unexpected)
+    colors = np.array([0, 1, -1], np.int32)
+    declaration = jaxamg.pattern(
+        [1, 0, 0, 0], [1, 1, 0, 1], (2, 3), colors=colors, n_colors=2
+    )
+    colors[:] = 0
+    np.testing.assert_array_equal(declaration.colors, [0, 1, -1])
+    with pytest.raises(ValueError):
+        declaration.colors.flags.writeable = True
+
+    def values(scale):
+        return materialize_sparse_matrix(
+            lambda vector: jnp.array([vector[0] + scale * vector[1], 2 * vector[1]]),
+            declaration.shape,
+            declaration.rows,
+            declaration.cols,
+            declaration.colors,
+            declaration.n_colors,
+        ).data.sum()
+
+    value, gradient = jax.jit(jax.value_and_grad(values))(2.0)
+    assert value == 5 and gradient == 1
+
+
+@pytest.mark.parametrize(
+    "colors,n_colors",
+    [
+        (None, 2),
+        ([0, 1], None),
+        ([0, 1], 0),
+        ([0.0, 1.0], 2),
+        ([0], 2),
+        ([-2, 1], 2),
+        ([-1, 1], 2),
+        ([0, 2], 2),
+        ([0, 1], 2**31),
+        ([0, 0], 2),
+    ],
+)
+def test_supplied_colours_are_validated(colors, n_colors):
+    with pytest.raises(ValueError):
+        jaxamg.pattern([0, 0], [0, 1], (1, 2), colors=colors, n_colors=n_colors)
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.uint64])
+def test_large_row_colour_keys_remain_exact(dtype):
+    limit = np.iinfo(np.int32).max
+    colors = np.array([limit - 2, limit - 1], dtype=dtype)
+    declaration = jaxamg.pattern(
+        [limit - 1, limit - 1],
+        [0, 1],
+        (limit, 2),
+        colors=colors,
+        n_colors=limit,
+    )
+    np.testing.assert_array_equal(declaration.colors, colors)
+    assert declaration.colors.dtype == np.int32
+
+
 def test_duplicates_and_zero_values_are_retained_as_a_set():
     p = jaxamg.pattern([1, 0, 0, 0], [1, 1, 0, 1], (2, 2))
 

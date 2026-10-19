@@ -194,6 +194,106 @@ def test_invalid_local_input_is_refused_collectively(bad):
         distributed_coloring(indices, indptr, counts, comm)
 
 
+@pytest.mark.parametrize("family", ["duplicates", "empty", "zero_rank"])
+def test_supplied_colours_follow_owners_without_assignment(family, monkeypatch):
+    from mpi4py import MPI
+
+    import jaxamg.distributed_coloring as module
+
+    def unexpected(*args):
+        raise AssertionError("supplied colours must not be recomputed")
+
+    monkeypatch.setattr(module, "_exchange_rows", unexpected)
+    comm = MPI.COMM_WORLD
+    if family == "duplicates":
+        rows, cols, counts = _irregular(comm.rank, comm.size)
+        indices, indptr = _csr(rows, cols, counts[comm.rank])
+        indices, indptr = np.repeat(indices, 2), indptr * 2
+    else:
+        counts = tuple(
+            0 if family == "zero_rank" and rank == 0 else 3 for rank in range(comm.size)
+        )
+        if family == "zero_rank" and counts[comm.rank]:
+            indices = np.arange(sum(counts), dtype=np.int64)
+            indptr = np.r_[0, np.full(counts[comm.rank], indices.size)]
+        else:
+            indices = np.empty(0, np.int64)
+            indptr = np.zeros(counts[comm.rank] + 1, np.int64)
+    first = sum(counts[: comm.rank])
+    colors = np.arange(first, first + counts[comm.rank], dtype=np.int32)
+    n_colors = sum(counts)
+    if family == "empty":
+        colors[:] = -1
+        n_colors = 0
+    owned, entries, count = module.distributed_coloring(
+        indices, indptr, counts, comm, colors=colors, n_colors=n_colors
+    )
+    np.testing.assert_array_equal(owned, colors)
+    np.testing.assert_array_equal(entries, indices)
+    assert count == n_colors
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "length",
+        "dtype",
+        "range",
+        "negative",
+        "uncoloured",
+        "conflict",
+        "missing_colors",
+        "missing_count",
+        "mixed",
+        "count",
+        "count_type",
+    ],
+)
+def test_invalid_supplied_colours_are_refused_collectively(bad):
+    from mpi4py import MPI
+
+    from jaxamg import global_operator
+
+    comm = MPI.COMM_WORLD
+    colors = np.arange(2 * comm.rank, 2 * comm.rank + 2, dtype=np.int32)
+    n_colors = 2 * comm.size
+    indices = np.array([2 * comm.rank, 2 * ((comm.rank + 1) % comm.size)], np.int64)
+    indptr = np.array([0, 2, 2], np.int64)
+    if comm.rank == 0:
+        if bad == "length":
+            colors = colors[:1]
+        elif bad == "dtype":
+            colors = colors.astype(float)
+        elif bad in ("range", "negative", "uncoloured", "conflict"):
+            colors[0] = {
+                "range": n_colors,
+                "negative": -2,
+                "uncoloured": -1,
+                "conflict": 2,
+            }[bad]
+        elif bad == "missing_colors":
+            colors = None
+        elif bad == "missing_count":
+            n_colors = None
+        elif bad == "mixed":
+            colors = n_colors = None
+        elif bad == "count":
+            n_colors += 1
+        else:
+            n_colors = 2.5
+    with pytest.raises(ValueError, match="color"):
+        global_operator(
+            lambda vector: vector,
+            indices,
+            indptr,
+            comm=comm,
+            mesh=None,
+            colors=colors,
+            n_colors=n_colors,
+        )
+    comm.Barrier()
+
+
 def test_dependency_storage_tracks_incidences_not_column_pairs():
     from jaxamg.distributed_coloring import _canonical_rows, _Coloring
 

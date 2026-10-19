@@ -37,6 +37,8 @@ class GlobalOperator:
         comm: Comm,
         mesh: Any,
         axis_name: str | tuple[str, ...] = "rank",
+        colors: Any = None,
+        n_colors: int | None = None,
     ):
         from mpi4py import MPI
 
@@ -46,6 +48,7 @@ class GlobalOperator:
             distributed_coloring,
         )
         from .local_arrays import register_local
+        from .patterns import _immutable
 
         self.fn = fn
         self.comm, self.mesh, self.axis_name = comm, mesh, axis_name
@@ -69,8 +72,17 @@ class GlobalOperator:
         self.indices, self.indptr, self.rows = (
             np.frombuffer(a.tobytes(), dtype=a.dtype) for a in (indices, indptr, rows)
         )
-        self.owned_colors, self.entry_colors, self.n_colors = distributed_coloring(
-            self.indices, indptr, (n_local,) * size, comm
+        owned_colors, entry_colors, self.n_colors = distributed_coloring(
+            self.indices,
+            indptr,
+            (n_local,) * size,
+            comm,
+            colors=colors,
+            n_colors=n_colors,
+        )
+        self.owned_colors, self.entry_colors = (
+            _immutable(owned_colors),
+            _immutable(entry_colors),
         )
         self.nnz = len(self.indices)
         self.max_nnz = int(comm.allreduce(self.nnz, op=MPI.MAX))
@@ -224,12 +236,14 @@ def global_operator(
     comm: Comm,
     mesh: Any,
     axis_name: str | tuple[str, ...] = "rank",
+    colors: Any = None,
+    n_colors: int | None = None,
 ) -> GlobalOperator:
     """A global-view operator for the sharding interface (collective).
 
     ``fn`` maps a global row-sharded vector to a global row-sharded vector and
     performs its own communication. Each rank declares the pattern of the rows
-    it owns; the columns are coloured once by the distributed colouring, and
+    it owns; column colours are computed or supplied once, and
     ``fn`` is probed with one global vector per colour.
 
     Args:
@@ -239,6 +253,14 @@ def global_operator(
         comm: The MPI communicator spanning the mesh's processes.
         mesh: The device mesh of the global vectors.
         axis_name: The mesh axis the rows are sharded over.
+        colors: Optional integer colour per column owned by this rank, in its
+            contiguous global row partition's order. Supply on every rank
+            together with ``n_colors`` to skip automatic colouring. Unused
+            columns may have colour -1; used columns must have colours in
+            ``[0, n_colors)``. Inputs are copied into immutable arrays.
+        n_colors: The same nonnegative colour count on every rank. Remote
+            colours are obtained from their owners and row conflicts are
+            checked collectively, including across rank boundaries.
 
     Returns:
         A `GlobalOperator`, accepted by `jaxamg.make_sharded_matrix` and as a
@@ -246,5 +268,12 @@ def global_operator(
         eagerly or inside transforms). Row partitions must be equal.
     """
     return GlobalOperator(
-        fn, indices, indptr, comm=comm, mesh=mesh, axis_name=axis_name
+        fn,
+        indices,
+        indptr,
+        comm=comm,
+        mesh=mesh,
+        axis_name=axis_name,
+        colors=colors,
+        n_colors=n_colors,
     )

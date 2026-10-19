@@ -32,6 +32,62 @@ def _single_device_array(values):
     return mesh, jax.device_put(jnp.asarray(values), sharding)
 
 
+@pytest.mark.gpu
+@pytest.mark.parametrize("supplied", [False, True])
+def test_global_operator_colours_are_immutable_and_reused(supplied, monkeypatch):
+    pytest.importorskip("mpi4py")
+    from mpi4py import MPI
+
+    import jaxamg.distributed_coloring as coloring_module
+    import jaxamg.local_arrays as local_arrays_module
+
+    mesh, template = _single_device_array(np.ones(4, np.float32))
+    rows = np.arange(4)
+    indices = np.stack((rows, (rows - 1) % 4), axis=1).ravel()
+    colors = (rows % 2).astype(np.int32)
+    options = {"colors": colors, "n_colors": 2} if supplied else {}
+
+    def fn(scale):
+        return lambda vector: scale**2 * vector - jnp.roll(vector, 1)
+
+    op = jaxamg.global_operator(
+        fn(1.0),
+        indices,
+        np.arange(5) * 2,
+        comm=MPI.COMM_SELF,
+        mesh=mesh,
+        **options,
+    )
+    original_colors = op.owned_colors.copy()
+    colors[:] = -1
+    np.testing.assert_array_equal(op.owned_colors, original_colors)
+    if supplied:
+        np.testing.assert_array_equal(op.owned_colors, rows % 2)
+        assert op.n_colors == 2
+    for array in (op.owned_colors, op.entry_colors):
+        with pytest.raises(ValueError):
+            array.flags.writeable = True
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("with_fn must reuse colouring and registered arrays")
+
+    monkeypatch.setattr(coloring_module, "distributed_coloring", unexpected)
+    monkeypatch.setattr(local_arrays_module, "register_local", unexpected)
+    assert op.with_fn(fn(2.0))._local is op._local
+
+    def loss(scale, vector):
+        return op.with_fn(fn(scale))._packed_values(vector).sum()
+
+    value, gradient = jax.jit(jax.value_and_grad(loss))(2.0, template)
+    assert value == 12 and gradient == 16
+    tangent = jax.jit(
+        lambda scale, vector: jax.jvp(
+            lambda parameter: loss(parameter, vector), (scale,), (jnp.ones_like(scale),)
+        )[1]
+    )(2.0, template)
+    assert tangent == 16
+
+
 # One rank: nothing travels, so the exchange is never called.
 _EMPTY_EXCHANGE = NeighbourPlan(0, (), (), (), ())
 
