@@ -106,6 +106,71 @@ def test_direct_constructor_rejects_conflicting_colors():
         jaxamg.Pattern([0, 0], [0, 1], (2, 2), [0, 0], 1)
 
 
+def test_supplied_colours_skip_assignment_and_materialize(monkeypatch):
+    import jaxamg.patterns as patterns
+
+    def unexpected(*args):
+        raise AssertionError("supplied colours must not be recomputed")
+
+    monkeypatch.setattr(patterns, "get_column_coloring", unexpected)
+    colors = np.array([0, 1, -1], np.int32)
+    declaration = jaxamg.pattern(
+        [1, 0, 0, 0], [1, 1, 0, 1], (2, 3), colors=colors, n_colors=2
+    )
+    colors[:] = 0
+    np.testing.assert_array_equal(declaration.colors, [0, 1, -1])
+    with pytest.raises(ValueError):
+        declaration.colors.flags.writeable = True
+
+    def values(scale):
+        return materialize_sparse_matrix(
+            lambda vector: jnp.array([vector[0] + scale * vector[1], 2 * vector[1]]),
+            declaration.shape,
+            declaration.rows,
+            declaration.cols,
+            declaration.colors,
+            declaration.n_colors,
+        ).data.sum()
+
+    value, gradient = jax.jit(jax.value_and_grad(values))(2.0)
+    assert value == 5 and gradient == 1
+
+
+@pytest.mark.parametrize(
+    "colors,n_colors",
+    [
+        (None, 2),
+        ([0, 1], None),
+        ([0, 1], 0),
+        ([0.0, 1.0], 2),
+        ([0], 2),
+        ([-2, 1], 2),
+        ([-1, 1], 2),
+        ([0, 2], 2),
+        ([0, 1], 2**31),
+        ([0, 0], 2),
+    ],
+)
+def test_supplied_colours_are_validated(colors, n_colors):
+    with pytest.raises(ValueError):
+        jaxamg.pattern([0, 0], [0, 1], (1, 2), colors=colors, n_colors=n_colors)
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.uint64])
+def test_large_row_colour_keys_remain_exact(dtype):
+    limit = np.iinfo(np.int32).max
+    colors = np.array([limit - 2, limit - 1], dtype=dtype)
+    declaration = jaxamg.pattern(
+        [limit - 1, limit - 1],
+        [0, 1],
+        (limit, 2),
+        colors=colors,
+        n_colors=limit,
+    )
+    np.testing.assert_array_equal(declaration.colors, colors)
+    assert declaration.colors.dtype == np.int32
+
+
 def test_duplicates_and_zero_values_are_retained_as_a_set():
     p = jaxamg.pattern([1, 0, 0, 0], [1, 1, 0, 1], (2, 2))
 
@@ -146,6 +211,45 @@ def test_halo_operator_without_ghosts():
     matrix = op._local_matrix(4, 8, jnp.float32, traced=False)
     np.testing.assert_array_equal(np.asarray(matrix.indices), [4, 5])
     np.testing.assert_array_equal(np.asarray(matrix.data), [2, 2])
+
+
+@pytest.mark.parametrize("shape", [(1, 3), (2, 2), (2, 4)])
+def test_halo_operator_rejects_mismatched_pattern(shape):
+    declaration = jaxamg.pattern([], [], shape)
+    with pytest.raises(ValueError, match="pattern shape"):
+        jaxamg.halo_operator(
+            lambda own, ghost: own,
+            n_local=2,
+            ghost_ids=[0],
+            pattern=declaration,
+        )
+
+
+def test_halo_operator_reuses_declared_pattern(monkeypatch):
+    import jaxamg.sparsity as sparsity
+
+    declaration = jaxamg.pattern(
+        [0, 0, 1], [0, 2, 1], (2, 3), colors=[0, 0, 1], n_colors=2
+    )
+
+    def fn(scale):
+        return lambda own, ghost: own + scale * jnp.array([ghost[0], 0])
+
+    op = jaxamg.halo_operator(fn(0.0), n_local=2, ghost_ids=[0], pattern=declaration)
+    assert op.with_fn(fn(1.0)).combined._pattern is declaration
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("a declared pattern must not be rediscovered")
+
+    monkeypatch.setattr(sparsity, "cache_coloring", unexpected)
+
+    def values(scale):
+        matrix = op.with_fn(fn(scale))._local_matrix(2, 5, jnp.float32, traced=True)
+        return matrix.data.sum(), matrix.data
+
+    (total, data), gradient = jax.jit(jax.value_and_grad(values, has_aux=True))(2.0)
+    np.testing.assert_array_equal(data, [2, 1, 1])
+    assert total == 4 and gradient == 1
 
 
 def test_halo_operator_owns_ghost_ids_and_validates_inputs():

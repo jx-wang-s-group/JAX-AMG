@@ -53,6 +53,26 @@ def _immutable(array: np.ndarray) -> np.ndarray:
     return np.frombuffer(array.astype(np.int32, copy=False).tobytes(), dtype=np.int32)
 
 
+def _column_colors(colors, n_colors, n_columns):
+    colors = _integers(colors, "colors")
+    if colors.size != n_columns:
+        raise ValueError("colors must contain one entry per input column")
+    n_colors = operator.index(n_colors)
+    if not 0 <= n_colors <= np.iinfo(np.int32).max:
+        raise ValueError("n_colors must be nonnegative and fit in int32")
+    if colors.size and (colors.min() < -1 or colors.max() >= n_colors):
+        raise ValueError("colors must lie in [-1, n_colors)")
+    return colors.astype(np.int32, copy=False), n_colors
+
+
+def _validate_row_colors(rows, colors, n_colors):
+    if np.any(colors < 0):
+        raise ValueError("every used column must have a nonnegative color")
+    keys = np.sort(rows.astype(np.int64) * n_colors + colors)
+    if np.any(keys[1:] == keys[:-1]):
+        raise ValueError("columns sharing a row must have different colors")
+
+
 @dataclass(frozen=True, eq=False)
 class Pattern:
     """Declared entries and column colouring of a linear operator.
@@ -62,8 +82,8 @@ class Pattern:
     Entries are canonicalized as a set and retained even when their values are
     zero. The declaration must cover every parameter value and precision in use.
 
-    Prefer :func:`pattern` to compute the colouring. Direct construction accepts
-    a colour per input column and a colour count; used columns must have colours
+    Prefer :func:`pattern` to compute or supply the colouring. Direct construction
+    accepts a colour per input column and a colour count; used columns must have colours
     in ``[0, n_colors)`` and columns sharing a row must have different colours.
     Both constructors copy their inputs into immutable host arrays.
     """
@@ -78,21 +98,8 @@ class Pattern:
 
     def __post_init__(self):
         rows, cols, shape = _coordinates(self.rows, self.cols, self.shape)
-        colors = _integers(self.colors, "colors")
-        if colors.size != shape[1]:
-            raise ValueError("colors must contain one entry per input column")
-        n_colors = operator.index(self.n_colors)
-        if not 0 <= n_colors <= np.iinfo(np.int32).max:
-            raise ValueError("n_colors must be nonnegative and fit in int32")
-        if colors.size and (colors.min() < -1 or colors.max() >= n_colors):
-            raise ValueError("colors must lie in [-1, n_colors)")
-        entry_colors = colors[cols]
-        if np.any(entry_colors < 0):
-            raise ValueError("every used column must have a nonnegative color")
-        order = np.lexsort((entry_colors, rows))
-        r, c = rows[order], entry_colors[order]
-        if np.any((r[1:] == r[:-1]) & (c[1:] == c[:-1])):
-            raise ValueError("columns sharing a row must have different colors")
+        colors, n_colors = _column_colors(self.colors, self.n_colors, shape[1])
+        _validate_row_colors(rows, colors[cols], n_colors)
         for name, value in (("rows", rows), ("cols", cols), ("colors", colors)):
             object.__setattr__(self, name, _immutable(value))
         object.__setattr__(self, "shape", shape)
@@ -138,14 +145,29 @@ class Pattern:
         )
 
 
-def pattern(rows: Any, cols: Any, shape: tuple[int, int]) -> Pattern:
-    """Declare all possible sparse entries and compute their column colouring.
+def pattern(
+    rows: Any,
+    cols: Any,
+    shape: tuple[int, int],
+    *,
+    colors: Any = None,
+    n_colors: int | None = None,
+) -> Pattern:
+    """Declare all possible sparse entries and compute or supply their colouring.
 
     ``rows`` and ``cols`` are one-dimensional integer coordinates in the
     operator's ``shape``. Unsorted coordinates and repeated entries are accepted.
+    Supply both ``colors`` (one integer per input column) and ``n_colors`` to
+    bypass automatic colouring. Used columns must have colours in
+    ``[0, n_colors)``; unused columns may have colour -1. Distinct columns in
+    each row must have different colours. Inputs are copied into immutable arrays.
     Attach the result with ``with_cache(op, pattern=p)``; numerical zeros do not
     remove declared entries. Construct it outside JAX transformations.
     """
+    if (colors is None) != (n_colors is None):
+        raise ValueError("supply both colors and n_colors, or neither")
+    if colors is not None:
+        return Pattern(rows, cols, shape, colors, n_colors)
     rows, cols, shape = _coordinates(rows, cols, shape)
     colors, n_colors = get_column_coloring(rows, cols, shape)
     return Pattern(rows, cols, shape, colors, n_colors)

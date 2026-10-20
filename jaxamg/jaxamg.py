@@ -39,7 +39,7 @@ from .nullspace import (
     verify_nullspace,
     warn_if_singular,
 )
-from .transport import halo_gather, mpi_ordered_effect
+from .transport import halo_gather, mpi_ordered_effect, tensor_type
 from .utils import *
 
 if TYPE_CHECKING:
@@ -202,8 +202,7 @@ def _amgx_mpi_lowering(ctx, *operands, res_history_len, ordered, config, **param
     attrs.update({k: mlir.ir_attribute(np.int32(v)) for k, v in params.items()})
     call = _custom_call(
         target,
-        result_types=[mlir.aval_to_ir_type(a) for a in ctx.avals_out]
-        + [hlo.TokenType.get()],
+        result_types=[tensor_type(a) for a in ctx.avals_out] + [hlo.TokenType.get()],
         operands=[*operands, token],
         backend_config=attrs,
         api_version=4,
@@ -868,7 +867,7 @@ def solve(
         transpose_nullspace: Basis of `null(Aᵀ)` (same formats). `b` is projected onto `range(A)` (removed fraction in `info["rhs_inconsistency"]`) and, by transposition, the adjoint solution is pinned: the forward returns `A⁺b`, `jax.grad` returns `(Aᵀ)⁺g`. Equals `nullspace` for symmetric `A` (filled in when `A` is marked symmetric); for nonsymmetric `A` it differs, e.g. `A = D⁻¹L` has `nullspace="constant"` but `transpose_nullspace=V` (cell volumes). Defaults to the basis attached with `with_cache`.
         labels: The pair `(count, labels)`, as `scipy.sparse.csgraph.connected_components` returns it: a static label count and one integer label per row (local rows in MPI mode, possibly traced), -1 for rows in no component, for a disconnected domain: every declared `nullspace`/`transpose_nullspace` column then applies separately on each label's rows (the null space is block diagonal over the labels), e.g. `nullspace="constant"` with labels declares one constant vector per component. A label whose columns vanish on its rows (no rows, or all of them -1 in this solve) is skipped exactly; columns dependent within a label are rejected (concrete values). Without labels the null space is the columns themselves. Defaults to the labels attached with `with_cache`.
         label_sum: In MPI mode with labels, the reduction of each rank's per-label partial sums (an array of `count` rows) to the labels' totals, a linear function (a `jaxamg.linear_map.LinearMap` where JAX's own transpose would be wrong, as for an MPI all-reduce). By default, the all-reduce over global label numbers (one `count`-row array on every rank); a caller whose labels span ranks in its own numbering supplies the reduction. Defaults to the one attached with `with_cache`.
-        derivative: `"implicit"` (default) differentiates `x = A⁻¹b` implicitly on the fixed pattern, `ẋ = A⁻¹(ḃ − Ȧx)` with each `A⁻¹` a native solve: forward and reverse mode, and higher orders where the operator supports them. `"adjoint"` is the reverse-only rule. Both use the same first reverse rule. Neither differentiates the AmgX iterations: derivatives are those of the exact solution, accurate to the solve tolerance.
+        derivative: `"implicit"` (default) differentiates `x = A⁻¹b` implicitly on the fixed pattern, `ẋ = A⁻¹(ḃ − Ȧx)` with each `A⁻¹` a native solve: forward and reverse mode, and higher orders where the operator supports them. `"adjoint"` is the reverse-only rule. Both use the same first reverse rule. Neither differentiates the AmgX iterations: derivatives are those of the exact solution, accurate to the solve tolerance. Under `jax.checkpoint` the single-GPU solve needs JAX 0.11.1 or later (older JAX refuses its side effect: `FfiEffect`; see docs/caching.md).
         **kwargs: Additional AmgX config parameters. These override values in `config` when both are provided.
 
     Returns:
@@ -1297,6 +1296,8 @@ def solve(
             def basis_max(value):
                 return mpi4jax.allreduce(value, op=MPI.MAX, comm=comm_obj)
 
+        # Keeps XLA from constant-folding reductions of a concrete basis (slow for large n).
+        N, M = jax.lax.optimization_barrier((N, M))
         N, M = unit_bases((N, M), basis_max)
     if N is None and M is None:
         warn_if_singular(A_csr, comm=comm_obj, stacklevel=3)
