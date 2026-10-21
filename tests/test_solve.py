@@ -281,8 +281,8 @@ class TestSolver:
         assert info_backend[2] == info_explicit[2] == jaxamg.AMGXStatus.SUCCESS
         np.testing.assert_allclose(lam_backend, lam_explicit)
 
-    def test_reuse_setup_forwards_to_adjoint_solve(self, monkeypatch):
-        """The VJP must use the same reuse_setup mode as the forward solve."""
+    def test_reuse_level_forwards_to_adjoint_solve(self, monkeypatch):
+        """The VJP must use the same reuse level as the forward solve."""
         calls = []
 
         def fake_amgx_solve(
@@ -294,7 +294,7 @@ class TestSolver:
             config_str="",
             transpose_solve=False,
             return_stats=False,
-            reuse_setup=False,
+            reuse_level=0,
             res_history_len=0,
             use_x0=False,
             block_dim=1,
@@ -302,7 +302,7 @@ class TestSolver:
             calls.append(
                 {
                     "transpose_solve": bool(transpose_solve),
-                    "reuse_setup": bool(reuse_setup),
+                    "reuse_level": int(reuse_level),
                 }
             )
             return b, jnp.zeros(3 + res_history_len, dtype=b.dtype)
@@ -313,9 +313,7 @@ class TestSolver:
         try:
             A = poisson_matrix(2, skew=0.7)
             b = rhs_ones(A.shape[0])
-            solver = jaxamg_module._get_adjoint_primitive(
-                "test-config", reuse_setup=True
-            )
+            solver = jaxamg_module._get_adjoint_primitive("test-config", reuse_level=1)
 
             def loss(rhs):
                 x, _ = solver(A, rhs, rhs)
@@ -324,13 +322,101 @@ class TestSolver:
             grad_b = jax.grad(loss)(b)
 
             assert grad_b.shape == b.shape
-            assert calls[0] == {"transpose_solve": False, "reuse_setup": True}
+            assert calls[0] == {"transpose_solve": False, "reuse_level": 1}
             assert any(
-                call == {"transpose_solve": True, "reuse_setup": True}
+                call == {"transpose_solve": True, "reuse_level": 1}
                 for call in calls[1:]
             )
         finally:
             jaxamg_module._get_adjoint_primitive.cache_clear()
+
+    @staticmethod
+    def _tridiagonal_pattern(n):
+        i = np.arange(n)
+        return jaxamg.pattern(
+            np.concatenate([i, i[1:], i[:-1]]),
+            np.concatenate([i, i[:-1], i[1:]]),
+            (n, n),
+        )
+
+    def _kept_matrix_solve(self, n, evaluations):
+        """A reuse='matrix' solve of the declared tridiagonal operator with
+        a given diagonal, counting the operator's evaluations."""
+        pattern = self._tridiagonal_pattern(n)
+
+        def solve(diagonal, b):
+            def op(x):
+                jax.debug.callback(lambda: evaluations.append(1))
+                y = diagonal * x
+                y = y.at[1:].add(-x[:-1])
+                return y.at[:-1].add(-x[1:])
+
+            A = jaxamg.with_cache(op, pattern=pattern)
+            return jaxamg.solve(A, b, reuse="matrix", tolerance=1e-8)[0]
+
+        return solve
+
+    @pytest.mark.parametrize("transform", ["eager", "jit", "jit_vmap", "vmap_jit"])
+    def test_reuse_matrix_keeps_the_first_matrix(self, transform):
+        """reuse='matrix' solves with the first solve's matrix and, under jit
+        (also batched), evaluates the operator only when no matrix is cached."""
+        jaxamg.clear_solver_cache()
+        if jaxamg.get_solver_cache_info()["isolated_mode"]:
+            pytest.skip("JAXAMG_CACHE_SIZE=0: nothing is cached in isolated mode")
+        n = 32
+        evaluations = []
+        solve = self._kept_matrix_solve(n, evaluations)
+        batched = jax.vmap(solve, in_axes=(None, 0))
+        solve = {
+            "eager": solve,
+            "jit": jax.jit(solve),
+            "jit_vmap": jax.jit(batched),
+            "vmap_jit": jax.vmap(jax.jit(solve), in_axes=(None, 0)),
+        }[transform]
+        b = rhs_ones(n)
+        if "vmap" in transform:
+            b = jnp.stack([b, 2 * b])
+
+        x1 = solve(2.0, b)
+        jax.effects_barrier()
+        probed = len(evaluations)
+        x2 = solve(4.0, b)
+        jax.effects_barrier()
+
+        A1 = tridiagonal_matrix(n, diagonal_value=2.0).todense()
+        assert probed > 0
+        # Eagerly the operator is evaluated, but its values are not used.
+        assert len(evaluations) == (2 * probed if transform == "eager" else probed)
+        np.testing.assert_allclose(x1, jnp.linalg.solve(A1, b.T).T, rtol=1e-4)
+        np.testing.assert_allclose(x2, x1, rtol=1e-4)
+
+    def test_reuse_matrix_refuses_derivatives_and_undeclared_operators(self):
+        """reuse='matrix' refuses derivatives, matrices, and invalid or removed
+        options."""
+        n = 8
+        eager = self._kept_matrix_solve(n, [])
+        solve = jax.jit(eager)
+        b = rhs_ones(n)
+        for loss in (
+            lambda d: jnp.sum(solve(2.0, d * b)),
+            lambda d: jnp.sum(solve(d, b)),
+            lambda d: jnp.sum(eager(d, b)),
+        ):
+            eager(2.0, b)
+            with pytest.raises(ValueError, match="not differentiable"):
+                jax.grad(loss)(2.0)
+        with pytest.raises(ValueError, match="pattern"):
+            jaxamg.solve(tridiagonal_matrix(n), b, reuse="matrix")
+        # A matrix's own entry order need not be the pattern's.
+        declared = jaxamg.with_cache(
+            tridiagonal_matrix(n), pattern=self._tridiagonal_pattern(n)
+        )
+        with pytest.raises(ValueError, match="callable"):
+            jaxamg.solve(declared, b, reuse="matrix")
+        with pytest.raises(ValueError, match="reuse must be"):
+            jaxamg.solve(tridiagonal_matrix(n), b, reuse=True)
+        with pytest.raises(TypeError, match="reuse='hierarchy'"):
+            jaxamg.solve(tridiagonal_matrix(n), b, reuse_setup=True)
 
     def test_save_stats_file(self, tmp_path):
         """Test that jaxamg.solve generates a stats file correctly."""

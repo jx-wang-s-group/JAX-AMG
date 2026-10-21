@@ -1291,6 +1291,66 @@ def test_sharded_global_operator(sharding_context, communicator):
         jax.config.update("jax_enable_x64", False)
 
 
+def test_sharded_kept_matrix(sharding_context):
+    """reuse='matrix': later solves use the solver's first matrix, jitted and
+    eagerly; each solver keeps its own; differentiation is refused."""
+    comm, rank, nranks, mesh = sharding_context
+    n = 8 * nranks
+    r0, r1, n_local = get_partition_info(n, rank, nranks)
+    axis = "rank"
+    forward = [(i, (i + 1) % nranks) for i in range(nranks)]
+    backward = [(i, (i - 1) % nranks) for i in range(nranks)]
+
+    def fn(scale):
+        def body(x):
+            before = jax.lax.ppermute(x[-1:], axis, perm=forward)
+            after = jax.lax.ppermute(x[:1], axis, perm=backward)
+            prev = jnp.concatenate([before, x[:-1]])
+            nxt = jnp.concatenate([x[1:], after])
+            return scale * (4.0 * x - prev - nxt)
+
+        return jax.shard_map(
+            body, mesh=mesh, in_specs=jax.P(axis), out_specs=jax.P(axis)
+        )
+
+    cols = [sorted({c, (c - 1) % n, (c + 1) % n}) for c in range(r0, r1)]
+    indptr = np.concatenate(([0], np.cumsum([len(c) for c in cols])))
+    op = jaxamg.global_operator(
+        fn(1.0), np.concatenate(cols), indptr, comm=comm, mesh=mesh
+    )
+    b = jaxamg.make_sharded_vector(
+        np.random.default_rng(rank).standard_normal(n_local).astype(np.float32),
+        comm=comm,
+        mesh=mesh,
+        global_size=n,
+    )
+    matrix = jaxamg.make_sharded_matrix(op, b, comm=comm, mesh=mesh)
+    config = {
+        "solver": "PBICGSTAB",
+        "tolerance": 1e-6,
+        "max_iters": 200,
+        "communicator": "MPI",
+    }
+    kept = jaxamg.make_sharded_solver(matrix, b, config=config, reuse="matrix")
+    other = jaxamg.make_sharded_solver(matrix, b, config=config, reuse="matrix")
+
+    def local(x):
+        return np.asarray(x.addressable_shards[0].data)
+
+    with jax.set_mesh(mesh):
+        x1 = local(kept(b, A=op)[0])
+        run = jax.jit(lambda s, rhs: kept(rhs, A=op.with_fn(fn(s)))[0])
+        x_jit = local(run(2.0, b))
+        x_eager = local(kept(b, A=op.with_fn(fn(2.0)))[0])
+        x_other = local(other(b, A=op.with_fn(fn(2.0)))[0])
+        for solve in (run, lambda s, rhs: kept(rhs, A=op.with_fn(fn(s)))[0]):
+            with pytest.raises(ValueError, match="not differentiable"):
+                jax.grad(lambda s: jnp.sum(solve(s, b)))(1.0)
+    np.testing.assert_allclose(x_jit, x1, rtol=1e-4)
+    np.testing.assert_allclose(x_eager, x1, rtol=1e-4)
+    np.testing.assert_allclose(x_other, x1 / 2, rtol=1e-4)
+
+
 def test_sharded_overrides_must_keep_the_structure(sharding_context):
     """An operator override with the solver's nonzero counts but other
     columns is refused on every rank (its values would otherwise be read in

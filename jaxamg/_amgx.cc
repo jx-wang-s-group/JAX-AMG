@@ -69,9 +69,10 @@ namespace
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
-          .Attr<int32_t>("reuse_setup")             // skip warm resetup
+          .Attr<int32_t>("reuse_level")             // 0 none, 1 hierarchy, 2 hierarchy and matrix
           .Attr<int32_t>("use_x0")                  // honor x0 initial guess
           .Attr<int32_t>("block_dim")               // BSR block size (1 = scalar CSR)
+          .Attr<int32_t>("operator_id")             // kept matrix's owner (0: none)
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -89,9 +90,10 @@ namespace
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
-          .Attr<int32_t>("reuse_setup")             // skip warm resetup
+          .Attr<int32_t>("reuse_level")             // 0 none, 1 hierarchy, 2 hierarchy and matrix
           .Attr<int32_t>("use_x0")                  // honor x0 initial guess
           .Attr<int32_t>("block_dim")               // BSR block size (1 = scalar CSR)
+          .Attr<int32_t>("operator_id")             // kept matrix's owner (0: none)
   );
 
 #ifdef JAXAMG_WITH_MPI
@@ -106,7 +108,7 @@ namespace
                                   ffi::Buffer<ffi::S32>, ffi::Buffer<ffi::S32>,
                                   ffi::Buffer<ffi::S32>, ffi::ResultBuffer<DT>,
                                   ffi::ResultBuffer<DT>, std::string_view, int32_t, int32_t,
-                                  int32_t, int32_t, int32_t, int32_t, int, int);
+                                  int32_t, int32_t, int32_t, int32_t, int32_t, int, int);
 
   template <ffi::DataType DT, MPISolve<DT> Solve>
   ffi::Error AmgxSolveMPIPadded(
@@ -115,8 +117,8 @@ namespace
       ffi::Buffer<ffi::S32> nglobal, ffi::Buffer<ffi::S32> comm_ptr, ffi::Buffer<ffi::S32> lrank,
       ffi::Buffer<ffi::S32> sizes, ffi::Token, ffi::ResultBuffer<DT> x,
       ffi::ResultBuffer<DT> stats, ffi::Result<ffi::Token>, std::string_view config,
-      int32_t transpose_solve, int32_t return_stats, int32_t reuse_setup, int32_t use_x0,
-      int32_t block_dim, int32_t device_mpi)
+      int32_t transpose_solve, int32_t return_stats, int32_t reuse_level, int32_t use_x0,
+      int32_t block_dim, int32_t device_mpi, int32_t operator_id)
   {
     int host_sizes[2] = {-1, -1};
     if (sizes.element_count() != 2)
@@ -131,16 +133,17 @@ namespace
         (host_sizes[0] != -1 || host_sizes[1] != -1))
       return ffi::Error::InvalidArgument("local sizes must be nonnegative or (-1, -1)");
     const int64_t n = host_sizes[0] < 0 ? n_buffer : host_sizes[0];
-    const int64_t nnz = host_sizes[1] < 0 ? values.element_count() : host_sizes[1];
+    const int64_t nnz = host_sizes[1] < 0 ? col_indices.element_count() : host_sizes[1];
+    // Empty values (a solve with the cached matrix) are checked by the solve.
     if (n > n_buffer || n > static_cast<int64_t>(b.element_count()) ||
         n > static_cast<int64_t>(x0.element_count()) ||
         n + 1 > static_cast<int64_t>(row_ptrs.element_count()) ||
-        nnz > static_cast<int64_t>(values.element_count()) ||
+        (values.element_count() != 0 && nnz > static_cast<int64_t>(values.element_count())) ||
         nnz > static_cast<int64_t>(col_indices.element_count()))
       return ffi::Error::InvalidArgument("local sizes exceed the padded buffers");
     ffi::Error err = Solve(stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank,
-                           x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0,
-                           block_dim, device_mpi, host_sizes[0], host_sizes[1]);
+                           x, stats, config, transpose_solve, return_stats, reuse_level, use_x0,
+                           block_dim, device_mpi, operator_id, host_sizes[0], host_sizes[1]);
     if (err.success() && n < n_buffer &&
         cudaMemsetAsync(x->typed_data() + n, 0,
                         (n_buffer - n) * sizeof(ffi::NativeType<DT>), stream) != cudaSuccess)
@@ -169,10 +172,11 @@ namespace
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
-          .Attr<int32_t>("reuse_setup")             // skip warm resetup
+          .Attr<int32_t>("reuse_level")             // 0 none, 1 hierarchy, 2 hierarchy and matrix
           .Attr<int32_t>("use_x0")                  // honor x0 initial guess
           .Attr<int32_t>("block_dim")               // BSR block size (1 = scalar CSR)
           .Attr<int32_t>("device_mpi")              // resource transport identity
+          .Attr<int32_t>("operator_id")             // kept matrix's owner (0: none)
   );
 
   XLA_FFI_DEFINE_HANDLER(
@@ -196,10 +200,11 @@ namespace
           .Attr<std::string_view>("config")         // config string
           .Attr<int32_t>("transpose_solve")         // transpose flag
           .Attr<int32_t>("return_stats")            // return stats flag
-          .Attr<int32_t>("reuse_setup")             // skip warm resetup
+          .Attr<int32_t>("reuse_level")             // 0 none, 1 hierarchy, 2 hierarchy and matrix
           .Attr<int32_t>("use_x0")                  // honor x0 initial guess
           .Attr<int32_t>("block_dim")               // BSR block size (1 = scalar CSR)
           .Attr<int32_t>("device_mpi")              // resource transport identity
+          .Attr<int32_t>("operator_id")             // kept matrix's owner (0: none)
   );
 
 #endif // JAXAMG_WITH_MPI

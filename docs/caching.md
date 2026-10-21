@@ -145,12 +145,22 @@ correct for any change in coefficient values, making cache reuse safe for worklo
 where coefficients change between solves (including optimization and time-stepping).
 
 For repeated solves where reusing the existing AMG hierarchy is acceptable, pass
-`reuse_setup=True` to `jaxamg.solve(...)`. This still refreshes the fine-level
+`reuse="hierarchy"` to `jaxamg.solve(...)`. This still refreshes the fine-level
 matrix values, but skips `AMGX_solver_resetup` on cache hits. It can reduce the
 per-solve cost further, but the reused hierarchy may be less effective for the
 new values; if coefficients change enough, convergence may require more
 iterations or become less robust. If that happens, call
 `jaxamg.clear_solver_cache()` to force the next solve to build a fresh hierarchy.
+
+For fixed operators, `reuse="matrix"` reuses both the matrix and hierarchy.
+Inside `jit`, it probes the operator only on cache misses. Declare the operator
+(a callable) with `with_cache(A, pattern=p)`; operators sharing the pattern
+object `p` share the cached matrix. With `make_sharded_solver(..., reuse="matrix")`, each solver
+has its own cached matrix instead.
+
+Each matrix uses one cache entry, so increase `JAXAMG_CACHE_SIZE` when alternating
+between solves. This mode requires unchanged operator values and does not support
+differentiation.
 
 ### Checkpointing (`jax.checkpoint`)
 
@@ -159,7 +169,7 @@ reject their cache side effect (`FfiEffect`). The sharded MPI solver
 (`make_sharded_solver`) declares no such effect and supports checkpointing on
 older JAX versions too.
 
-With `reuse_setup=True`, recomputed solves use the currently cached hierarchy,
+With `reuse="hierarchy"`, recomputed solves use the currently cached hierarchy,
 which may differ from the one used in the forward pass.
 
 ## Cache inspection

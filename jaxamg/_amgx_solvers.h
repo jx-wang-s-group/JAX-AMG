@@ -176,6 +176,25 @@ namespace
     return stats_host;
   }
 
+  // The status of a solve without values (reuse level 2) when no matrix is cached.
+  constexpr int kMatrixMissing = -1;
+
+  // Report kMatrixMissing: x = 0, no iterations, NaN residuals.
+  template <typename T>
+  inline ffi::Error ReportMatrixMissing(cudaStream_t stream, T *x, int64_t n, T *stats,
+                                        size_t stats_len)
+  {
+    std::vector<T> stats_host(stats_len, std::numeric_limits<T>::quiet_NaN());
+    stats_host[0] = static_cast<T>(0);
+    stats_host[2] = static_cast<T>(kMatrixMissing);
+    if (cudaMemsetAsync(x, 0, n * sizeof(T), stream) != cudaSuccess ||
+        cudaMemcpyAsync(stats, stats_host.data(), stats_len * sizeof(T),
+                        cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+        cudaStreamSynchronize(stream) != cudaSuccess)
+      return ffi::Error::Internal("reporting a missing cached matrix failed");
+    return ffi::Error::Success();
+  }
+
   // Build the BSR structure of the (optionally transposed) scalar CSR pattern
   // plus a scatter map from the scalar values order into the BSR values
   // buffer (slot = block_index * bs^2 + local_row * bs + local_col; blocks are
@@ -321,9 +340,10 @@ namespace
                                       std::string_view config,
                                       int32_t transpose_solve,
                                       int32_t return_stats,
-                                      int32_t reuse_setup,
+                                      int32_t reuse_level,
                                       int32_t use_x0,
-                                      int32_t block_dim)
+                                      int32_t block_dim,
+                                      int32_t operator_id)
   {
     EnsureAmgxInitialized();
 
@@ -354,7 +374,13 @@ namespace
     T *stats_data = stats->typed_data();
 
     const int n_rows = static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
-    const int nnz = static_cast<int>(values.element_count());
+    const int nnz = static_cast<int>(col_indices.element_count());
+    // At reuse level 2, empty values select the cached matrix.
+    const bool has_values = values.element_count() != 0 || col_indices.element_count() == 0;
+    if (!has_values && reuse_level != 2)
+    {
+      return ffi::Error::InvalidArgument("matrix values are required below reuse level 2");
+    }
 
     // Block mode (block_dim > 1): the scalar CSR inputs are converted to BSR
     // for AmgX; n_b is the number of block rows.
@@ -377,8 +403,12 @@ namespace
     }
     const size_t structure_hash = static_cast<size_t>(device_hash);
 
-    CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, bs, structure_hash, std::string(config)};
+    CacheKey key = {n_rows, nnz, static_cast<int>(Mode), transpose_solve != 0, bs, structure_hash, std::string(config), operator_id};
     bool cache_hit = GetSolverCache().get(key, res);
+    if (!cache_hit && !has_values)
+    {
+      return ReportMatrixMissing<T>(stream, x_data, n_rows, stats_data, stats->element_count());
+    }
 
     // Destroys freshly created resources on any early return below (armed only
     // on the cache-miss path; disarmed once the cache takes ownership).
@@ -386,7 +416,8 @@ namespace
 
     bool reuse_success = false;
 
-    if (cache_hit)
+    // Reuse level 2 uses the cached matrix and hierarchy as they are.
+    if (cache_hit && reuse_level != 2)
     {
       if (bs > 1)
       {
@@ -438,9 +469,13 @@ namespace
             res.A, n_rows, (int)values.element_count(), values_data, nullptr));
       }
 
-      // reuse_setup keeps the existing hierarchy while still refreshing the fine matrix.
-      if (!reuse_setup)
+      // Level 1 keeps the hierarchy while still refreshing the fine matrix.
+      if (reuse_level == 0)
         AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
+    }
+
+    if (cache_hit)
+    {
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_b, bs, b_data));
       // AMGX_solver_solve treats the x vector's contents as the initial guess.
       if (use_x0 != 0)
@@ -661,10 +696,11 @@ namespace
                                          std::string_view config,
                                          int32_t transpose_solve,
                                          int32_t return_stats,
-                                         int32_t reuse_setup,
+                                         int32_t reuse_level,
                                          int32_t use_x0,
                                          int32_t block_dim,
                                          int32_t device_mpi,
+                                         int32_t operator_id,
                                          int n_override = -1,
                                          int nnz_override = -1)
   {
@@ -715,7 +751,13 @@ namespace
     const int n_local = n_override >= 0
                             ? n_override
                             : static_cast<int>(b.dimensions().size() > 0 ? b.dimensions()[0] : 0);
-    const int nnz = nnz_override >= 0 ? nnz_override : static_cast<int>(values.element_count());
+    const int nnz = nnz_override >= 0 ? nnz_override : static_cast<int>(col_indices.element_count());
+    // At reuse level 2, empty values select the cached matrix (the same on every rank).
+    const bool has_values = values.element_count() != 0 || col_indices.element_count() == 0;
+    if (!has_values && reuse_level != 2)
+    {
+      return ffi::Error::InvalidArgument("matrix values are required below reuse level 2");
+    }
 
     // Block mode (block_dim > 1): local scalar CSR (with global columns) is
     // converted to BSR. Both the local partition and the global size must be
@@ -764,7 +806,8 @@ namespace
         comm_ptr_val,
         structure_hash,
         global_structure_hash,
-        std::string(config)};
+        std::string(config),
+        operator_id};
     // No lookup after a failed hash (a lookup reorders the cache).
     bool cache_hit = !hash_err && GetMPISolverCache().get(key, res);
     // Every rank's cache sees the same sequence of keys (collective solves,
@@ -791,12 +834,17 @@ namespace
           "The failed call ends this process's ordered MPI program; restart, and "
           "call jaxamg.clear_solver_cache() on every rank or on none");
     }
+    if (!cache_hit && !has_values)
+    {
+      return ReportMatrixMissing<T>(stream, x_data, n_local, stats_data, stats->element_count());
+    }
 
     // Destroys freshly created resources on any early return below (armed only
     // on the cache-miss path; disarmed once the cache takes ownership).
     FreshResourceGuard fresh_guard{&res};
 
-    if (cache_hit)
+    // Reuse level 2 uses the cached matrix and hierarchy as they are.
+    if (cache_hit && reuse_level != 2)
     {
       if (bs > 1)
       {
@@ -825,9 +873,13 @@ namespace
             res.A, n_local, nnz, res.values_buf, nullptr));
       }
 
-      // reuse_setup keeps the existing hierarchy while still refreshing the fine matrix.
-      if (!reuse_setup)
+      // Level 1 keeps the hierarchy while still refreshing the fine matrix.
+      if (reuse_level == 0)
         AMGX_SAFE_CALL(AMGX_solver_resetup(res.solver, res.A));
+    }
+
+    if (cache_hit)
+    {
       AMGX_SAFE_CALL(AMGX_vector_upload(res.b_vec, n_local_b, bs, b_data));
       // AMGX_solver_solve treats the x vector's contents as the initial guess.
       if (use_x0 != 0)
@@ -1060,12 +1112,13 @@ namespace
                                   std::string_view config,
                                   int32_t transpose_solve,
                                   int32_t return_stats,
-                                  int32_t reuse_setup,
+                                  int32_t reuse_level,
                                   int32_t use_x0,
-                                  int32_t block_dim)
+                                  int32_t block_dim,
+                                  int32_t operator_id)
   {
     return AmgxSolveInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x0, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim);
+        stream, row_ptrs, col_indices, values, b, x0, x, stats, config, transpose_solve, return_stats, reuse_level, use_x0, block_dim, operator_id);
   }
 
   // Double implementation
@@ -1080,12 +1133,13 @@ namespace
                                         std::string_view config,
                                         int32_t transpose_solve,
                                         int32_t return_stats,
-                                        int32_t reuse_setup,
+                                        int32_t reuse_level,
                                         int32_t use_x0,
-                                        int32_t block_dim)
+                                        int32_t block_dim,
+                                        int32_t operator_id)
   {
     return AmgxSolveInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x0, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim);
+        stream, row_ptrs, col_indices, values, b, x0, x, stats, config, transpose_solve, return_stats, reuse_level, use_x0, block_dim, operator_id);
   }
 
 #ifdef JAXAMG_WITH_MPI
@@ -1104,15 +1158,16 @@ namespace
                                      std::string_view config,
                                      int32_t transpose_solve,
                                      int32_t return_stats,
-                                     int32_t reuse_setup,
+                                     int32_t reuse_level,
                                      int32_t use_x0,
                                      int32_t block_dim,
                                      int32_t device_mpi,
+                                     int32_t operator_id,
                                      int n_override = -1,
                                      int nnz_override = -1)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim, device_mpi, n_override, nnz_override);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_level, use_x0, block_dim, device_mpi, operator_id, n_override, nnz_override);
   }
 
   // MPI Double implementation
@@ -1130,15 +1185,16 @@ namespace
                                            std::string_view config,
                                            int32_t transpose_solve,
                                            int32_t return_stats,
-                                           int32_t reuse_setup,
+                                           int32_t reuse_level,
                                            int32_t use_x0,
                                            int32_t block_dim,
                                            int32_t device_mpi,
+                                           int32_t operator_id,
                                      int n_override = -1,
                                      int nnz_override = -1)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_setup, use_x0, block_dim, device_mpi, n_override, nnz_override);
+        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_level, use_x0, block_dim, device_mpi, operator_id, n_override, nnz_override);
   }
 
 #endif // JAXAMG_WITH_MPI

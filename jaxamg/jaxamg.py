@@ -1,7 +1,9 @@
 import functools
+import itertools
 import json
 import os
 import warnings
+import weakref
 from collections.abc import Callable
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, cast
@@ -112,6 +114,70 @@ class AMGXStatus(IntEnum):
         return f"{self.__class__.__name__}.{self.name}"
 
 
+# Native reuse levels of the public `reuse` values.
+_REUSE_LEVELS = {None: 0, "hierarchy": 1, "matrix": 2}
+# Native status of a kept-matrix solve when no matrix is cached.
+_MATRIX_MISSING = -1
+# Owner ids of kept matrices (0: none); a pattern keeps its id while it lives.
+_matrix_ids = itertools.count(1)
+_pattern_matrix_ids: "weakref.WeakKeyDictionary[Any, int]" = weakref.WeakKeyDictionary()
+
+
+def _reuse_level(reuse: str | None) -> int:
+    if reuse not in _REUSE_LEVELS:
+        raise ValueError(f"reuse must be None, 'hierarchy' or 'matrix', got {reuse!r}")
+    return _REUSE_LEVELS[reuse]
+
+
+def _pattern_matrix_id(pattern: Any) -> int:
+    if pattern not in _pattern_matrix_ids:
+        _pattern_matrix_ids[pattern] = next(_matrix_ids)
+    return _pattern_matrix_ids[pattern]
+
+
+def _without_derivatives(native: Callable) -> Callable:
+    """``native`` (a function of arrays), refusing differentiation."""
+    wrapped = jax.custom_jvp(native)
+
+    def refuse(primals, tangents):
+        raise ValueError(
+            "a solve with reuse='matrix' is not differentiable: it solves with "
+            "the kept matrix without reading A; use reuse='hierarchy'"
+        )
+
+    wrapped.defjvp(refuse)
+    return wrapped
+
+
+@jax.custom_batching.custom_vmap
+def _any_member(flag: jax.Array) -> jax.Array:
+    """``flag``; under ``vmap``, whether any batch member's flag is set (unbatched)."""
+    return flag
+
+
+@_any_member.def_vmap
+def _any_member_vmap(axis_size, in_batched, flag):
+    return (jnp.any(flag) if in_batched[0] else flag), False
+
+
+def _solve_kept_matrix(
+    solve_with: Callable, values: Callable, missing: Callable
+) -> Any:
+    """Solve with the kept matrix, evaluating ``values()`` only when needed.
+
+    In a staged program, ``solve_with(None)`` uses the cached matrix; when
+    ``missing(info)`` reports none, ``solve_with(values())`` sets it up.
+    Eagerly, ``solve_with(values())`` runs directly: a cached matrix ignores
+    the values, and their derivatives reach the refusal."""
+    # Only a staged program (jit) traces a new constant.
+    if not isinstance(jnp.zeros(()), jax.core.Tracer):
+        return solve_with(values())
+    out = solve_with(None)
+    # Batch members share one kept matrix, so they take one branch (no select).
+    absent = _any_member(missing(out[1]))
+    return jax.lax.cond(absent, lambda: solve_with(values()), lambda: out)
+
+
 def _amgx_solve_impl(
     row_ptrs: ArrayLike,
     col_indices: ArrayLike,
@@ -121,12 +187,17 @@ def _amgx_solve_impl(
     config_str: str = "",
     transpose_solve: bool = False,
     return_stats: bool = False,
-    reuse_setup: bool = False,
+    reuse_level: int = 0,
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
+    operator_id: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
-    """Low-level FFI call to AmgX solver (non-differentiable)."""
+    """Low-level FFI call to AmgX solver (non-differentiable).
+
+    ``reuse_level`` 0 refreshes the cached matrix and hierarchy, 1 only the
+    matrix, 2 neither; at level 2, empty ``values`` select the matrix kept for
+    ``operator_id``."""
 
     _ensure_backend()
     b = jnp.asarray(b)
@@ -160,9 +231,10 @@ def _amgx_solve_impl(
         config=config_str,
         transpose_solve=np.int32(transpose_solve),
         return_stats=np.int32(return_stats),
-        reuse_setup=np.int32(reuse_setup),
+        reuse_level=np.int32(reuse_level),
         use_x0=np.int32(use_x0),
         block_dim=np.int32(block_dim),
+        operator_id=np.int32(operator_id),
     )
 
     return cast(tuple, results)
@@ -266,14 +338,17 @@ def _amgx_solve_mpi_impl(
     config_str: str = "",
     transpose_solve: bool = False,
     return_stats: bool = False,
-    reuse_setup: bool = False,
+    reuse_level: int = 0,
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
     ordered: bool = True,
     local_sizes: ArrayLike | None = None,
+    operator_id: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX MPI solver (non-differentiable).
+
+    ``reuse_level`` and ``operator_id`` are as in ``_amgx_solve_impl``.
 
     ``ordered`` (per-rank programs) joins mpi4jax's ordered effect, so every
     rank issues its AmgX solves, neighbour exchanges and mpi4jax collectives
@@ -308,11 +383,12 @@ def _amgx_solve_mpi_impl(
         config=config_str,
         transpose_solve=int(transpose_solve),
         return_stats=int(return_stats),
-        reuse_setup=int(reuse_setup),
+        reuse_level=int(reuse_level),
         res_history_len=int(res_history_len),
         use_x0=int(use_x0),
         block_dim=int(block_dim),
         ordered=bool(ordered),
+        operator_id=int(operator_id),
     )
     return x, stats
 
@@ -322,7 +398,7 @@ def _get_adjoint_primitive(
     config_str: str,
     is_symmetric: bool = False,
     return_stats: bool = False,
-    reuse_setup: bool = False,
+    reuse_level: int = 0,
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
@@ -331,7 +407,7 @@ def _get_adjoint_primitive(
     The adjoint-rule solve (a ``custom_vjp``, reverse mode only) for one native
     configuration, cached per configuration.
 
-    reuse_setup: Skip warm AMGX resetup and keep the cached hierarchy.
+    reuse_level: Native reuse level, 0 or 1 (keep the cached hierarchy).
     res_history_len: Residual-history slots appended to the stats output.
     use_x0: Honor the x0 operand as the initial guess (otherwise it is a
         same-shape dummy and the solve starts from zero).
@@ -348,7 +424,7 @@ def _get_adjoint_primitive(
             x0,
             config_str=config_str,
             return_stats=return_stats,
-            reuse_setup=reuse_setup,
+            reuse_level=reuse_level,
             res_history_len=res_history_len,
             use_x0=use_x0,
             block_dim=block_dim,
@@ -374,7 +450,7 @@ def _get_adjoint_primitive(
             config_str,
             is_symmetric,
             return_stats=False,
-            reuse_setup=reuse_setup,
+            reuse_level=reuse_level,
             block_dim=block_dim,
         )
 
@@ -394,7 +470,7 @@ def _get_adjoint_primitive(
                     g_x,
                     config_str=config_str,
                     transpose_solve=True,
-                    reuse_setup=reuse_setup,
+                    reuse_level=reuse_level,
                     block_dim=block_dim,
                 )
             except Exception:
@@ -422,7 +498,7 @@ def _single_gpu_services(
     config_str: str,
     is_symmetric: bool = False,
     return_stats: bool = False,
-    reuse_setup: bool = False,
+    reuse_level: int = 0,
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
@@ -441,7 +517,7 @@ def _single_gpu_services(
             x0,
             config_str=config_str,
             return_stats=return_stats,
-            reuse_setup=reuse_setup,
+            reuse_level=reuse_level,
             res_history_len=res_history_len,
             use_x0=use_x0,
             block_dim=block_dim,
@@ -455,7 +531,7 @@ def _single_gpu_services(
             rhs,
             None,
             config_str=config_str,
-            reuse_setup=reuse_setup,
+            reuse_level=reuse_level,
             block_dim=block_dim,
         )[0]
 
@@ -471,7 +547,7 @@ def _single_gpu_services(
                 None,
                 config_str=config_str,
                 transpose_solve=True,
-                reuse_setup=reuse_setup,
+                reuse_level=reuse_level,
                 block_dim=block_dim,
             )[0]
         except Exception:
@@ -489,7 +565,7 @@ def _get_implicit_primitive(
     config_str: str,
     is_symmetric: bool = False,
     return_stats: bool = False,
-    reuse_setup: bool = False,
+    reuse_level: int = 0,
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
@@ -502,7 +578,7 @@ def _get_implicit_primitive(
         config_str,
         is_symmetric,
         return_stats,
-        reuse_setup,
+        reuse_level,
         res_history_len,
         use_x0,
         block_dim,
@@ -546,7 +622,7 @@ def _get_adjoint_primitive_mpi(
     transpose_exchange: Any = None,
     transpose_reverse: bool = False,
     return_stats: bool = False,
-    reuse_setup: bool = False,
+    reuse_level: int = 0,
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
@@ -598,7 +674,7 @@ def _get_adjoint_primitive_mpi(
             lrank_arr,
             config_str=config_str,
             return_stats=return_stats,
-            reuse_setup=reuse_setup,
+            reuse_level=reuse_level,
             res_history_len=res_history_len,
             use_x0=use_x0,
             block_dim=block_dim,
@@ -632,7 +708,7 @@ def _get_adjoint_primitive_mpi(
             transpose_exchange=transpose_exchange,
             transpose_reverse=not transpose_reverse,
             return_stats=return_stats,
-            reuse_setup=reuse_setup,
+            reuse_level=reuse_level,
             block_dim=block_dim,
             ordered=ordered,
         )
@@ -704,7 +780,7 @@ def _get_implicit_primitive_mpi(
     halo_exchange: Any = None,
     transpose_exchange: Any = None,
     return_stats: bool = False,
-    reuse_setup: bool = False,
+    reuse_level: int = 0,
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
@@ -738,7 +814,7 @@ def _get_implicit_primitive_mpi(
             jnp.asarray(lrank_arr),
             config_str=config_str,
             return_stats=stats,
-            reuse_setup=reuse_setup,
+            reuse_level=reuse_level,
             res_history_len=history,
             use_x0=warm,
             block_dim=block_dim,
@@ -842,7 +918,7 @@ def solve(
     nglobal: int | None = None,
     partition_info: tuple[int, int] | None = None,
     save_stats_file: str | os.PathLike | None = None,
-    reuse_setup: bool = False,
+    reuse: str | None = None,
     nullspace: NullSpaceSpec = None,
     transpose_nullspace: NullSpaceSpec = None,
     labels: LabelSpec = None,
@@ -862,7 +938,7 @@ def solve(
         nglobal: Global matrix row count for MPI mode. Required when `comm` is provided and MPI metadata is not pre-attached to `A`.
         partition_info: `(row_start, row_end)` owned by this rank in MPI mode.  Required when `comm` is provided and MPI metadata is not pre-attached to `A`.
         save_stats_file: Optional file path to save detailed AmgX solver statistics.  If None, no file is created.
-        reuse_setup: For repeated solves with the same sparsity pattern, skip warm `AMGX_solver_resetup` and keep the cached hierarchy. This is cheaper per solve but may require more iterations if matrix coefficients change significantly.
+        reuse: What repeated solves with the same sparsity pattern and configuration keep from the cached solver. `None` (default) refreshes the matrix values and rebuilds the hierarchy (`AMGX_solver_resetup`). `"hierarchy"` refreshes the values but keeps the hierarchy: cheaper per solve, but it may need more iterations if the coefficients change significantly. `"matrix"` keeps both, for an operator whose values never change: `A` must be a callable declared with `with_cache(A, pattern=...)`, and solves of operators with the same pattern object use the first solve's matrix. Inside `jit`, `A` is evaluated only when that matrix is not cached. Each kept matrix takes its own cache entry (`JAXAMG_CACHE_SIZE`); such solves run on a single GPU or through `make_sharded_solver` and are not differentiable.
         nullspace: Basis of `null(A)` for singular systems: `"constant"`, a length-`n` vector, or an `(n, k)` array (local rows in MPI mode). The solution is pinned orthogonal to it, and the transpose of that pin projects the adjoint right-hand side onto `range(Aᵀ)`, which makes the backward solve converge. Gradients w.r.t. `A` assume perturbations that preserve the declared null spaces (`dA·N = 0`, `Mᵀ·dA = 0`), as coefficient changes of a conservative discretization do. Defaults to the basis attached with `with_cache`.
         transpose_nullspace: Basis of `null(Aᵀ)` (same formats). `b` is projected onto `range(A)` (removed fraction in `info["rhs_inconsistency"]`) and, by transposition, the adjoint solution is pinned: the forward returns `A⁺b`, `jax.grad` returns `(Aᵀ)⁺g`. Equals `nullspace` for symmetric `A` (filled in when `A` is marked symmetric); for nonsymmetric `A` it differs, e.g. `A = D⁻¹L` has `nullspace="constant"` but `transpose_nullspace=V` (cell volumes). Defaults to the basis attached with `with_cache`.
         labels: The pair `(count, labels)`, as `scipy.sparse.csgraph.connected_components` returns it: a static label count and one integer label per row (local rows in MPI mode, possibly traced), -1 for rows in no component, for a disconnected domain: every declared `nullspace`/`transpose_nullspace` column then applies separately on each label's rows (the null space is block diagonal over the labels), e.g. `nullspace="constant"` with labels declares one constant vector per component. A label whose columns vanish on its rows (no rows, or all of them -1 in this solve) is skipped exactly; columns dependent within a label are rejected (concrete values). Without labels the null space is the columns themselves. Defaults to the labels attached with `with_cache`.
@@ -881,6 +957,12 @@ def solve(
     if derivative not in _DERIVATIVE_POLICIES:
         raise ValueError(
             f"derivative must be one of {_DERIVATIVE_POLICIES}, got {derivative!r}"
+        )
+    reuse_level = _reuse_level(reuse)
+    # The removed option would otherwise pass silently into the AmgX configuration.
+    if "reuse_setup" in kwargs:
+        raise TypeError(
+            "reuse_setup was replaced by reuse: reuse_setup=True is reuse='hierarchy'"
         )
     b = jnp.asarray(b)
 
@@ -1000,6 +1082,11 @@ def solve(
                 "Rebuild with MPI enabled (JAXAMG_ENABLE_MPI=1, with mpicxx on "
                 "PATH) to use distributed solves."
             )
+        if reuse == "matrix":
+            raise ValueError(
+                "reuse='matrix' supports single-GPU solves and "
+                "make_sharded_solver, not per-rank MPI solves"
+            )
         if mpi_cache is None:
             # Validate parameters for non-cache path
             if nglobal is None:
@@ -1059,7 +1146,7 @@ def solve(
                     None if transpose_plan is None else transpose_plan.exchange
                 ),
                 return_stats=1 if save_stats_file else 0,
-                reuse_setup=reuse_setup,
+                reuse_level=reuse_level,
                 res_history_len=res_history_len,
                 use_x0=use_x0,
                 block_dim=block_dim,
@@ -1151,7 +1238,7 @@ def solve(
                     None if transpose_plan is None else transpose_plan.exchange
                 ),
                 return_stats=1 if save_stats_file else 0,
-                reuse_setup=reuse_setup,
+                reuse_level=reuse_level,
                 res_history_len=res_history_len,
                 use_x0=use_x0,
                 block_dim=block_dim,
@@ -1226,39 +1313,79 @@ def solve(
 
     else:
         # Single-GPU mode: use int32 indices
-        A_csr = to_bcsr_matrix(A, b)
-        # Get cached primitive for this configuration and derivative policy
-        primitive = (
-            _get_implicit_primitive
-            if derivative == "implicit"
-            else _get_adjoint_primitive
-        )
-        solver = primitive(
-            config_str,
-            is_symmetric=is_symmetric,
-            return_stats=1 if save_stats_file else 0,
-            reuse_setup=reuse_setup,
-            res_history_len=res_history_len,
-            use_x0=use_x0,
-            block_dim=block_dim,
-        )
         comm_obj = None
         reduce_sum = None
+        if reuse_level == 2:
+            pattern = getattr(A, "_pattern", None)
+            if not callable(A) or pattern is None:
+                raise ValueError(
+                    "reuse='matrix' needs an operator (a callable) declared with "
+                    "jaxamg.with_cache(A, pattern=...): the pattern object "
+                    "identifies the kept matrix and orders its values"
+                )
+            # The declared structure, which A's materialization follows; A is
+            # evaluated only when the kept matrix is not cached.
+            A_csr = None
+            layout = pattern._materialization_layout()
+            indptr = jnp.asarray(layout.indptr, jnp.int32)
+            indices = jnp.asarray(layout.cols, jnp.int32)
+            native = _without_derivatives(
+                functools.partial(
+                    _amgx_solve_impl,
+                    config_str=config_str,
+                    return_stats=1 if save_stats_file else 0,
+                    reuse_level=reuse_level,
+                    res_history_len=res_history_len,
+                    use_x0=use_x0,
+                    block_dim=block_dim,
+                    operator_id=_pattern_matrix_id(pattern),
+                )
+            )
 
-        def run(b_: jax.Array, x0_: jax.Array) -> tuple[jax.Array, jax.Array]:
-            return solver(A_csr, b_, x0_)
+            def run(b_: jax.Array, x0_: jax.Array) -> tuple[jax.Array, jax.Array]:
+                def solve_with(values: jax.Array | None) -> tuple[jax.Array, jax.Array]:
+                    if values is None:
+                        values = jnp.zeros(0, target_dtype)
+                    return native(indptr, indices, values, b_, x0_)
 
-        def matvec(basis: jax.Array) -> jax.Array:
-            return A_csr @ basis
+                return _solve_kept_matrix(
+                    solve_with,
+                    lambda: to_bcsr_matrix(A, b).data,
+                    lambda info: info[2] == _MATRIX_MISSING,
+                )
 
-        def matvec_T(basis: jax.Array) -> jax.Array:
-            return A_csr.to_bcoo().T @ basis
+        else:
+            A_csr = to_bcsr_matrix(A, b)
+            # Get cached primitive for this configuration and derivative policy
+            primitive = (
+                _get_implicit_primitive
+                if derivative == "implicit"
+                else _get_adjoint_primitive
+            )
+            solver = primitive(
+                config_str,
+                is_symmetric=is_symmetric,
+                return_stats=1 if save_stats_file else 0,
+                reuse_level=reuse_level,
+                res_history_len=res_history_len,
+                use_x0=use_x0,
+                block_dim=block_dim,
+            )
+
+            def run(b_: jax.Array, x0_: jax.Array) -> tuple[jax.Array, jax.Array]:
+                return solver(A_csr, b_, x0_)
+
+            def matvec(basis: jax.Array) -> jax.Array:
+                return A_csr @ basis
+
+            def matvec_T(basis: jax.Array) -> jax.Array:
+                return A_csr.to_bcoo().T @ basis
 
         column_labels = None
 
     # Null-space projections as JAX ops around the primitive; their
     # transposes are the adjoint projections (see nullspace.py).
-    n_local = A_csr.shape[0]
+    n_local = b.shape[0] if A_csr is None else A_csr.shape[0]
     if comm_obj is None:
         n_columns = None
     else:
@@ -1299,7 +1426,9 @@ def solve(
         # Keeps XLA from constant-folding reductions of a concrete basis (slow for large n).
         N, M = jax.lax.optimization_barrier((N, M))
         N, M = unit_bases((N, M), basis_max)
-    if N is None and M is None:
+    if A_csr is None:
+        pass  # A is not evaluated for a kept matrix
+    elif N is None and M is None:
         warn_if_singular(A_csr, comm=comm_obj, stacklevel=3)
     else:
         checks: dict[str, Any] = dict(comm=comm_obj, stacklevel=3, labels=labels)
