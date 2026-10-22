@@ -272,6 +272,18 @@ def cache_mpi_metadata(
 
     # Compute MPI communication metadata
     all_sizes = comm.allgather(n_local)
+    recvcounts_tuple = tuple(int(s) for s in all_sizes)
+
+    # Native uploads now derive their global size from the local row counts.
+    # Validate the cached declaration collectively before building any plans.
+    from mpi4py import MPI
+
+    total_rows = sum(recvcounts_tuple)
+    if comm.allreduce(nglobal != total_rows, op=MPI.LOR):
+        raise ValueError(
+            "nglobal must match the sum of local row counts "
+            f"({total_rows}) on every rank"
+        )
 
     from .mpi_utils import build_halo_plan, build_transpose_plan
 
@@ -306,8 +318,6 @@ def cache_mpi_metadata(
         )
         local_col_indices = np.asarray(A_materialized.indices)
         local_indptr = np.asarray(A_materialized.indptr)
-
-    recvcounts_tuple = tuple(int(s) for s in all_sizes)
 
     # The transpose plan serves the backward pass of nonsymmetric solves.
     if is_symmetric:

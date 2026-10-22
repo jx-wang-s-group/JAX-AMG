@@ -332,7 +332,6 @@ def _amgx_solve_mpi_impl(
     values: ArrayLike,
     b: ArrayLike,
     x0: ArrayLike | None,
-    nglobal: ArrayLike,
     comm_ptr: ArrayLike,
     lrank: ArrayLike,
     config_str: str = "",
@@ -372,7 +371,6 @@ def _amgx_solve_mpi_impl(
         jnp.asarray(values),
         b,
         b if x0 is None else jnp.asarray(x0),
-        jnp.asarray(nglobal),
         jnp.asarray(comm_ptr),
         jnp.asarray(lrank),
         (
@@ -613,7 +611,6 @@ def _transpose_plan_operands(
 @functools.lru_cache(maxsize=32)
 def _get_adjoint_primitive_mpi(
     config_str: str,
-    nglobal: int,
     comm_ptr: int,
     lrank: int,
     is_symmetric: bool = False,
@@ -650,8 +647,6 @@ def _get_adjoint_primitive_mpi(
         halo: tuple[jax.Array, ...],
         transpose: tuple[jax.Array, ...],
     ) -> tuple[jax.Array, jax.Array]:
-        nglobal_arr = jnp.array([nglobal], dtype=jnp.int32)
-
         # Split 64-bit comm_ptr into two int32 values for FFI
         comm_ptr_low_unsigned = comm_ptr & 0xFFFFFFFF
         comm_ptr_high_unsigned = (comm_ptr >> 32) & 0xFFFFFFFF
@@ -669,7 +664,6 @@ def _get_adjoint_primitive_mpi(
             A.data,
             b,
             x0,
-            nglobal_arr,
             comm_ptr_arr,
             lrank_arr,
             config_str=config_str,
@@ -699,7 +693,6 @@ def _get_adjoint_primitive_mpi(
         # the residual-history readback).
         adj_solver = _get_adjoint_primitive_mpi(
             config_str,
-            nglobal,
             comm_ptr,
             lrank,
             is_symmetric=is_symmetric,
@@ -772,7 +765,6 @@ def _get_adjoint_primitive_mpi(
 @functools.lru_cache(maxsize=32)
 def _get_implicit_primitive_mpi(
     config_str: str,
-    nglobal: int,
     comm_ptr: int,
     lrank: int,
     is_symmetric: bool = False,
@@ -796,7 +788,6 @@ def _get_implicit_primitive_mpi(
     """
     from .core import implicit_solver
 
-    nglobal_arr = np.array([nglobal], dtype=np.int32)
     low = np.int32(np.uint32(comm_ptr & 0xFFFFFFFF))
     high = np.int32(np.uint32((comm_ptr >> 32) & 0xFFFFFFFF))
     comm_ptr_arr = np.array([low, high], dtype=np.int32)
@@ -809,7 +800,6 @@ def _get_implicit_primitive_mpi(
             values,
             b,
             x0,
-            jnp.asarray(nglobal_arr),
             jnp.asarray(comm_ptr_arr),
             jnp.asarray(lrank_arr),
             config_str=config_str,
@@ -1136,7 +1126,6 @@ def solve(
             transpose_operands = _transpose_plan_operands(A_csr, transpose_plan)
             solver = mpi_primitive(
                 mpi_cache["config_str"],
-                mpi_cache["nglobal"],
                 mpi_cache["comm_ptr"],
                 mpi_cache["lrank"],
                 is_symmetric=is_symmetric,
@@ -1172,11 +1161,8 @@ def solve(
             # Gather partition sizes from all ranks (row partition + displacements)
             n_local = A_csr.shape[0]
             all_sizes_list = comm.allgather(n_local)
-            recvcounts_val = np.array(all_sizes_list, dtype=np.int32)
-            displs_val = np.cumsum(np.concatenate(([0], recvcounts_val[:-1]))).astype(
-                np.int32
-            )
-            recvcounts_tuple = tuple(recvcounts_val.tolist())
+            # Local counts fit int32; their global prefix sums need not.
+            recvcounts_tuple = tuple(int(n) for n in all_sizes_list)
 
             # Validate partition_info against the partition actually implied by
             # the local matrix shapes (which is what AmgX uses). Reduce first so
@@ -1184,7 +1170,7 @@ def solve(
             # the other ranks deadlocked in the collectives below.
             from mpi4py import MPI
 
-            row_start = int(displs_val[rank])
+            row_start = sum(recvcounts_tuple[:rank])
             derived_partition = (row_start, row_start + n_local)
             mismatch = tuple(partition_info) != derived_partition
             if comm.allreduce(mismatch, op=MPI.LOR):
@@ -1199,6 +1185,17 @@ def solve(
                     f"from the local matrix shapes ({detail}). Each rank must "
                     "pass its own (row_start, row_end) matching its local "
                     "partition."
+                )
+
+            # The native upload derives its global size from these counts.
+            # Keep the public metadata consistent with that size as well.
+            total_rows = sum(recvcounts_tuple)
+            if comm.allreduce(
+                nglobal != total_rows or A_csr.shape[1] != total_rows, op=MPI.LOR
+            ):
+                raise ValueError(
+                    "nglobal and the matrix column count must match the sum "
+                    f"of local row counts ({total_rows}) on every rank"
                 )
 
             # Halo-exchange plan for the backward pass (fetches only the remote
@@ -1228,7 +1225,6 @@ def solve(
 
             solver = mpi_primitive(
                 config_str,
-                nglobal,
                 comm_ptr,
                 lrank,
                 is_symmetric=is_symmetric,

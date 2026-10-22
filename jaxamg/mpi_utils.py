@@ -710,8 +710,8 @@ def make_allgather_vector(
     # Static communication layout, computed once and captured by the closure.
     all_sizes = comm.allgather(n_local)
     recvcounts_tuple = tuple(int(s) for s in all_sizes)
-    recvcounts_np = np.array(recvcounts_tuple, dtype=np.int32)
-    displacements = np.insert(np.cumsum(recvcounts_np[:-1]), 0, 0).astype(np.int32)
+    recvcounts_np = np.array(recvcounts_tuple, dtype=np.int64)
+    displacements = np.insert(np.cumsum(recvcounts_np[:-1]), 0, 0)
 
     total = int(recvcounts_np.sum())
     if total != int(nglobal):

@@ -262,7 +262,6 @@ namespace
     // row_ptrs + col_indices content) ensure stable hits and correct structural identity
     // for AMGX_matrix_replace_coefficients on the cache-hit path.
     int n_local;
-    int n_global;
     int nnz;
     int lrank;
     int mode; // AMGX_Mode (dFFI vs dDDI)
@@ -280,7 +279,6 @@ namespace
     bool operator==(const MPICacheKey &other) const
     {
       return n_local == other.n_local &&
-             n_global == other.n_global &&
              nnz == other.nnz &&
              lrank == other.lrank &&
              mode == other.mode &&
@@ -322,21 +320,20 @@ namespace std
     size_t operator()(const MPICacheKey &k) const
     {
       size_t h1 = hash<int>()(k.n_local);
-      size_t h2 = hash<int>()(k.n_global);
-      size_t h3 = hash<int>()(k.nnz);
-      size_t h4 = hash<int>()(k.lrank);
-      size_t h5 = hash<int>()(k.mode);
-      size_t h6 = hash<bool>()(k.transpose_solve);
-      size_t h7 = hash<uint64_t>()(k.comm_ptr);
-      size_t h8 = hash<size_t>()(k.structure_hash);
-      size_t h9 = hash<string>()(k.config);
-      size_t h10 = hash<int>()(k.block_dim);
-      size_t h11 = hash<uint64_t>()(k.global_structure_hash);
-      size_t h12 = hash<int>()(k.operator_id);
+      size_t h2 = hash<int>()(k.nnz);
+      size_t h3 = hash<int>()(k.lrank);
+      size_t h4 = hash<int>()(k.mode);
+      size_t h5 = hash<bool>()(k.transpose_solve);
+      size_t h6 = hash<uint64_t>()(k.comm_ptr);
+      size_t h7 = hash<size_t>()(k.structure_hash);
+      size_t h8 = hash<string>()(k.config);
+      size_t h9 = hash<int>()(k.block_dim);
+      size_t h10 = hash<uint64_t>()(k.global_structure_hash);
+      size_t h11 = hash<int>()(k.operator_id);
 
       return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^
              (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7) ^ (h9 << 8) ^
-             (h10 << 9) ^ (h11 << 10) ^ (h12 << 11);
+             (h10 << 9) ^ (h11 << 10);
     }
   };
 } // namespace std
@@ -353,7 +350,7 @@ namespace
     AMGX_vector_handle b_vec = nullptr;
     void *values_buf = nullptr;            // MPI replace_coefficients buffer (null for non-MPI)
     void *row_ptrs_buf = nullptr;          // MPI: cache-owned copy of local row_ptrs (see cold path)
-    void *col_indices_buf = nullptr;       // MPI: cache-owned int32 copy of local global col_indices
+    void *col_indices_buf = nullptr;       // MPI: global columns in the AmgX upload index type
     void *transpose_row_ptrs = nullptr;    // transpose_solve mode only
     void *transpose_col_indices = nullptr; // transpose_solve mode only
     void *transpose_values = nullptr;      // transpose_solve mode only

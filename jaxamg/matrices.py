@@ -22,6 +22,15 @@ import scipy.sparse as sp
 from jax.typing import DTypeLike
 
 from .mpi_utils import get_partition_info
+from .utils import temp_enable_x64
+
+
+def _global_column_indices(indices, n_global):
+    """Preserve large global columns without changing small-matrix JAX behavior."""
+    if n_global <= np.iinfo(np.int32).max:
+        return jnp.array(indices, dtype=jnp.int32)
+    with temp_enable_x64():
+        return jnp.array(indices, dtype=jnp.int64)
 
 
 def tridiagonal_matrix(
@@ -358,11 +367,10 @@ def tridiagonal_matrix_distributed(
     indices = stencil_cols[valid]
     indptr = np.concatenate(([0], np.cumsum(valid.sum(axis=1))))
 
-    # Indices are int32 by default; converted to int64 by _ensure_bcsr_properties if needed for MPI
     A_local = jsp.BCSR(
         (
             data,
-            jnp.array(indices, dtype=jnp.int32),
+            _global_column_indices(indices, n_global),
             jnp.array(indptr, dtype=jnp.int32),
         ),
         shape=(n_local, n_global),
@@ -429,11 +437,10 @@ def poisson_matrix_distributed(
     indices = stencil_cols[valid]
     indptr = np.concatenate(([0], np.cumsum(valid.sum(axis=1))))
 
-    # Indices are int32 by default; converted to int64 by _ensure_bcsr_properties if needed for MPI
     A_local = jsp.BCSR(
         (
             jnp.array(data, dtype=dtype),
-            jnp.array(indices, dtype=jnp.int32),
+            _global_column_indices(indices, n),
             jnp.array(indptr, dtype=jnp.int32),
         ),
         shape=(n_local, n),
@@ -486,12 +493,11 @@ def random_matrix_distributed(
     diag = abs(A_local).sum(axis=1).A1 + 1.0
     A_local.setdiag(diag, k=row_start)
 
-    # Indices are int32 by default; converted to int64 by _ensure_bcsr_properties if needed for MPI
     return (
         jsp.BCSR(
             (
                 jnp.array(A_local.data, dtype=dtype),
-                jnp.array(A_local.indices, dtype=jnp.int32),
+                _global_column_indices(A_local.indices, n_global),
                 jnp.array(A_local.indptr, dtype=jnp.int32),
             ),
             shape=(n_local, n_global),

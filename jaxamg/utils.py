@@ -266,7 +266,11 @@ def to_bcsr_matrix(
     if isinstance(A, jsp.BCSR):
         A_bcsr = A
     elif isinstance(A, jsp.BCOO):
-        A_bcsr = jsp.BCSR.from_bcoo(A)
+        if use_int64_indices:
+            with temp_enable_x64():
+                A_bcsr = jsp.BCSR.from_bcoo(A)
+        else:
+            A_bcsr = jsp.BCSR.from_bcoo(A)
     elif sp.issparse(A):
         # Use numpy dtype for scipy conversion
         np_dtype = np.float64 if target_dtype == jnp.float64 else np.float32
@@ -281,7 +285,14 @@ def to_bcsr_matrix(
                 sp.dok_matrix,
             ),
         ):
-            A_bcsr = jsp.BCSR.from_scipy_sparse(A.astype(np_dtype))
+            if use_int64_indices:
+                # Global MPI columns can exceed int32.
+                with temp_enable_x64():
+                    A_bcsr = jsp.BCSR.from_scipy_sparse(
+                        A.astype(np_dtype), index_dtype=np.int64
+                    )
+            else:
+                A_bcsr = jsp.BCSR.from_scipy_sparse(A.astype(np_dtype))
         else:
             raise TypeError(
                 f"Unsupported scipy sparse matrix type: {type(A).__name__}."
