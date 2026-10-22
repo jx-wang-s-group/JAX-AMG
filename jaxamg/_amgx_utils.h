@@ -231,6 +231,7 @@ namespace
     int block_dim;
     size_t structure_hash; // device fingerprint of row_ptrs + col_indices (_pattern_hash.cu)
     std::string config;
+    int operator_id; // a kept matrix's owner (0: values arrive with every solve)
 
     bool operator==(const CacheKey &other) const
     {
@@ -240,7 +241,8 @@ namespace
              transpose_solve == other.transpose_solve &&
              block_dim == other.block_dim &&
              structure_hash == other.structure_hash &&
-             config == other.config;
+             config == other.config &&
+             operator_id == other.operator_id;
     }
   };
 
@@ -273,6 +275,7 @@ namespace
     // can match on some ranks and not others, e.g. for A and Aᵀ).
     uint64_t global_structure_hash;
     std::string config;
+    int operator_id; // as in CacheKey
 
     bool operator==(const MPICacheKey &other) const
     {
@@ -286,7 +289,8 @@ namespace
              comm_ptr == other.comm_ptr &&
              structure_hash == other.structure_hash &&
              global_structure_hash == other.global_structure_hash &&
-             config == other.config;
+             config == other.config &&
+             operator_id == other.operator_id;
     }
   };
 } // namespace
@@ -305,9 +309,10 @@ namespace std
       size_t h5 = hash<size_t>()(k.structure_hash);
       size_t h6 = hash<string>()(k.config);
       size_t h7 = hash<int>()(k.block_dim);
+      size_t h8 = hash<int>()(k.operator_id);
 
       return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5) ^
-             (h7 << 6);
+             (h7 << 6) ^ (h8 << 7);
     }
   };
 
@@ -327,10 +332,11 @@ namespace std
       size_t h9 = hash<string>()(k.config);
       size_t h10 = hash<int>()(k.block_dim);
       size_t h11 = hash<uint64_t>()(k.global_structure_hash);
+      size_t h12 = hash<int>()(k.operator_id);
 
       return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^
              (h5 << 4) ^ (h6 << 5) ^ (h7 << 6) ^ (h8 << 7) ^ (h9 << 8) ^
-             (h10 << 9) ^ (h11 << 10);
+             (h10 << 9) ^ (h11 << 10) ^ (h12 << 11);
     }
   };
 } // namespace std

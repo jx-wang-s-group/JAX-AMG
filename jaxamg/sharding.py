@@ -21,7 +21,14 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from . import config as amgx_config
-from .jaxamg import _capture_and_save_stats
+from .jaxamg import (
+    _MATRIX_MISSING,
+    _capture_and_save_stats,
+    _matrix_ids,
+    _reuse_level,
+    _solve_kept_matrix,
+    _without_derivatives,
+)
 from .linear_map import LinearMap
 from .mpi_utils import (
     build_halo_plan,
@@ -809,7 +816,7 @@ def make_sharded_solver(
     config: dict[str, Any] | None = None,
     is_symmetric: bool = False,
     block_dim: int = 1,
-    reuse_setup: bool = False,
+    reuse: str | None = None,
     save_stats: bool = False,
 ) -> ShardedSolve:
     """Create a solver for a globally sharded RHS.
@@ -846,8 +853,9 @@ def make_sharded_solver(
         block_dim: AmgX block dimension. The matrix retains its scalar CSR
             representation, and every local row partition must be divisible by
             this value.
-        reuse_setup: Reuse the cached AmgX hierarchy across solves with the
-            same sparsity pattern.
+        reuse: As in :func:`jaxamg.solve`. With ``"matrix"``, each solver
+            keeps the matrix of its first solve, and inside ``jax.jit``
+            evaluates ``A`` only when that matrix is not cached.
         save_stats: Prepare the AmgX configuration with solver-statistics
             output enabled so a later direct call with
             ``solver(..., save_stats_file=...)`` produces a complete stats
@@ -866,6 +874,9 @@ def make_sharded_solver(
         raise TypeError("A must be created with jaxamg.make_sharded_matrix")
     if not isinstance(b, jax.Array):
         raise TypeError("b must be a global jax.Array")
+    reuse_level = _reuse_level(reuse)
+    # Each solver owns its kept matrix.
+    operator_id = next(_matrix_ids) if reuse_level == 2 else 0
     comm = A._comm
     mesh = A.mesh
     axis_name = A.axis_name
@@ -1105,24 +1116,31 @@ def make_sharded_solver(
     def native_solve(load, structure, values, rhs, x0, singular_):
         indptr_h, indices_h, sizes_h = structure
         comm_lrank = load(local_comm)
-        return _amgx_solve_mpi_impl(
-            load(indptr_h),
-            load(indices_h),
-            values,
-            rhs,
-            x0,
-            jnp.asarray(nglobal_arr),
-            comm_lrank[:2],
-            comm_lrank[2:],
-            config_str=config_for(singular_),
-            return_stats=int(save_stats),
-            reuse_setup=reuse_setup,
-            res_history_len=res_history_len,
-            use_x0=x0 is not None,
-            block_dim=block_dim,
-            ordered=False,
-            local_sizes=load(sizes_h),
-        )
+
+        def call(indptr, indices, values, rhs, x0, sizes):
+            return _amgx_solve_mpi_impl(
+                indptr,
+                indices,
+                values,
+                rhs,
+                x0,
+                jnp.asarray(nglobal_arr),
+                comm_lrank[:2],
+                comm_lrank[2:],
+                config_str=config_for(singular_),
+                return_stats=int(save_stats),
+                reuse_level=reuse_level,
+                res_history_len=res_history_len,
+                use_x0=x0 is not None,
+                block_dim=block_dim,
+                ordered=False,
+                local_sizes=sizes,
+                operator_id=operator_id,
+            )
+
+        if reuse_level == 2:
+            call = _without_derivatives(call)
+        return call(load(indptr_h), load(indices_h), values, rhs, x0, load(sizes_h))
 
     def info_specs_for(has_M: bool) -> dict:
         specs = {
@@ -1280,15 +1298,19 @@ def make_sharded_solver(
         )(tuple(bases), *rows)
         return bases, (rows[0] if rows else None)
 
-    def solve_map(structure, warm: bool, dense: tuple, singular_: bool):
+    def solve_map(
+        structure, warm: bool, dense: tuple, singular_: bool, kept: bool = False
+    ):
         """The mapped solve ``(values, rhs[, x0], *bases) -> (x, info)`` of
         ``structure`` (the primal or the adjoint's), with the unlabelled bases
         present in ``dense`` (nullspace, transpose_nullspace) projected in the
         map: b onto range(A) (the removed fraction reported), then x out of
-        null(A)."""
+        null(A). With ``kept``, it takes no values and uses the cached matrix."""
 
         def body(reduce, load):
-            def local(values, rhs, *rest):
+            def local(*operands):
+                values = jnp.zeros(0, A_data.dtype) if kept else operands[0]
+                rhs, *rest = operands[int(not kept) :]
                 x0 = rest[0] if warm else None
                 bases = list(rest[int(warm) :])
                 N = bases.pop(0) if dense[0] else None
@@ -1305,7 +1327,8 @@ def make_sharded_solver(
 
             return local
 
-        in_specs = (A_data_spec,) + (rhs_spec,) * (1 + int(warm))
+        in_specs: tuple = () if kept else (A_data_spec,)
+        in_specs += (rhs_spec,) * (1 + int(warm))
         in_specs += (columns_spec,) * sum(dense)
         return dispatch(
             body(mpi_reduce, loader(False)),
@@ -1710,32 +1733,42 @@ def make_sharded_solver(
         )
     )
 
+    def forward_solve(dense: tuple, count: int | None, reduce_sum):
+        """The forward solve ``run(structure, values, rhs, x0, N, M, rows)`` of
+        a solve whose null-space operands are prepared (see build_core);
+        ``values=None`` solves with the kept matrix."""
+        singular_ = any(dense)
+        project = None if count is None else label_projection(count, reduce_sum)
+
+        def run(structure, values, rhs, x0, N, M, rows):
+            warm = () if x0 is None else (x0,)
+            kept = values is None
+            held = () if kept else (values,)
+            if project is None:
+                present = (N is not None, M is not None)
+                solve = solve_map(structure, x0 is not None, present, singular_, kept)
+                bases = tuple(B for B in (N, M) if B is not None)
+                return solve(*held, rhs, *warm, *bases)
+            inconsistency = None
+            if M is not None:
+                rhs, inconsistency = project(rhs, M, rows)
+            solve = solve_map(structure, x0 is not None, (False, False), True, kept)
+            x, info = solve(*held, rhs, *warm)
+            if N is not None:
+                x, _ = project(x, N, rows)
+            if inconsistency is not None:
+                info = {**info, "rhs_inconsistency": inconsistency}
+            return x, info
+
+        return run
+
     def build_core(dense: tuple, count: int | None, reduce_sum):
         """The implicit core of a solve whose null-space operands ``aux`` =
         (nullspace, transpose_nullspace, labels) are prepared: ``dense``, the
         bases present; with ``count`` labels, the labelled projections run
         around the singular solve, their sums reduced by ``reduce_sum``. For
         Aᵀ the two null spaces exchange roles."""
-        singular_ = any(dense)
-        project = None if count is None else label_projection(count, reduce_sum)
-
-        def run(structure, values, rhs, x0, N, M, rows):
-            warm = () if x0 is None else (x0,)
-            if project is None:
-                present = (N is not None, M is not None)
-                solve = solve_map(structure, x0 is not None, present, singular_)
-                bases = tuple(B for B in (N, M) if B is not None)
-                return solve(values, rhs, *warm, *bases)
-            inconsistency = None
-            if M is not None:
-                rhs, inconsistency = project(rhs, M, rows)
-            solve = solve_map(structure, x0 is not None, (False, False), True)
-            x, info = solve(values, rhs, *warm)
-            if N is not None:
-                x, _ = project(x, N, rows)
-            if inconsistency is not None:
-                info = {**info, "rhs_inconsistency": inconsistency}
-            return x, info
+        run = forward_solve(dense, count, reduce_sum)
 
         def sharded_native(indptr, indices, values, rhs_, x0_, aux):
             N, M, rows = aux
@@ -1836,25 +1869,31 @@ def make_sharded_solver(
     ) -> tuple[jax.Array, ShardedInfo]:
         _validate_operand(rhs, b, mesh, axis_name, "b")
         traced = isinstance(rhs, jax.core.Tracer) or isinstance(x0, jax.core.Tracer)
-        if A_override is None:
-            if traced:
-                raise ValueError(
-                    "A must be passed explicitly (this rank's operator or "
-                    "matrix, or the packed values A.data) when a sharded solver "
-                    "is used inside jax.jit, jax.grad, or another JAX transform"
-                )
-            matrix_data = A_data
-        elif isinstance(A_override, jax.Array) and A_override.ndim == 1:
-            # The packed global values themselves.
-            matrix_data = A_override
-        elif isinstance(A_override, _global_operator_type()):
-            require_fixed_structure(
-                structure_problem(A_override.indices, A_override.indptr)
+        if A_override is None and traced:
+            raise ValueError(
+                "A must be passed explicitly (this rank's operator or "
+                "matrix, or the packed values A.data) when a sharded solver "
+                "is used inside jax.jit, jax.grad, or another JAX transform"
             )
-            matrix_data = A_override._packed_values(rhs)
-        else:
-            matrix_data = pack_operator(A_override, traced)
-        _validate_operand(matrix_data, A_data, mesh, axis_name, "A_data")
+
+        def packed_values() -> jax.Array:
+            if A_override is None:
+                matrix_data = A_data
+            elif isinstance(A_override, jax.Array) and A_override.ndim == 1:
+                # The packed global values themselves.
+                matrix_data = A_override
+            elif isinstance(A_override, _global_operator_type()):
+                require_fixed_structure(
+                    structure_problem(A_override.indices, A_override.indptr)
+                )
+                matrix_data = A_override._packed_values(rhs)
+            else:
+                matrix_data = pack_operator(A_override, traced)
+            _validate_operand(matrix_data, A_data, mesh, axis_name, "A_data")
+            return matrix_data
+
+        # A kept matrix's values are packed only when it is not cached.
+        matrix_data = None if reuse_level == 2 else packed_values()
         if save_stats_file is not None:
             if any(
                 isinstance(operand, jax.core.Tracer)
@@ -1919,15 +1958,23 @@ def make_sharded_solver(
             N = prepared.pop(0) if N is not None else None
             M = N if shared else (prepared.pop(0) if M is not None else None)
         reduce_sum = sum_over_ranks if label_sum is None else label_sum
-        core = build_core(
-            (N is not None, M is not None), None if rows is None else count, reduce_sum
-        )
-        result = core(
-            _PackedValues(matrix_data, no_structure, no_structure),
-            rhs,
-            x0,
-            (N, M, rows),
-        )
+        dense = (N is not None, M is not None)
+        count = None if rows is None else count
+        if reuse_level == 2:
+            run = forward_solve(dense, count, reduce_sum)
+            result = _solve_kept_matrix(
+                lambda values: run(primal_structure, values, rhs, x0, N, M, rows),
+                packed_values,
+                lambda info: jnp.any(info["status"] == _MATRIX_MISSING),
+            )
+        else:
+            core = build_core(dense, count, reduce_sum)
+            result = core(
+                _PackedValues(matrix_data, no_structure, no_structure),
+                rhs,
+                x0,
+                (N, M, rows),
+            )
         if save_stats_file is not None:
             # Statistics are captured during execution, so wait for the solve
             # to finish before reading them back from the extension.
