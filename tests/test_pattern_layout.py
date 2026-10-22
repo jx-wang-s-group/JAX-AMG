@@ -161,6 +161,27 @@ def test_mpi_indices_bypass_single_device_layout():
         np.testing.assert_array_equal(reused.todense(), expected.todense())
 
 
+@pytest.mark.parametrize("format", ["csr", "coo", "bcsr", "bcoo"])
+def test_mpi_scipy_columns_past_int32_are_kept(format):
+    import jax.experimental.sparse as jsp
+    import scipy.sparse as sp
+
+    columns = np.array([5, 2**31 + 7, 2**33 - 1])
+    local = sp.csr_matrix((np.ones(3), columns, np.array([0, 3])), shape=(1, 2**33))
+    if format == "coo":
+        local = local.tocoo()
+    elif format in ("bcsr", "bcoo"):
+        cls = jsp.BCSR if format == "bcsr" else jsp.BCOO
+        with temp_enable_x64():
+            local = cls.from_scipy_sparse(
+                local.astype(np.float32), index_dtype=np.int64
+            )
+    A = to_bcsr_matrix(local, jnp.ones(1), use_int64_indices=True)
+    assert A.indices.dtype == np.int64
+    assert A.indptr.dtype == np.int32
+    np.testing.assert_array_equal(np.asarray(A.indices), columns)
+
+
 def test_replacement_uses_the_new_structure_after_layout_was_built():
     p = declaration()
     op = jaxamg.with_cache(operator(jnp.float32(0.5)), pattern=p)

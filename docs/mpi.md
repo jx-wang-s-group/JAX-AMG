@@ -166,8 +166,16 @@ cover only locally owned columns.
 - Use one host thread per communicator. Keep the communicator alive until
   queued work finishes and all ranks call `jaxamg.finalize()`.
 - Restart the process after a native-call failure.
-- Global row counts and local row/nonzero counts must fit signed 32-bit
-  integers. Each exchange message must be smaller than 2 GiB.
+- Local scalar row and nonzero counts must fit signed 32-bit integers.
+  Published AmgX releases also limit the global block-row count
+  (`nglobal / block_dim`) to signed 32-bit. To exceed that limit, rebuild
+  JAX-AMG against an AmgX port whose `AMGX_matrix_upload_distributed` accepts
+  a 64-bit `n_global`, and use the matching library at runtime. The header
+  selects the upload width automatically; stock builds retain their 32-bit
+  upload path and reject larger systems. Global columns remain 64-bit on
+  the Python/FFI boundary in either case. This does not enable larger local
+  partitions or single-GPU systems. Each exchange message must be smaller
+  than 2 GiB.
 
 ## Halo-form operators
 

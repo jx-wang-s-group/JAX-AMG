@@ -106,7 +106,7 @@ namespace
   using MPISolve = ffi::Error (*)(cudaStream_t, ffi::Buffer<ffi::S32>, ffi::Buffer<ffi::S64>,
                                   ffi::Buffer<DT>, ffi::Buffer<DT>, ffi::Buffer<DT>,
                                   ffi::Buffer<ffi::S32>, ffi::Buffer<ffi::S32>,
-                                  ffi::Buffer<ffi::S32>, ffi::ResultBuffer<DT>,
+                                  ffi::ResultBuffer<DT>,
                                   ffi::ResultBuffer<DT>, std::string_view, int32_t, int32_t,
                                   int32_t, int32_t, int32_t, int32_t, int32_t, int, int);
 
@@ -114,7 +114,7 @@ namespace
   ffi::Error AmgxSolveMPIPadded(
       cudaStream_t stream, ffi::Buffer<ffi::S32> row_ptrs, ffi::Buffer<ffi::S64> col_indices,
       ffi::Buffer<DT> values, ffi::Buffer<DT> b, ffi::Buffer<DT> x0,
-      ffi::Buffer<ffi::S32> nglobal, ffi::Buffer<ffi::S32> comm_ptr, ffi::Buffer<ffi::S32> lrank,
+      ffi::Buffer<ffi::S32> comm_ptr, ffi::Buffer<ffi::S32> lrank,
       ffi::Buffer<ffi::S32> sizes, ffi::Token, ffi::ResultBuffer<DT> x,
       ffi::ResultBuffer<DT> stats, ffi::Result<ffi::Token>, std::string_view config,
       int32_t transpose_solve, int32_t return_stats, int32_t reuse_level, int32_t use_x0,
@@ -141,7 +141,7 @@ namespace
         (values.element_count() != 0 && nnz > static_cast<int64_t>(values.element_count())) ||
         nnz > static_cast<int64_t>(col_indices.element_count()))
       return ffi::Error::InvalidArgument("local sizes exceed the padded buffers");
-    ffi::Error err = Solve(stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank,
+    ffi::Error err = Solve(stream, row_ptrs, col_indices, values, b, x0, comm_ptr, lrank,
                            x, stats, config, transpose_solve, return_stats, reuse_level, use_x0,
                            block_dim, device_mpi, operator_id, host_sizes[0], host_sizes[1]);
     if (err.success() && n < n_buffer &&
@@ -161,7 +161,6 @@ namespace
           .Arg<ffi::Buffer<ffi::F32>>()             // values
           .Arg<ffi::Buffer<ffi::F32>>()             // b (local)
           .Arg<ffi::Buffer<ffi::F32>>()             // x0 (local; ignored unless use_x0)
-          .Arg<ffi::Buffer<ffi::S32>>()             // nglobal
           .Arg<ffi::Buffer<ffi::S32>>()             // comm_ptr (2 x int32)
           .Arg<ffi::Buffer<ffi::S32>>()             // lrank
           .Arg<ffi::Buffer<ffi::S32>>()             // sizes: (n_local, nnz) or (-1, -1)
@@ -189,7 +188,6 @@ namespace
           .Arg<ffi::Buffer<ffi::F64>>()             // values
           .Arg<ffi::Buffer<ffi::F64>>()             // b (local)
           .Arg<ffi::Buffer<ffi::F64>>()             // x0 (local; ignored unless use_x0)
-          .Arg<ffi::Buffer<ffi::S32>>()             // nglobal
           .Arg<ffi::Buffer<ffi::S32>>()             // comm_ptr (2 x int32)
           .Arg<ffi::Buffer<ffi::S32>>()             // lrank
           .Arg<ffi::Buffer<ffi::S32>>()             // sizes: (n_local, nnz) or (-1, -1)
@@ -273,7 +271,6 @@ PYBIND11_MODULE(_amgx, m)
           for (const auto &k : mpi_keys) {
             py::dict entry;
             entry["n_local"] = py::int_(k.n_local);
-            entry["n_global"] = py::int_(k.n_global);
             entry["nnz"] = py::int_(k.nnz);
             entry["lrank"] = py::int_(k.lrank);
             entry["mode"] = py::str(ModeToString(k.mode));

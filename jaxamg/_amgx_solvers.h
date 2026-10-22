@@ -202,12 +202,13 @@ namespace
   // the BSR values buffer is zero-initialized once so they stay zero across
   // value refreshes. For transpose=true the map composes the CSR transpose
   // permutation, so scattering A's values directly yields BSR(A^T).
-  // ColT is int (single-GPU) or int64_t (MPI global column indices).
-  template <typename ColT>
+  // ColT is int (single-GPU) or int64_t (MPI global columns). BlockColT
+  // matches the upload API; check before narrowing for stock AmgX.
+  template <typename ColT, typename BlockColT = ColT>
   inline const char *BuildBsrScatterMap(int n_rows, int nnz, int bs, bool transpose,
                                         const int *row_ptrs, const ColT *col_indices,
                                         std::vector<int> &bsr_row_ptrs,
-                                        std::vector<int> &bsr_col_indices,
+                                        std::vector<BlockColT> &bsr_col_indices,
                                         std::vector<int> &scatter_map)
   {
     if (bs < 1 || n_rows % bs != 0)
@@ -217,7 +218,7 @@ namespace
 
     struct Entry
     {
-      int bcol;
+      ColT bcol;
       int sub;
       int idx;
     };
@@ -243,7 +244,7 @@ namespace
           const long long er = transpose ? c : r;
           const long long ec = transpose ? r : c;
           Entry e;
-          e.bcol = static_cast<int>(ec / bs);
+          e.bcol = static_cast<ColT>(ec / bs);
           e.sub = static_cast<int>((er % bs) * bs + (ec % bs));
           e.idx = k;
           entries[cursor[static_cast<int>(er / bs)]++] = e;
@@ -259,13 +260,15 @@ namespace
       std::sort(entries.begin() + lo, entries.begin() + hi,
                 [](const Entry &a, const Entry &b)
                 { return a.bcol < b.bcol; });
-      int prev_bcol = -1;
+      ColT prev_bcol = -1;
       for (int i = lo; i < hi; ++i)
       {
         if (entries[i].bcol != prev_bcol)
         {
           prev_bcol = entries[i].bcol;
-          bsr_col_indices.push_back(prev_bcol);
+          if (prev_bcol > std::numeric_limits<BlockColT>::max())
+            return "block column exceeds the AmgX upload index range";
+          bsr_col_indices.push_back(static_cast<BlockColT>(prev_bcol));
         }
         const long long slot =
             (static_cast<long long>(bsr_col_indices.size()) - 1) * bs * bs +
@@ -676,6 +679,35 @@ namespace
   }
 
 #ifdef JAXAMG_WITH_MPI
+  // The global row count's type in this AmgX's distributed upload: int in
+  // published releases, int64_t in builds that support more rows.
+  template <typename R, typename H, typename N, typename... Rest>
+  N UploadGlobalRowsType(R (*)(H, N, Rest...));
+  using AmgxGlobalRows = decltype(UploadGlobalRowsType(&AMGX_matrix_upload_distributed));
+  static_assert(std::is_same<AmgxGlobalRows, int>::value ||
+                std::is_same<AmgxGlobalRows, int64_t>::value,
+                "unsupported AmgX global row count type");
+
+  template <typename Index>
+  inline const char *BuildPartitionOffsets(const std::vector<int> &counts, int bs,
+                                           std::vector<Index> &offsets)
+  {
+    offsets.assign(counts.size() + 1, 0);
+    int64_t total = 0;
+    for (size_t r = 0; r < counts.size(); ++r)
+    {
+      if (bs < 1 || counts[r] < 0 || counts[r] % bs != 0)
+        return "a rank's partition is not divisible by block_dim";
+      total += counts[r] / bs;
+      if (total > std::numeric_limits<Index>::max())
+        return "the global block-row count exceeds this AmgX build's 32-bit limit; "
+               "rebuild JAX-AMG against an AmgX whose "
+               "AMGX_matrix_upload_distributed takes a 64-bit n_global";
+      offsets[r + 1] = static_cast<Index>(total);
+    }
+    return nullptr;
+  }
+
   /*
    * AmgxSolveMPIInternal: MPI-aware templated core implementation.
    * Uses AMGX_resources_create() with MPI communicator and
@@ -688,7 +720,6 @@ namespace
                                          ffi::Buffer<DType> values,
                                          ffi::Buffer<DType> b,
                                          ffi::Buffer<DType> x0,
-                                         ffi::Buffer<ffi::DataType::S32> nglobal_buf,
                                          ffi::Buffer<ffi::DataType::S32> comm_ptr_buf,
                                          ffi::Buffer<ffi::DataType::S32> lrank_buf,
                                          ffi::ResultBuffer<DType> x,
@@ -724,11 +755,9 @@ namespace
     }
 
     cudaStreamSynchronize(stream);
-    int nglobal_host;
     int comm_ptr_parts[2];
     int lrank_host;
 
-    cudaMemcpy(&nglobal_host, nglobal_buf.typed_data(), sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(comm_ptr_parts, comm_ptr_buf.typed_data(), 2 * sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&lrank_host, lrank_buf.typed_data(), sizeof(int), cudaMemcpyDeviceToHost);
 
@@ -760,13 +789,11 @@ namespace
     }
 
     // Block mode (block_dim > 1): local scalar CSR (with global columns) is
-    // converted to BSR. Both the local partition and the global size must be
-    // block-aligned.
+    // converted to BSR. The local partition must be block-aligned.
     const int bs = block_dim;
-    if (bs < 1 || n_local % bs != 0 || nglobal_host % bs != 0)
+    if (bs < 1 || n_local % bs != 0)
     {
-      return ffi::Error::Internal(
-          "local partition or global size is not divisible by block_dim");
+      return ffi::Error::Internal("local partition is not divisible by block_dim");
     }
     const int n_local_b = n_local / bs;
 
@@ -797,7 +824,6 @@ namespace
 
     MPICacheKey key = {
         n_local,
-        nglobal_host,
         nnz,
         lrank_host,
         static_cast<int>(Mode),
@@ -897,6 +923,24 @@ namespace
 
     if (!cache_hit)
     {
+      // Contiguous scalar/block row boundaries need only O(nranks) metadata.
+      // Validate before allocating or evicting cached resources. Every rank
+      // sees the same counts and therefore accepts or refuses together.
+      int nranks_host = 1;
+      MPI_Comm_size(*mpi_comm, &nranks_host);
+      std::vector<int> counts(nranks_host);
+      int n_local_send = n_local;
+      if (MPI_Allgather(&n_local_send, 1, MPI_INT, counts.data(), 1, MPI_INT,
+                        *mpi_comm) != MPI_SUCCESS)
+        return ffi::Error::Internal("MPI_Allgather of local sizes failed");
+      // Offsets and columns must have the same type. Retain stock AmgX's
+      // 32-bit upload path (its 64-bit path has shown convergence failures),
+      // and select 64-bit uploads when the header supports larger systems.
+      std::vector<AmgxGlobalRows> partition_offsets;
+      if (const char *err = BuildPartitionOffsets(counts, bs, partition_offsets))
+        return ffi::Error::InvalidArgument(err);
+      const AmgxGlobalRows nglobal_b = partition_offsets.back();
+
       // On cache miss, evict first (if full) so we never create a new MPI
       // resources handle while stale distributed resources are still alive.
       // This avoids communicator setup crashes under small cache capacities.
@@ -928,9 +972,7 @@ namespace
       // and the warm-path AMGX_matrix_replace_coefficients reference these across
       // solves, whereas the XLA inputs are released after this call. In block
       // mode the cache-owned buffers hold the BSR structure/values instead of
-      // the scalar CSR; in scalar mode col_indices is narrowed to int32 (the
-      // low 4 bytes of each int64; valid since global indices are <
-      // nglobal_host, an int) for the 32-bit distributed upload below.
+      // the scalar CSR. Upload columns match the global row count's type.
       if (bs > 1)
       {
         // The pattern on the host for the BSR build (on this setup path only).
@@ -941,8 +983,9 @@ namespace
         cudaMemcpyAsync(h_col_indices.data(), col_indices_data,
                         nnz * sizeof(int64_t), cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
-        std::vector<int> bsr_row_ptrs, bsr_col_indices, scatter_map;
-        const char *build_err = BuildBsrScatterMap<int64_t>(
+        std::vector<int> bsr_row_ptrs, scatter_map;
+        std::vector<AmgxGlobalRows> bsr_col_indices;
+        const char *build_err = BuildBsrScatterMap<int64_t, AmgxGlobalRows>(
             n_local, nnz, bs, /*transpose=*/false,
             h_row_ptrs.data(), h_col_indices.data(),
             bsr_row_ptrs, bsr_col_indices, scatter_map);
@@ -957,7 +1000,7 @@ namespace
         if (cudaMalloc(&res.bsr_scatter_map, map_bytes) != cudaSuccess ||
             cudaMalloc(&res.bsr_values, val_bytes) != cudaSuccess ||
             cudaMalloc(&res.row_ptrs_buf, (n_local_b + 1) * sizeof(int)) != cudaSuccess ||
-            cudaMalloc(&res.col_indices_buf, res.bsr_nnzb * sizeof(int)) != cudaSuccess)
+            cudaMalloc(&res.col_indices_buf, res.bsr_nnzb * sizeof(AmgxGlobalRows)) != cudaSuccess)
         {
           return ffi::Error::Internal("cudaMalloc for MPI block buffers failed");
         }
@@ -966,7 +1009,7 @@ namespace
         cudaMemcpyAsync(res.row_ptrs_buf, bsr_row_ptrs.data(),
                         (n_local_b + 1) * sizeof(int), cudaMemcpyHostToDevice, stream);
         cudaMemcpyAsync(res.col_indices_buf, bsr_col_indices.data(),
-                        res.bsr_nnzb * sizeof(int), cudaMemcpyHostToDevice, stream);
+                        res.bsr_nnzb * sizeof(AmgxGlobalRows), cudaMemcpyHostToDevice, stream);
         cudaMemsetAsync(res.bsr_values, 0, val_bytes, stream);
         const char *scatter_err = ScatterValuesToBsr<T>(
             stream, nnz, values_data, res.bsr_scatter_map, res.bsr_values,
@@ -980,46 +1023,25 @@ namespace
       {
         if (cudaMalloc(&res.values_buf, nnz * sizeof(T)) != cudaSuccess ||
             cudaMalloc(&res.row_ptrs_buf, (n_local + 1) * sizeof(int)) != cudaSuccess ||
-            cudaMalloc(&res.col_indices_buf, nnz * sizeof(int)) != cudaSuccess)
+            cudaMalloc(&res.col_indices_buf, nnz * sizeof(AmgxGlobalRows)) != cudaSuccess)
         {
           return ffi::Error::Internal("cudaMalloc for MPI matrix buffers failed");
         }
         cudaMemcpyAsync(res.values_buf, values_data, nnz * sizeof(T), cudaMemcpyDeviceToDevice, stream);
         cudaMemcpyAsync(res.row_ptrs_buf, row_ptrs_data, (n_local + 1) * sizeof(int), cudaMemcpyDeviceToDevice, stream);
-        cudaMemcpy2DAsync(res.col_indices_buf, sizeof(int), col_indices_data, sizeof(int64_t),
-                          sizeof(int), nnz, cudaMemcpyDeviceToDevice, stream);
+        if constexpr (sizeof(AmgxGlobalRows) == sizeof(int64_t))
+          cudaMemcpyAsync(res.col_indices_buf, col_indices_data, nnz * sizeof(int64_t),
+                          cudaMemcpyDeviceToDevice, stream);
+        else
+          // CUDA is little-endian. Validated global columns fit int32 here,
+          // so pack their low words, preserving the stock upload path.
+          cudaMemcpy2DAsync(res.col_indices_buf, sizeof(int), col_indices_data, sizeof(int64_t),
+                            sizeof(int), nnz, cudaMemcpyDeviceToDevice, stream);
         cudaStreamSynchronize(stream);
       }
 
-      // Contiguous scalar/block row boundaries need only O(nranks) metadata.
-      // An owning-rank vector would replicate O(nglobal) host storage on every
-      // rank even when each rank owns a fixed-size subdomain.
-      int nranks_host = 1;
-      MPI_Comm_size(*mpi_comm, &nranks_host);
-      std::vector<int> counts(nranks_host);
-      int n_local_send = n_local;
-      if (MPI_Allgather(&n_local_send, 1, MPI_INT, counts.data(), 1, MPI_INT,
-                        *mpi_comm) != MPI_SUCCESS)
-        return ffi::Error::Internal("MPI_Allgather of local sizes failed");
-      const int nglobal_b = nglobal_host / bs;
-      std::vector<int> partition_offsets(nranks_host + 1, 0);
-      for (int r = 0; r < nranks_host; ++r)
-      {
-        if (counts[r] < 0 || counts[r] % bs != 0)
-          return ffi::Error::Internal(
-              "a rank's partition is not divisible by block_dim");
-        const int64_t end = static_cast<int64_t>(partition_offsets[r]) + counts[r] / bs;
-        if (end > nglobal_b)
-          return ffi::Error::Internal("partition row counts exceed the global size");
-        partition_offsets[r + 1] = static_cast<int>(end);
-      }
-      if (partition_offsets.back() != nglobal_b)
-        return ffi::Error::Internal("partition row counts do not match the global size");
-
-      // Keep the 32-bit column path: the former 64-bit upload produced a
-      // diverging AMG hierarchy at >=4 ranks. Offsets change only how ownership
-      // is described, not index precision. Creating the distribution from the
-      // solver config preserves its import-ring count (classical AMG uses 2).
+      // Creating the distribution from the solver config preserves its
+      // import-ring count (classical AMG uses 2).
       {
         struct DistributionGuard
         {
@@ -1030,13 +1052,14 @@ namespace
           }
         } distribution;
         AMGX_SAFE_CALL(AMGX_distribution_create(&distribution.handle, res.cfg));
-        AMGX_SAFE_CALL(AMGX_distribution_set_32bit_colindices(distribution.handle, 1));
+        AMGX_SAFE_CALL(AMGX_distribution_set_32bit_colindices(
+            distribution.handle, sizeof(AmgxGlobalRows) == sizeof(int)));
         AMGX_SAFE_CALL(AMGX_distribution_set_partition_data(
             distribution.handle, AMGX_DIST_PARTITION_OFFSETS, partition_offsets.data()));
         AMGX_SAFE_CALL(AMGX_matrix_upload_distributed(
             res.A, nglobal_b, n_local_b, bs > 1 ? res.bsr_nnzb : nnz, bs, bs,
             static_cast<int *>(res.row_ptrs_buf),
-            static_cast<int *>(res.col_indices_buf),
+            res.col_indices_buf,
             bs > 1 ? static_cast<T *>(res.bsr_values)
                    : static_cast<T *>(res.values_buf),
             nullptr, distribution.handle));
@@ -1150,7 +1173,6 @@ namespace
                                      ffi::Buffer<ffi::DataType::F32> values,
                                      ffi::Buffer<ffi::DataType::F32> b,
                                      ffi::Buffer<ffi::DataType::F32> x0,
-                                     ffi::Buffer<ffi::DataType::S32> nglobal,
                                      ffi::Buffer<ffi::DataType::S32> comm_ptr,
                                      ffi::Buffer<ffi::DataType::S32> lrank,
                                      ffi::ResultBuffer<ffi::DataType::F32> x,
@@ -1167,7 +1189,7 @@ namespace
                                      int nnz_override = -1)
   {
     return AmgxSolveMPIInternal<float, ffi::DataType::F32, AMGX_mode_dFFI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_level, use_x0, block_dim, device_mpi, operator_id, n_override, nnz_override);
+        stream, row_ptrs, col_indices, values, b, x0, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_level, use_x0, block_dim, device_mpi, operator_id, n_override, nnz_override);
   }
 
   // MPI Double implementation
@@ -1177,7 +1199,6 @@ namespace
                                            ffi::Buffer<ffi::DataType::F64> values,
                                            ffi::Buffer<ffi::DataType::F64> b,
                                            ffi::Buffer<ffi::DataType::F64> x0,
-                                           ffi::Buffer<ffi::DataType::S32> nglobal,
                                            ffi::Buffer<ffi::DataType::S32> comm_ptr,
                                            ffi::Buffer<ffi::DataType::S32> lrank,
                                            ffi::ResultBuffer<ffi::DataType::F64> x,
@@ -1194,7 +1215,7 @@ namespace
                                      int nnz_override = -1)
   {
     return AmgxSolveMPIInternal<double, ffi::DataType::F64, AMGX_mode_dDDI>(
-        stream, row_ptrs, col_indices, values, b, x0, nglobal, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_level, use_x0, block_dim, device_mpi, operator_id, n_override, nnz_override);
+        stream, row_ptrs, col_indices, values, b, x0, comm_ptr, lrank, x, stats, config, transpose_solve, return_stats, reuse_level, use_x0, block_dim, device_mpi, operator_id, n_override, nnz_override);
   }
 
 #endif // JAXAMG_WITH_MPI

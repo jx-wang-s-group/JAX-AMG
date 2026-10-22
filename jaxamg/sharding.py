@@ -1021,7 +1021,6 @@ def make_sharded_solver(
             dtype=np.int32,
         ),
     )
-    nglobal_arr = np.array([nglobal], dtype=np.int32)
     primal_structure = register_structure(indptr_host, indices_host, max_nnz)
     if is_symmetric:
         adjoint_structure = primal_structure
@@ -1124,7 +1123,6 @@ def make_sharded_solver(
                 values,
                 rhs,
                 x0,
-                jnp.asarray(nglobal_arr),
                 comm_lrank[:2],
                 comm_lrank[2:],
                 config_str=config_for(singular_),
