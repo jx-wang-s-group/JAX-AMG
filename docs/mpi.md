@@ -168,9 +168,10 @@ cover only locally owned columns.
 - Restart the process after a native-call failure.
 - Local scalar row and nonzero counts must fit signed 32-bit integers.
   Published AmgX releases also limit the global block-row count
-  (`nglobal / block_dim`) to signed 32-bit. To exceed that limit, rebuild
-  JAX-AMG against an AmgX port whose `AMGX_matrix_upload_distributed` accepts
-  a 64-bit `n_global`, and use the matching library at runtime. The header
+  (`nglobal / block_dim`) to signed 32-bit. To exceed that limit, build the
+  [int64-global-rows AMGX port](https://github.com/stevenliuyi/AMGX/tree/int64-global-rows)
+  and rebuild JAX-AMG against it. This port's `AMGX_matrix_upload_distributed`
+  accepts a 64-bit `n_global`; use the matching library at runtime. The header
   selects the upload width automatically; stock builds retain their 32-bit
   upload path and reject larger systems. Global columns remain 64-bit on
   the Python/FFI boundary in either case. This does not enable larger local
