@@ -76,6 +76,19 @@ each rank to one visible CUDA device and enables early `jax.distributed` setup.
     The MPI demos under `demo/` (e.g. `mpirun -n 4 python demo/mpi_autodiff.py`)
     are a quick way to sanity-check distributed behavior end to end.
 
+### Testing other JAX versions
+
+CI runs the CPU tests on the oldest supported JAX (`requirements.txt`), each
+newer minor series and the newest release. GPU and MPI suites cannot run there:
+to check another JAX version, install it in a fresh environment, rebuild the
+extension against it (it compiles against the installed `jaxlib`, so build
+without isolation, which would resolve its own JAX) and rerun the suites above:
+
+```bash
+pip install "jax[cuda13]==0.11.*" "setuptools>=77" "pybind11>=2.10"
+pip install --no-build-isolation -e . -v
+```
+
 ## Code Quality
 
 Formatting and linting are enforced with `pre-commit` (black, ruff with

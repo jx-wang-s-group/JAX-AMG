@@ -1225,7 +1225,7 @@ def make_sharded_solver(
             value.addressable_shards[0].data, NamedSharding(local_mesh, P())
         )
 
-    def assemble_global(local_value: jax.Array) -> jax.Array:
+    def assemble_global(local_value: jax.Array | np.ndarray) -> jax.Array:
         spec = P(axis_name, *(None,) * (local_value.ndim - 1))
         return jax.make_array_from_single_device_arrays(
             (nranks * local_value.shape[0], *local_value.shape[1:]),
@@ -1427,9 +1427,11 @@ def make_sharded_solver(
                 return
 
             def reduce(sums):
+                # A host array: under the multi-process mesh, jnp.asarray would
+                # replicate it over every process's device.
                 local = np.asarray(sums.addressable_shards[0].data)
                 with jax.set_mesh(mesh):
-                    totals = label_sum_(assemble_global(jnp.asarray(local)))
+                    totals = label_sum_(assemble_global(local))
                 return jnp.asarray(np.asarray(totals.addressable_shards[0].data))
 
             validate_basis(basis, name, None, labels_, reduce)
