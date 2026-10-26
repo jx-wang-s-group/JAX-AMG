@@ -298,6 +298,7 @@ class TestSolver:
             res_history_len=0,
             use_x0=False,
             block_dim=1,
+            has_side_effect=True,
         ):
             calls.append(
                 {

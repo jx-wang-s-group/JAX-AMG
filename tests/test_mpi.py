@@ -63,6 +63,7 @@ def test_mpi_lowerings_construct_typed_results(dtype, monkeypatch):
                 res_history_len=2,
                 ordered=False,
                 config="{}",
+                has_side_effect=True,
             )
             element = "f32" if dtype == np.float32 else "f64"
             assert [str(output.type) for output in outputs] == [

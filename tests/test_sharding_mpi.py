@@ -235,6 +235,51 @@ def test_sharded_nonsymmetric_matrix_and_rhs_gradients(sharding_context):
     assert _local_status(info) == 0
 
 
+def test_sharded_pure_solve_differentiates_under_checkpoint(sharding_context):
+    """A sharded solve declared pure (has_side_effect=False) solves and, under
+    jax.checkpoint, recomputes on every rank on any JAX version."""
+    comm, rank, nranks, mesh = sharding_context
+    n_local = 4
+    n_global = n_local * nranks
+    A_local, row_start, row_end = tridiagonal_matrix_distributed(
+        n_global, rank, nranks, diagonal_value=4.0, dtype=jnp.float32
+    )
+    b_local = np.linspace(row_start + 1.0, row_end, n_local, dtype=np.float32)
+    b = _global_vector(b_local, n_global, mesh)
+    matrix = jaxamg.make_sharded_matrix(A_local, b, comm=comm, mesh=mesh)
+    solver = jaxamg.make_sharded_solver(
+        matrix,
+        b,
+        is_symmetric=True,
+        config={
+            "solver": "CG",
+            "preconditioner": {"solver": "JACOBI_L1"},
+            "max_iters": 100,
+            "tolerance": 1e-8,
+        },
+        has_side_effect=False,
+    )
+
+    def loss(matrix_data, rhs):
+        x, _ = solver(rhs, A=matrix_data)
+        return jnp.sum(x**2)
+
+    with jax.set_mesh(mesh):
+        x, info = jax.jit(lambda m, rhs: solver(rhs, A=m))(matrix.data, b)
+        grad_b = jax.jit(jax.grad(jax.checkpoint(loss), argnums=1))(matrix.data, b)
+
+    A_global = 4.0 * np.eye(n_global) - np.eye(n_global, k=1) - np.eye(n_global, k=-1)
+    x_ref = np.linalg.solve(A_global, np.arange(1, n_global + 1, dtype=np.float64))
+    np.testing.assert_allclose(_gather_global(x, comm), x_ref, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(
+        _gather_global(grad_b, comm),
+        np.linalg.solve(A_global.T, 2.0 * x_ref),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert _local_status(info) == 0
+
+
 def test_sharded_symmetric_warm_start_gradients(sharding_context):
     """Cover the symmetric optimization and zero x0 cotangent."""
     comm, rank, nranks, mesh = sharding_context

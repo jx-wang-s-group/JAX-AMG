@@ -164,13 +164,23 @@ differentiation.
 
 ### Checkpointing (`jax.checkpoint`)
 
-Checkpointing single-GPU solves requires JAX 0.11.1 or later. Older versions
-reject their cache side effect (`FfiEffect`). The sharded MPI solver
-(`make_sharded_solver`) declares no such effect and supports checkpointing on
-older JAX versions too.
+Every solve updates the solver cache, which `reuse="hierarchy"` solves read, so
+by default a solve, single-GPU or sharded, declares a side effect to JAX. Under
+`jax.checkpoint` (JAX 0.11.1 or later; older versions reject the effect) JAX then
+runs each solve once and keeps its output for the backward pass: the solves'
+memory grows as without checkpointing.
 
-With `reuse="hierarchy"`, recomputed solves use the currently cached hierarchy,
-which may differ from the one used in the forward pass.
+`has_side_effect=False` (in `solve` and `make_sharded_solver`) declares a solve
+pure. Under `jax.checkpoint` a single-GPU or sharded solve is then recomputed
+instead of kept, which bounds that memory on any JAX version, and JAX may drop
+an unused solve or merge identical ones. Declare it only when no
+`reuse="hierarchy"` solve depends on this solve's setup, or when such a solve
+may use whichever setup is cached: a recomputed `reuse="hierarchy"` solve uses
+the currently cached hierarchy, which may differ from the one used in the
+forward pass, so its result varies within the solve tolerance. Per-rank MPI
+solves keep mpi4jax's ordered effect either way, which `jax.checkpoint` rejects
+(`Effects not supported in partial-eval of checkpoint/remat:
+[OrderedMPIEffect]`): they cannot be checkpointed.
 
 ## Cache inspection
 
