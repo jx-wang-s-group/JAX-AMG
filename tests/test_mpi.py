@@ -26,6 +26,44 @@ from jaxamg.mpi_utils import (
 )
 
 
+def test_a_batched_mpi_solve_maps_its_batched_operands_one_system_at_a_time(
+    monkeypatch,
+):
+    """vmap over the MPI solve maps the batched operands through one solve each
+    and passes the unbatched ones unchanged (traced with the extension mocked)."""
+    import importlib
+
+    solver = importlib.import_module("jaxamg.jaxamg")
+    monkeypatch.setattr(solver, "_ensure_backend", lambda: None)
+    n, batch = 4, 3
+
+    def call(values, b):
+        return solver._amgx_solve_mpi_impl(
+            jnp.arange(n + 1, dtype=jnp.int32),
+            jnp.arange(n, dtype=jnp.int32),
+            values,
+            b,
+            None,
+            jnp.zeros(2, jnp.int32),
+            jnp.zeros(1, jnp.int32),
+            ordered=False,
+        )
+
+    jaxpr = jax.make_jaxpr(jax.vmap(call, in_axes=(None, 1)))(
+        jnp.ones(n), jnp.ones((n, batch))
+    )
+    assert [a.shape for a in jaxpr.out_avals] == [(batch, n), (batch, 3)]
+    (scan,) = [e for e in jaxpr.eqns if e.primitive.name == "scan"]
+    (inner,) = scan.params["jaxpr"].jaxpr.eqns
+    assert [v.aval.shape for v in inner.invars[:5]] == [
+        (n + 1,),
+        (n,),
+        (n,),
+        (n,),
+        (n,),
+    ]
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_mpi_lowerings_construct_typed_results(dtype, monkeypatch):
     import importlib

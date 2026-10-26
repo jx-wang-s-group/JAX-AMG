@@ -300,13 +300,9 @@ def _amgx_mpi_lowering(
 
 def _amgx_mpi_batch(args, dims, **params):
     """One system at a time (communication has no batched form)."""
-    from jax.interpreters import batching
-
-    moved = [
-        a if d is batching.not_mapped else jnp.moveaxis(a, d, 0)
-        for a, d in zip(args, dims)
-    ]
-    batched = [d is not batching.not_mapped for d in dims]
+    # Unbatched operands have dimension None (JAX 0.10 removed its not_mapped alias).
+    moved = [a if d is None else jnp.moveaxis(a, d, 0) for a, d in zip(args, dims)]
+    batched = [d is not None for d in dims]
 
     def one(sliced):
         it = iter(sliced)

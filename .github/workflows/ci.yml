@@ -34,15 +34,28 @@ jobs:
   test-cpu:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        include:
+          - { python-version: "3.11", jax-version: "0.9.1" }
+          - { python-version: "3.11", jax-version: "0.10.*" }
+          - { python-version: "3.12", jax-version: "0.11.*" }
+          - { python-version: "3.12", jax-version: "" }
+          - { python-version: "3.13", jax-version: "" }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+      # One resolution, so dependencies such as lineax fit the pinned JAX.
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+        env:
+          JAX_VERSION: ${{ matrix.jax-version }}
+        run: pip install -r requirements-dev.txt ${JAX_VERSION:+"jax[cpu]==$JAX_VERSION"}
+      - name: Check dependencies
+        run: pip check
+      - name: Report versions
+        run: python -c "import sys, jax, jaxlib; print(sys.version, jax.__version__, jaxlib.__version__)"
       # Run from the repo root without installing the package: the extension
       # loads lazily, so the pure-Python surface (sparsity tracing, coloring,
       # config, matrices, monkeypatched preconditioners) is fully testable.
