@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from jax.ad_checkpoint import print_saved_residuals
 from jax.test_util import check_grads
 
 import jaxamg
@@ -67,6 +68,42 @@ class TestGradient:
 
         # Comparison with finite differences
         check_grads(loss, (b,), order=1, modes=["rev"])
+
+    def test_a_checkpointed_solve_keeps_its_output_by_default(self, capsys):
+        """A solve updates the solver cache, a side effect: under jax.checkpoint JAX
+        runs it once and keeps its output (JAX 0.11.1 or later; older JAX rejects it).
+        """
+        A = tridiagonal_matrix(32, diagonal_value=4.0)
+        b = rhs_ones(32)
+        loss = lambda b: l2_loss(A, b)
+
+        if jax.__version_info__ < (0, 11, 1):
+            with pytest.raises(NotImplementedError):
+                jax.grad(jax.checkpoint(loss))(b)
+            return
+        print_saved_residuals(jax.checkpoint(loss), b)
+        assert "output of" in capsys.readouterr().out
+        np.testing.assert_allclose(
+            jax.grad(jax.checkpoint(loss))(b), jax.grad(loss)(b), rtol=1e-6
+        )
+
+    def test_a_solve_declared_pure_is_recomputed_under_checkpoint(self, capsys):
+        """With has_side_effect=False the backward pass recomputes the solve: it
+        saves the right-hand side, not the solution, on every JAX version."""
+        A = tridiagonal_matrix(32, diagonal_value=4.0)
+        b = rhs_ones(32)
+
+        def loss(b):
+            x, _ = jaxamg.solve(A, b, config={"solver": "CG"}, has_side_effect=False)
+            return jnp.sum(x * x)
+
+        print_saved_residuals(jax.checkpoint(loss), b)
+        saved = capsys.readouterr().out
+        assert "from the argument b" in saved
+        assert "output of" not in saved
+        np.testing.assert_allclose(
+            jax.grad(jax.checkpoint(loss))(b), jax.grad(loss)(b), rtol=1e-6
+        )
 
     @pytest.mark.parametrize("seed", [0, 42, 123])
     def test_gradient_vector_product(self, seed):

@@ -818,6 +818,7 @@ def make_sharded_solver(
     block_dim: int = 1,
     reuse: str | None = None,
     save_stats: bool = False,
+    has_side_effect: bool = True,
 ) -> ShardedSolve:
     """Create a solver for a globally sharded RHS.
 
@@ -860,6 +861,7 @@ def make_sharded_solver(
             output enabled so a later direct call with
             ``solver(..., save_stats_file=...)`` produces a complete stats
             file.
+        has_side_effect: As in :func:`jaxamg.solve`.
 
     Returns:
         A callable ``solver(b, x0=None, *, A=None, save_stats_file=None)``.
@@ -1134,6 +1136,7 @@ def make_sharded_solver(
                 ordered=False,
                 local_sizes=sizes,
                 operator_id=operator_id,
+                has_side_effect=has_side_effect,
             )
 
         if reuse_level == 2:

@@ -192,12 +192,13 @@ def _amgx_solve_impl(
     use_x0: bool = False,
     block_dim: int = 1,
     operator_id: int = 0,
+    has_side_effect: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX solver (non-differentiable).
 
     ``reuse_level`` 0 refreshes the cached matrix and hierarchy, 1 only the
     matrix, 2 neither; at level 2, empty ``values`` select the matrix kept for
-    ``operator_id``."""
+    ``operator_id``. ``has_side_effect`` is as in ``solve``."""
 
     _ensure_backend()
     b = jnp.asarray(b)
@@ -211,11 +212,11 @@ def _amgx_solve_impl(
     if b.dtype == jnp.float64:
         call_name = _AMGX_CALL_NAME_DOUBLE
 
-    # AmgX mutates cached solver resources, so this call is not functionally pure.
+    # Every solve updates the solver cache, which reuse="hierarchy" solves read.
     call = ffi.ffi_call(
         call_name,
         out_spec,
-        has_side_effect=True,
+        has_side_effect=has_side_effect,
         input_layouts=[None, None, None, None, None],
         output_layouts=None,
         vmap_method="sequential",
@@ -240,16 +241,22 @@ def _amgx_solve_impl(
     return cast(tuple, results)
 
 
-def _amgx_mpi_abstract_eval(*args, res_history_len, ordered, **params):
+def _amgx_mpi_abstract_eval(*args, res_history_len, ordered, has_side_effect, **params):
+    from jax._src.ffi import FfiEffect
+
     b = args[3]
     outs = (
         b.update(weak_type=False),
         b.update(shape=(3 + res_history_len,), weak_type=False),
     )
-    return outs, ({mpi_ordered_effect()} if ordered else set())
+    # The single-GPU call's effect, for the same solver cache.
+    cache = {FfiEffect()} if has_side_effect else set()
+    return outs, ({mpi_ordered_effect()} if ordered else set()) | cache
 
 
-def _amgx_mpi_lowering(ctx, *operands, res_history_len, ordered, config, **params):
+def _amgx_mpi_lowering(
+    ctx, *operands, res_history_len, ordered, config, has_side_effect, **params
+):
     # The private builder (as mpi4jax uses): a typed-FFI call with a token.
     from jax._src.interpreters.mlir import custom_call as _custom_call
     from jax._src.lib.mlir.dialects import hlo
@@ -278,7 +285,8 @@ def _amgx_mpi_lowering(ctx, *operands, res_history_len, ordered, config, **param
         operands=[*operands, token],
         backend_config=attrs,
         api_version=4,
-        has_side_effect=True,
+        # Ordered per-rank calls stay effectful: their token orders them with mpi4jax.
+        has_side_effect=ordered or has_side_effect,
         operand_layouts=[tuple(range(len(a.shape) - 1, -1, -1)) for a in ctx.avals_in]
         + [()],
         result_layouts=[tuple(range(len(a.shape) - 1, -1, -1)) for a in ctx.avals_out]
@@ -344,10 +352,13 @@ def _amgx_solve_mpi_impl(
     ordered: bool = True,
     local_sizes: ArrayLike | None = None,
     operator_id: int = 0,
+    has_side_effect: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Low-level FFI call to AmgX MPI solver (non-differentiable).
 
-    ``reuse_level`` and ``operator_id`` are as in ``_amgx_solve_impl``.
+    ``reuse_level`` and ``operator_id`` are as in ``_amgx_solve_impl``,
+    ``has_side_effect`` as in ``solve``: per-rank programs keep mpi4jax's
+    ordered effect either way.
 
     ``ordered`` (per-rank programs) joins mpi4jax's ordered effect, so every
     rank issues its AmgX solves, neighbour exchanges and mpi4jax collectives
@@ -387,6 +398,7 @@ def _amgx_solve_mpi_impl(
         block_dim=int(block_dim),
         ordered=bool(ordered),
         operator_id=int(operator_id),
+        has_side_effect=bool(has_side_effect),
     )
     return x, stats
 
@@ -400,6 +412,7 @@ def _get_adjoint_primitive(
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
+    has_side_effect: bool = True,
 ) -> Callable:
     """
     The adjoint-rule solve (a ``custom_vjp``, reverse mode only) for one native
@@ -426,6 +439,7 @@ def _get_adjoint_primitive(
             res_history_len=res_history_len,
             use_x0=use_x0,
             block_dim=block_dim,
+            has_side_effect=has_side_effect,
         )
         return x, info
 
@@ -450,6 +464,7 @@ def _get_adjoint_primitive(
             return_stats=False,
             reuse_level=reuse_level,
             block_dim=block_dim,
+            has_side_effect=has_side_effect,
         )
 
         # Check if matrix is symmetric
@@ -470,6 +485,7 @@ def _get_adjoint_primitive(
                     transpose_solve=True,
                     reuse_level=reuse_level,
                     block_dim=block_dim,
+                    has_side_effect=has_side_effect,
                 )
             except Exception:
                 A_T = jsp.BCSR.from_bcoo(A.to_bcoo().transpose())
@@ -500,6 +516,7 @@ def _single_gpu_services(
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
+    has_side_effect: bool = True,
 ) -> tuple[Callable, Callable, Callable]:
     """The single-GPU native services of the implicit core: the primal solve,
     the zero-start solve and the declared transposed solve. Tangent and adjoint
@@ -519,6 +536,7 @@ def _single_gpu_services(
             res_history_len=res_history_len,
             use_x0=use_x0,
             block_dim=block_dim,
+            has_side_effect=has_side_effect,
         )
 
     def native_zero_start(indptr, indices, values, rhs, aux=()):
@@ -531,6 +549,7 @@ def _single_gpu_services(
             config_str=config_str,
             reuse_level=reuse_level,
             block_dim=block_dim,
+            has_side_effect=has_side_effect,
         )[0]
 
     def native_transpose(indptr, indices, values, rhs, aux=()):
@@ -547,6 +566,7 @@ def _single_gpu_services(
                 transpose_solve=True,
                 reuse_level=reuse_level,
                 block_dim=block_dim,
+                has_side_effect=has_side_effect,
             )[0]
         except Exception:
             # An explicit Aᵀ where the native transposed solve cannot be used,
@@ -567,6 +587,7 @@ def _get_implicit_primitive(
     res_history_len: int = 0,
     use_x0: bool = False,
     block_dim: int = 1,
+    has_side_effect: bool = True,
 ) -> Callable:
     """The implicit-policy single-GPU solve (``jaxamg.core``): ``solve(A, b, x0)
     -> (x, info)`` with forward, reverse and higher-order derivatives."""
@@ -580,6 +601,7 @@ def _get_implicit_primitive(
         res_history_len,
         use_x0,
         block_dim,
+        has_side_effect,
     )
     return implicit_solver(native, zero_start, transpose, is_symmetric)
 
@@ -624,6 +646,7 @@ def _get_adjoint_primitive_mpi(
     use_x0: bool = False,
     block_dim: int = 1,
     ordered: bool = True,
+    has_side_effect: bool = True,
 ) -> Callable:
     """
     The adjoint-rule pure-MPI solve (a ``custom_vjp``, reverse mode only),
@@ -673,6 +696,7 @@ def _get_adjoint_primitive_mpi(
             use_x0=use_x0,
             block_dim=block_dim,
             ordered=ordered,
+            has_side_effect=has_side_effect,
         )
 
         return x, info
@@ -704,6 +728,7 @@ def _get_adjoint_primitive_mpi(
             reuse_level=reuse_level,
             block_dim=block_dim,
             ordered=ordered,
+            has_side_effect=has_side_effect,
         )
 
         # Backward solve: A^T @ adj_b = g_x
@@ -777,6 +802,7 @@ def _get_implicit_primitive_mpi(
     use_x0: bool = False,
     block_dim: int = 1,
     ordered: bool = True,
+    has_side_effect: bool = True,
 ) -> Callable:
     """The implicit-policy pure-MPI solve (``jaxamg.core``), with the adjoint
     rule's signature ``solve(A, b, x0, halo, transpose)``.
@@ -809,6 +835,7 @@ def _get_implicit_primitive_mpi(
             use_x0=warm,
             block_dim=block_dim,
             ordered=ordered,
+            has_side_effect=has_side_effect,
         )
 
     def native(indptr, indices, values, b, x0, aux):
@@ -914,6 +941,7 @@ def solve(
     labels: LabelSpec = None,
     label_sum: Callable[[jax.Array], jax.Array] | None = None,
     derivative: str = "implicit",
+    has_side_effect: bool = True,
     **kwargs: Any,
 ) -> tuple[jax.Array, dict]:
     """Solve `Ax=b` using the AmgX backend. See [Examples](examples.md) for usage.
@@ -933,7 +961,8 @@ def solve(
         transpose_nullspace: Basis of `null(Aᵀ)` (same formats). `b` is projected onto `range(A)` (removed fraction in `info["rhs_inconsistency"]`) and, by transposition, the adjoint solution is pinned: the forward returns `A⁺b`, `jax.grad` returns `(Aᵀ)⁺g`. Equals `nullspace` for symmetric `A` (filled in when `A` is marked symmetric); for nonsymmetric `A` it differs, e.g. `A = D⁻¹L` has `nullspace="constant"` but `transpose_nullspace=V` (cell volumes). Defaults to the basis attached with `with_cache`.
         labels: The pair `(count, labels)`, as `scipy.sparse.csgraph.connected_components` returns it: a static label count and one integer label per row (local rows in MPI mode, possibly traced), -1 for rows in no component, for a disconnected domain: every declared `nullspace`/`transpose_nullspace` column then applies separately on each label's rows (the null space is block diagonal over the labels), e.g. `nullspace="constant"` with labels declares one constant vector per component. A label whose columns vanish on its rows (no rows, or all of them -1 in this solve) is skipped exactly; columns dependent within a label are rejected (concrete values). Without labels the null space is the columns themselves. Defaults to the labels attached with `with_cache`.
         label_sum: In MPI mode with labels, the reduction of each rank's per-label partial sums (an array of `count` rows) to the labels' totals, a linear function (a `jaxamg.linear_map.LinearMap` where JAX's own transpose would be wrong, as for an MPI all-reduce). By default, the all-reduce over global label numbers (one `count`-row array on every rank); a caller whose labels span ranks in its own numbering supplies the reduction. Defaults to the one attached with `with_cache`.
-        derivative: `"implicit"` (default) differentiates `x = A⁻¹b` implicitly on the fixed pattern, `ẋ = A⁻¹(ḃ − Ȧx)` with each `A⁻¹` a native solve: forward and reverse mode, and higher orders where the operator supports them. `"adjoint"` is the reverse-only rule. Both use the same first reverse rule. Neither differentiates the AmgX iterations: derivatives are those of the exact solution, accurate to the solve tolerance. Under `jax.checkpoint` the single-GPU solve needs JAX 0.11.1 or later (older JAX refuses its side effect: `FfiEffect`; see docs/caching.md).
+        derivative: `"implicit"` (default) differentiates `x = A⁻¹b` implicitly on the fixed pattern, `ẋ = A⁻¹(ḃ − Ȧx)` with each `A⁻¹` a native solve: forward and reverse mode, and higher orders where the operator supports them. `"adjoint"` is the reverse-only rule. Both use the same first reverse rule. Neither differentiates the AmgX iterations: derivatives are those of the exact solution, accurate to the solve tolerance.
+        has_side_effect: Whether the solve declares a side effect to JAX (default `True`): every solve updates the solver cache (its setup for the sparsity pattern and configuration, possibly displacing another), which `reuse="hierarchy"` solves read. JAX keeps every such solve, and under `jax.checkpoint` (JAX 0.11.1 or later; older JAX rejects the effect) runs it once and keeps its output for the backward pass. `False` declares the solve pure: JAX may drop it when its result is unused or merge identical solves, and recomputes it under `jax.checkpoint` instead of keeping its output, which bounds the memory of checkpointed computations. Declare it only when no `reuse="hierarchy"` solve depends on this solve's setup, or when such a solve may use whichever setup is cached (its result then varies within the solve tolerance). Per-rank MPI solves keep mpi4jax's ordered effect either way, which `jax.checkpoint` rejects. See [Caching](caching.md#checkpointing-jaxcheckpoint).
         **kwargs: Additional AmgX config parameters. These override values in `config` when both are provided.
 
     Returns:
@@ -1140,6 +1169,7 @@ def solve(
                 use_x0=use_x0,
                 block_dim=block_dim,
                 ordered=ordered,
+                has_side_effect=has_side_effect,
             )
 
         elif comm is not None:
@@ -1239,6 +1269,7 @@ def solve(
                 use_x0=use_x0,
                 block_dim=block_dim,
                 ordered=ordered,
+                has_side_effect=has_side_effect,
             )
 
         halo_args = (
@@ -1335,6 +1366,7 @@ def solve(
                     use_x0=use_x0,
                     block_dim=block_dim,
                     operator_id=_pattern_matrix_id(pattern),
+                    has_side_effect=has_side_effect,
                 )
             )
 
@@ -1366,6 +1398,7 @@ def solve(
                 res_history_len=res_history_len,
                 use_x0=use_x0,
                 block_dim=block_dim,
+                has_side_effect=has_side_effect,
             )
 
             def run(b_: jax.Array, x0_: jax.Array) -> tuple[jax.Array, jax.Array]:

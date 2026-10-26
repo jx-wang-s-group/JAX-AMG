@@ -565,3 +565,39 @@ def test_row_axes_of_a_multi_axis_mesh():
         _row_axes(mesh, ("x", "w"))
     with pytest.raises(ValueError, match="axis name"):
         _axis_spec(())
+
+
+@pytest.mark.parametrize("has_side_effect", [True, False])
+def test_a_sharded_native_solve_declares_the_solver_cache_effect_as_asked(
+    has_side_effect, monkeypatch
+):
+    """An SPMD native solve declares the single-GPU solve's effect (the solver
+    cache), in its jaxpr and in its lowered custom call, unless the caller
+    declares it pure."""
+    import importlib
+
+    from jax._src.ffi import FfiEffect
+
+    solver = importlib.import_module("jaxamg.jaxamg")
+    monkeypatch.setattr(solver, "_ensure_backend", lambda: None)
+    # Unordered calls never use mpi4jax's effect; CI has no mpi4jax.
+    monkeypatch.setattr(solver, "mpi_ordered_effect", lambda: None)
+    n = 4
+
+    def call(b):
+        return solver._amgx_solve_mpi_impl(
+            jnp.arange(n + 1, dtype=jnp.int32),
+            jnp.arange(n, dtype=jnp.int32),
+            jnp.ones(n),
+            b,
+            None,
+            jnp.zeros(2, jnp.int32),
+            jnp.zeros(1, jnp.int32),
+            ordered=False,
+            has_side_effect=has_side_effect,
+        )
+
+    effects = jax.make_jaxpr(call)(jnp.ones(n)).effects
+    assert (FfiEffect() in effects) == has_side_effect
+    lowered = jax.jit(call).trace(jnp.ones(n)).lower(lowering_platforms=("cuda",))
+    assert ("has_side_effect = true" in lowered.as_text()) == has_side_effect
